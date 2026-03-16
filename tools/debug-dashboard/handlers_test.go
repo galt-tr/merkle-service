@@ -170,6 +170,42 @@ func TestHandleRegister_DefaultCallbackURL(t *testing.T) {
 	}
 }
 
+func TestHandleStump_Returns200(t *testing.T) {
+	h := &Handlers{
+		callbackStore: NewCallbackStore(100),
+		txidTracker:   NewTxidTracker(),
+		templates:     testTemplates(),
+		logger:        testLogger(),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/stump", nil)
+	w := httptest.NewRecorder()
+
+	h.handleStump(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	body := w.Body.String()
+	if !strings.Contains(body, "stump-input") {
+		t.Error("expected page to contain textarea with id 'stump-input'")
+	}
+	if !strings.Contains(body, "decode-btn") {
+		t.Error("expected page to contain decode button with id 'decode-btn'")
+	}
+	if !strings.Contains(body, "STUMP Visualizer") {
+		t.Error("expected page to contain 'STUMP Visualizer' heading")
+	}
+}
+
+func TestParseTemplates_IncludesStump(t *testing.T) {
+	templates := testTemplates()
+	if _, ok := templates["stump.html"]; !ok {
+		t.Error("expected stump.html to be in parsed templates")
+	}
+}
+
 func TestTxidValidation(t *testing.T) {
 	tests := []struct {
 		txid  string

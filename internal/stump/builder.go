@@ -2,6 +2,7 @@ package stump
 
 import (
 	"encoding/binary"
+	"sort"
 )
 
 // STUMP represents a Subtree Unified Merkle Path in BRC-0074 BUMP format.
@@ -20,76 +21,137 @@ type PathLevel struct {
 type Leaf struct {
 	Offset    uint64
 	Hash      []byte // 32 bytes
-	TxID      bool   // true if this is a txid (duplicate flag=0, txid flag=1)
-	Duplicate bool   // true if hash should be duplicated from the complementary node
+	TxID      bool   // true if this is a registered txid (flag=0x02)
+	Duplicate bool   // true if hash should be duplicated from the working hash (flag=0x01)
 }
 
 // Build constructs a STUMP for registered txids within a subtree merkle tree.
-// merkleTree is the full subtree merkle tree as a flat array (level 0 = leaves = txids).
+//
+// leaves contains the leaf hashes (txid hashes) in their original order.
+// internalNodes contains the internal merkle tree nodes as returned by
+// go-subtree's BuildMerkleTreeStoreFromBytes (level-by-level, NOT including leaves).
 // registeredIndices maps leaf index to the txid at that position.
-func Build(blockHeight uint64, merkleTree [][]byte, registeredIndices map[int]string) *STUMP {
-	if len(registeredIndices) == 0 {
+//
+// The resulting STUMP follows BRC-0074 BUMP format where the subtree root
+// replaces the block merkle root.
+func Build(blockHeight uint64, leaves [][]byte, internalNodes [][]byte, registeredIndices map[int]string) *STUMP {
+	if len(registeredIndices) == 0 || len(leaves) == 0 {
 		return nil
 	}
 
-	treeHeight := calculateTreeHeight(len(merkleTree))
+	nLeaves := len(leaves)
+	nextPoT := nextPowerOfTwo(nLeaves)
+
+	// Calculate tree height (number of levels from leaves to root, exclusive of root).
+	treeHeight := uint8(0)
+	for n := nextPoT; n > 1; n >>= 1 {
+		treeHeight++
+	}
+
+	// Single leaf: root equals the leaf, no path needed.
+	if treeHeight == 0 {
+		return &STUMP{
+			BlockHeight: blockHeight,
+			TreeHeight:  0,
+		}
+	}
+
+	// getNode returns the hash at the given level and index.
+	// Level 0 = leaves, level 1+ = internalNodes.
+	getNode := func(level uint8, index int) []byte {
+		if level == 0 {
+			if index < nLeaves {
+				return leaves[index]
+			}
+			return nil // padded position
+		}
+		// Internal nodes layout: level k starts at offset sum(nextPoT/2^i, i=1..k-1).
+		off := 0
+		sz := nextPoT >> 1
+		for k := uint8(1); k < level; k++ {
+			off += sz
+			sz >>= 1
+		}
+		pos := off + index
+		if pos < len(internalNodes) {
+			return internalNodes[pos]
+		}
+		return nil
+	}
+
 	stump := &STUMP{
 		BlockHeight: blockHeight,
 		TreeHeight:  treeHeight,
 		Paths:       make([]PathLevel, treeHeight),
 	}
 
-	// Track which nodes we need at each level
+	// Track which indices we need at each level.
 	needed := make(map[int]bool)
 	for idx := range registeredIndices {
 		needed[idx] = true
 	}
 
-	levelSize := leafCount(merkleTree)
-	offset := 0
+	// Track the count of real (non-padding) nodes at each level.
+	realCount := nLeaves
 
 	for level := uint8(0); level < treeHeight; level++ {
-		pathLevel := PathLevel{}
+		addedOffsets := make(map[uint64]bool)
+		var pathLeaves []Leaf
 		nextNeeded := make(map[int]bool)
 
 		for idx := range needed {
-			// Add the sibling node as a path element
-			siblingIdx := idx ^ 1 // XOR with 1 to get sibling
-
-			if siblingIdx < levelSize {
-				leaf := Leaf{
-					Offset: uint64(siblingIdx),
+			// At level 0, include the registered txid itself.
+			if level == 0 {
+				if _, isReg := registeredIndices[idx]; isReg && !addedOffsets[uint64(idx)] {
+					pathLeaves = append(pathLeaves, Leaf{
+						Offset: uint64(idx),
+						Hash:   leaves[idx],
+						TxID:   true,
+					})
+					addedOffsets[uint64(idx)] = true
 				}
-
-				nodePos := offset + siblingIdx
-				if nodePos < len(merkleTree) {
-					if siblingIdx == idx {
-						// Self-duplicate
-						leaf.Duplicate = true
-					} else {
-						leaf.Hash = merkleTree[nodePos]
-					}
-				}
-
-				// Check if sibling is also a registered txid at level 0
-				if level == 0 {
-					if _, isRegistered := registeredIndices[siblingIdx]; isRegistered {
-						leaf.TxID = true
-					}
-				}
-
-				pathLevel.Leaves = append(pathLevel.Leaves, leaf)
 			}
 
-			// Parent index for next level
-			parentIdx := idx / 2
-			nextNeeded[parentIdx] = true
+			// Add sibling hash needed for proof.
+			siblingIdx := idx ^ 1
+			if !addedOffsets[uint64(siblingIdx)] {
+				leaf := Leaf{Offset: uint64(siblingIdx)}
+
+				if siblingIdx >= realCount {
+					// Sibling is beyond real data — verifier duplicates the working hash.
+					leaf.Duplicate = true
+				} else {
+					h := getNode(level, siblingIdx)
+					if h != nil {
+						hashCopy := make([]byte, len(h))
+						copy(hashCopy, h)
+						leaf.Hash = hashCopy
+					} else {
+						leaf.Duplicate = true
+					}
+					// Check if sibling is also a registered txid at level 0.
+					if level == 0 {
+						if _, isReg := registeredIndices[siblingIdx]; isReg {
+							leaf.TxID = true
+						}
+					}
+				}
+
+				pathLeaves = append(pathLeaves, leaf)
+				addedOffsets[uint64(siblingIdx)] = true
+			}
+
+			nextNeeded[idx/2] = true
 		}
 
-		stump.Paths[level] = pathLevel
-		offset += levelSize
-		levelSize = (levelSize + 1) / 2
+		// Sort leaves by offset for deterministic output.
+		sort.Slice(pathLeaves, func(i, j int) bool {
+			return pathLeaves[i].Offset < pathLeaves[j].Offset
+		})
+
+		stump.Paths[level] = PathLevel{Leaves: pathLeaves}
 		needed = nextNeeded
+		realCount = (realCount + 1) / 2
 	}
 
 	return stump
@@ -103,32 +165,31 @@ func (s *STUMP) Encode() []byte {
 
 	buf := make([]byte, 0, 256)
 
-	// Block height (VarInt)
-	buf = appendVarInt(buf, s.BlockHeight)
+	// Block height (CompactSize VarInt).
+	buf = appendCompactSize(buf, s.BlockHeight)
 
-	// Tree height
+	// Tree height (single byte).
 	buf = append(buf, s.TreeHeight)
 
-	// Path levels
+	// Path levels.
 	for _, level := range s.Paths {
-		// Number of leaves at this level (VarInt)
-		buf = appendVarInt(buf, uint64(len(level.Leaves)))
+		// Number of leaves at this level (CompactSize VarInt).
+		buf = appendCompactSize(buf, uint64(len(level.Leaves)))
 
 		for _, leaf := range level.Leaves {
-			// Offset (VarInt)
-			buf = appendVarInt(buf, leaf.Offset)
+			// Offset (CompactSize VarInt).
+			buf = appendCompactSize(buf, leaf.Offset)
 
-			// Flags byte: bit 0 = duplicate, bit 1 = txid
+			// Flags byte: 0x00 = hash follows (not txid), 0x01 = duplicate, 0x02 = hash follows (is txid).
 			var flags byte
 			if leaf.Duplicate {
-				flags |= 0x01
-			}
-			if leaf.TxID {
-				flags |= 0x02
+				flags = 0x01
+			} else if leaf.TxID {
+				flags = 0x02
 			}
 			buf = append(buf, flags)
 
-			// Hash (32 bytes, only if not duplicate)
+			// Hash (32 bytes, only if not duplicate).
 			if !leaf.Duplicate {
 				buf = append(buf, leaf.Hash...)
 			}
@@ -158,7 +219,10 @@ func MergeSTUMPs(stumps []*STUMP) *STUMP {
 		for _, s := range stumps {
 			if int(level) < len(s.Paths) {
 				for _, leaf := range s.Paths[level].Leaves {
-					if _, exists := seen[leaf.Offset]; !exists {
+					if existing, exists := seen[leaf.Offset]; !exists {
+						seen[leaf.Offset] = leaf
+					} else if leaf.TxID && !existing.TxID {
+						// Prefer the version with TxID flag set.
 						seen[leaf.Offset] = leaf
 					}
 				}
@@ -169,6 +233,9 @@ func MergeSTUMPs(stumps []*STUMP) *STUMP {
 		for _, leaf := range seen {
 			leaves = append(leaves, leaf)
 		}
+		sort.Slice(leaves, func(i, j int) bool {
+			return leaves[i].Offset < leaves[j].Offset
+		})
 		merged.Paths[level] = PathLevel{Leaves: leaves}
 	}
 
@@ -187,33 +254,33 @@ func GroupByCallback(registrations map[string][]string) map[string][]string {
 	return result
 }
 
-func calculateTreeHeight(nodeCount int) uint8 {
-	if nodeCount <= 1 {
+func nextPowerOfTwo(n int) int {
+	if n <= 1 {
 		return 1
 	}
-	height := uint8(0)
-	n := nodeCount
-	for n > 1 {
-		n = (n + 1) / 2
-		height++
+	p := 1
+	for p < n {
+		p <<= 1
 	}
-	return height
+	return p
 }
 
-func leafCount(tree [][]byte) int {
-	// For a binary tree stored as flat array, leaf count is roughly half + 1
-	// This is a simplified calculation; actual implementation depends on tree format
-	n := len(tree)
-	leaves := 1
-	for leaves < n {
-		leaves *= 2
+// appendCompactSize appends a Bitcoin CompactSize unsigned integer to buf.
+func appendCompactSize(buf []byte, v uint64) []byte {
+	switch {
+	case v < 253:
+		return append(buf, byte(v))
+	case v <= 0xFFFF:
+		b := [3]byte{0xFD}
+		binary.LittleEndian.PutUint16(b[1:], uint16(v))
+		return append(buf, b[:]...)
+	case v <= 0xFFFFFFFF:
+		b := [5]byte{0xFE}
+		binary.LittleEndian.PutUint32(b[1:], uint32(v))
+		return append(buf, b[:]...)
+	default:
+		b := [9]byte{0xFF}
+		binary.LittleEndian.PutUint64(b[1:], v)
+		return append(buf, b[:]...)
 	}
-	return leaves / 2
 }
-
-func appendVarInt(buf []byte, v uint64) []byte {
-	var tmp [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(tmp[:], v)
-	return append(buf, tmp[:n]...)
-}
-

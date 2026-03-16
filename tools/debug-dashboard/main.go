@@ -81,6 +81,7 @@ func main() {
 	mux.HandleFunc("POST /lookup", h.handleLookup)
 	mux.HandleFunc("GET /registrations", h.handleRegistrations)
 	mux.HandleFunc("GET /callbacks", h.handleCallbacks)
+	mux.HandleFunc("GET /stump", h.handleStump)
 
 	// Callback receiver.
 	mux.HandleFunc("POST /callbacks/receive", h.handleCallbackReceive)
@@ -137,7 +138,7 @@ func (w *statusWriter) WriteHeader(code int) {
 // layout. This avoids the issue where all pages define {{define "content"}} and
 // only the last-parsed one would win if all were in a single template set.
 func parseTemplates() (map[string]*template.Template, error) {
-	pages := []string{"home.html", "registrations.html", "callbacks.html"}
+	pages := []string{"home.html", "registrations.html", "callbacks.html", "stump.html"}
 	templates := make(map[string]*template.Template, len(pages))
 
 	layoutData, err := fs.ReadFile(templateFS, "templates/layout.html")

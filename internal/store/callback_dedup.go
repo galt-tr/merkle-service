@@ -8,6 +8,7 @@ import (
 	"time"
 
 	as "github.com/aerospike/aerospike-client-go/v7"
+	astypes "github.com/aerospike/aerospike-client-go/v7/types"
 )
 
 const (
@@ -65,10 +66,22 @@ func (s *CallbackDedupStore) Record(txid, callbackURL, statusType string, ttl ti
 	}
 
 	wp := s.client.WritePolicy(s.maxRetries, s.retryBaseMs)
-	wp.Expiration = uint32(ttl.Seconds())
+	if ttl > 0 {
+		wp.Expiration = uint32(ttl.Seconds())
+	}
 
 	bins := as.BinMap{dedupMarkerBin: 1}
 	if err := s.client.Client().Put(wp, key, bins); err != nil {
+		// If TTL is rejected (namespace lacks nsup-period), retry without TTL.
+		if asErr, ok := err.(as.Error); ok && asErr.Matches(astypes.FAIL_FORBIDDEN) && ttl > 0 {
+			s.logger.Warn("callback dedup TTL rejected, writing without TTL (configure Aerospike nsup-period to enable TTL)",
+				"txid", txid, "statusType", statusType)
+			wp2 := s.client.WritePolicy(s.maxRetries, s.retryBaseMs)
+			if err2 := s.client.Client().Put(wp2, key, bins); err2 != nil {
+				return fmt.Errorf("failed to record dedup (without TTL): %w", err2)
+			}
+			return nil
+		}
 		return fmt.Errorf("failed to record dedup: %w", err)
 	}
 	return nil

@@ -218,6 +218,11 @@ func (h *Handlers) handleCallbackReceive(w http.ResponseWriter, r *http.Request)
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
+// handleStump renders the STUMP visualizer page.
+func (h *Handlers) handleStump(w http.ResponseWriter, r *http.Request) {
+	h.render(w, "stump.html", h.newPageData("STUMP Visualizer"))
+}
+
 // handleCallbacksClear clears all stored callbacks.
 func (h *Handlers) handleCallbacksClear(w http.ResponseWriter, r *http.Request) {
 	h.callbackStore.Clear()

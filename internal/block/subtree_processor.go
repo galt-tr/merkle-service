@@ -82,12 +82,20 @@ func ProcessBlockSubtree(
 		return fmt.Errorf("building merkle tree for subtree %s: %w", subtreeHash, err)
 	}
 
-	// Convert chainhash.Hash merkle tree to [][]byte for stump.Build.
-	merkleTree := make([][]byte, len(*merkleTreeStore))
+	// Convert leaf hashes to [][]byte.
+	leaves := make([][]byte, len(nodes))
+	for i, node := range nodes {
+		hashCopy := make([]byte, chainhash.HashSize)
+		copy(hashCopy, node.Hash[:])
+		leaves[i] = hashCopy
+	}
+
+	// Convert internal nodes (from BuildMerkleTreeStoreFromBytes) to [][]byte.
+	internalNodes := make([][]byte, len(*merkleTreeStore))
 	for i, h := range *merkleTreeStore {
 		hashCopy := make([]byte, chainhash.HashSize)
 		copy(hashCopy, h[:])
-		merkleTree[i] = hashCopy
+		internalNodes[i] = hashCopy
 	}
 
 	// 6.6: Map registered txids to their leaf indices in the subtree.
@@ -99,7 +107,7 @@ func ProcessBlockSubtree(
 	}
 
 	// 6.7: Build STUMP.
-	s := stump.Build(blockHeight, merkleTree, registeredIndices)
+	s := stump.Build(blockHeight, leaves, internalNodes, registeredIndices)
 	if s == nil {
 		return nil
 	}

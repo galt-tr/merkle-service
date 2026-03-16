@@ -186,12 +186,19 @@ func TestMerkleTreeAndSTUMPBuild(t *testing.T) {
 		t.Fatal("merkle tree should not be empty")
 	}
 
-	// Convert to [][]byte.
-	merkleTree := make([][]byte, len(*merkleTreeStore))
+	// Build leaves and internal nodes separately.
+	leaves := make([][]byte, len(nodes))
+	for i, node := range nodes {
+		hashCopy := make([]byte, 32)
+		copy(hashCopy, node.Hash[:])
+		leaves[i] = hashCopy
+	}
+
+	internalNodes := make([][]byte, len(*merkleTreeStore))
 	for i, h := range *merkleTreeStore {
 		hashCopy := make([]byte, 32)
 		copy(hashCopy, h[:])
-		merkleTree[i] = hashCopy
+		internalNodes[i] = hashCopy
 	}
 
 	// Register leaf 0 and leaf 2.
@@ -200,7 +207,7 @@ func TestMerkleTreeAndSTUMPBuild(t *testing.T) {
 		2: nodes[2].Hash.String(),
 	}
 
-	s := stump.Build(100, merkleTree, registeredIndices)
+	s := stump.Build(100, leaves, internalNodes, registeredIndices)
 	if s == nil {
 		t.Fatal("STUMP should not be nil")
 	}

@@ -64,10 +64,23 @@ func (s *SeenCounterStore) Increment(txid string, subtreeID string) (*IncrementR
 		return nil, fmt.Errorf("failed to increment seen counter: %w", err)
 	}
 
-	sizeVal := record.Bins[seenSubtreesBin]
-	newSize, ok := sizeVal.(int)
-	if !ok {
-		return nil, fmt.Errorf("unexpected type for seen counter list size: %T", sizeVal)
+	// When multiple operations target the same bin, Aerospike returns results
+	// as []interface{}. Index 0 = ListAppend result, index 1 = ListSize result.
+	var newSize int
+	switch v := record.Bins[seenSubtreesBin].(type) {
+	case int:
+		newSize = v
+	case []interface{}:
+		if len(v) < 2 {
+			return nil, fmt.Errorf("expected at least 2 results for seen counter ops, got %d", len(v))
+		}
+		size, ok := v[1].(int)
+		if !ok {
+			return nil, fmt.Errorf("unexpected type for list size result: %T", v[1])
+		}
+		newSize = size
+	default:
+		return nil, fmt.Errorf("unexpected type for seen counter list size: %T", v)
 	}
 
 	// Check if threshold was already fired previously.
