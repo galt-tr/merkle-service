@@ -20,15 +20,17 @@ type Server struct {
 	cfg        config.APIConfig
 	httpServer *http.Server
 	router     chi.Router
-	regStore   *store.RegistrationStore
-	asClient   *store.AerospikeClient
+	regStore        *store.RegistrationStore
+	urlRegistry     *store.CallbackURLRegistry
+	asClient        *store.AerospikeClient
 }
 
-func NewServer(cfg config.APIConfig, regStore *store.RegistrationStore, asClient *store.AerospikeClient, logger *slog.Logger) *Server {
+func NewServer(cfg config.APIConfig, regStore *store.RegistrationStore, urlRegistry *store.CallbackURLRegistry, asClient *store.AerospikeClient, logger *slog.Logger) *Server {
 	s := &Server{
-		cfg:      cfg,
-		regStore: regStore,
-		asClient: asClient,
+		cfg:         cfg,
+		regStore:    regStore,
+		urlRegistry: urlRegistry,
+		asClient:    asClient,
 	}
 	s.InitBase("api-server")
 	if logger != nil {

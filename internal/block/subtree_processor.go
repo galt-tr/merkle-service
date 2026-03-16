@@ -17,6 +17,8 @@ import (
 
 // ProcessBlockSubtree processes a single subtree within a block: retrieves the
 // subtree data, checks registrations, builds a STUMP, and emits MINED callbacks.
+// Returns (hadRegistrations, error) where hadRegistrations is true if any registered
+// txids were found in this subtree.
 func ProcessBlockSubtree(
 	ctx context.Context,
 	subtreeHash string,
@@ -29,7 +31,7 @@ func ProcessBlockSubtree(
 	stumpsProducer *kafka.Producer,
 	postMineTTLSec int,
 	logger *slog.Logger,
-) error {
+) (bool, error) {
 	// 6.2: Retrieve subtree data from blob store, falling back to DataHub.
 	rawData, err := subtreeStore.GetSubtree(subtreeHash)
 	if err != nil || rawData == nil {
@@ -39,7 +41,7 @@ func ProcessBlockSubtree(
 		)
 		rawData, err = dhClient.FetchSubtreeRaw(ctx, dataHubURL, subtreeHash)
 		if err != nil {
-			return fmt.Errorf("fetching subtree %s from DataHub: %w", subtreeHash, err)
+			return false, fmt.Errorf("fetching subtree %s from DataHub: %w", subtreeHash, err)
 		}
 		// Store for potential future use.
 		if storeErr := subtreeStore.StoreSubtree(subtreeHash, rawData, blockHeight); storeErr != nil {
@@ -51,11 +53,11 @@ func ProcessBlockSubtree(
 	// DataHub returns concatenated 32-byte hashes, not full go-subtree Serialize() format.
 	nodes, err := datahub.ParseRawNodes(rawData)
 	if err != nil {
-		return fmt.Errorf("parsing subtree %s: %w", subtreeHash, err)
+		return false, fmt.Errorf("parsing subtree %s: %w", subtreeHash, err)
 	}
 
 	if len(nodes) == 0 {
-		return nil
+		return false, nil
 	}
 
 	// 6.4: Extract TxIDs and batch-lookup registrations.
@@ -69,17 +71,17 @@ func ProcessBlockSubtree(
 
 	registrations, err := regStore.BatchGet(txids)
 	if err != nil {
-		return fmt.Errorf("batch get registrations for subtree %s: %w", subtreeHash, err)
+		return false, fmt.Errorf("batch get registrations for subtree %s: %w", subtreeHash, err)
 	}
 
 	if len(registrations) == 0 {
-		return nil
+		return false, nil
 	}
 
 	// 6.5: Build full merkle tree from subtree nodes.
 	merkleTreeStore, err := subtreepkg.BuildMerkleTreeStoreFromBytes(nodes)
 	if err != nil {
-		return fmt.Errorf("building merkle tree for subtree %s: %w", subtreeHash, err)
+		return false, fmt.Errorf("building merkle tree for subtree %s: %w", subtreeHash, err)
 	}
 
 	// Convert leaf hashes to [][]byte.
@@ -109,7 +111,7 @@ func ProcessBlockSubtree(
 	// 6.7: Build STUMP.
 	s := stump.Build(blockHeight, leaves, internalNodes, registeredIndices)
 	if s == nil {
-		return nil
+		return false, nil
 	}
 
 	// 6.8: Encode STUMP to BRC-0074 binary.
@@ -162,5 +164,5 @@ func ProcessBlockSubtree(
 		"registeredTxids", len(registrations),
 	)
 
-	return nil
+	return true, nil
 }

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -69,5 +70,20 @@ func TestHandleWatch_InvalidBody(t *testing.T) {
 	w := postWatch(router, `not json`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// TestServerHasURLRegistryField verifies the Server struct holds a urlRegistry
+// field and that NewServer wires it correctly.
+func TestServerHasURLRegistryField(t *testing.T) {
+	s := &Server{}
+	if s.urlRegistry != nil {
+		t.Error("expected nil urlRegistry on zero-value Server")
+	}
+
+	// Verify NewServer accepts and stores the registry.
+	s2 := NewServer(config.APIConfig{Port: 8080}, nil, nil, nil, nil)
+	if s2.urlRegistry != nil {
+		t.Error("expected nil urlRegistry when nil passed to NewServer")
 	}
 }

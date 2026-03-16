@@ -67,6 +67,13 @@ func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Register callback URL in the broadcast registry.
+	if s.urlRegistry != nil {
+		if err := s.urlRegistry.Add(req.CallbackURL); err != nil {
+			s.Logger.Warn("failed to add callback URL to registry", "url", req.CallbackURL, "error", err)
+		}
+	}
+
 	writeJSON(w, http.StatusOK, WatchResponse{
 		Status:  "ok",
 		Message: "registration successful",

@@ -86,11 +86,19 @@ func main() {
 	}
 	defer stumpsProducer.Close()
 
+	urlRegistry := store.NewCallbackURLRegistry(
+		asClient,
+		cfg.Aerospike.CallbackURLRegistry,
+		cfg.Aerospike.MaxRetries,
+		cfg.Aerospike.RetryBaseMs,
+		logger,
+	)
+
 	// Create services.
-	apiServer := api.NewServer(cfg.API, regStore, asClient, logger)
+	apiServer := api.NewServer(cfg.API, regStore, urlRegistry, asClient, logger)
 	p2pClient := p2p.NewClient(cfg.P2P, subtreeProducer, blockProducer, logger)
 	subtreeProcessor := subtree.NewProcessor(cfg, regStore, seenStore, subtreeStore)
-	blockProcessor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, stumpsProducer, regStore, subtreeStore, logger)
+	blockProcessor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, stumpsProducer, regStore, subtreeStore, urlRegistry, logger)
 	callbackDedupStore := store.NewCallbackDedupStore(
 		asClient,
 		cfg.Aerospike.CallbackDedupSet,

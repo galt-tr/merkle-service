@@ -12,6 +12,7 @@ const (
 	StatusSeenOnNetwork  StatusType = "SEEN_ON_NETWORK"
 	StatusSeenMultiNodes StatusType = "SEEN_MULTIPLE_NODES"
 	StatusMined          StatusType = "MINED"
+	StatusBlockProcessed StatusType = "BLOCK_PROCESSED"
 )
 
 // SubtreeMessage represents a subtree announcement received from P2P.

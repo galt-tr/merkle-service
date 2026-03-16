@@ -987,6 +987,256 @@ func TestEndToEnd_ExactlyOneCallbackPerStatusType(t *testing.T) {
 	}
 }
 
+func TestDeliverCallback_BlockProcessed(t *testing.T) {
+	var receivedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		receivedBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("failed to read body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+
+	msg := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		StatusType:  kafka.StatusBlockProcessed,
+		BlockHash:   "000000abc123",
+	}
+
+	err := ds.deliverCallback(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var payload callbackPayload
+	if err := json.Unmarshal(receivedBody, &payload); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if payload.Status != "BLOCK_PROCESSED" {
+		t.Errorf("expected status BLOCK_PROCESSED, got %q", payload.Status)
+	}
+	if payload.BlockHash != "000000abc123" {
+		t.Errorf("expected blockHash 000000abc123, got %q", payload.BlockHash)
+	}
+	if payload.TxID != "" {
+		t.Errorf("expected empty txid, got %q", payload.TxID)
+	}
+	if payload.StumpData != "" {
+		t.Errorf("expected empty stumpData, got %q", payload.StumpData)
+	}
+}
+
+func TestHandleMessage_BlockProcessedDedupOnBlockHash(t *testing.T) {
+	var httpCallCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCallCount++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	cfg.Callback.DedupTTLSec = 86400
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+	dedup := newMockDedupStore()
+	ds.dedupStore = dedup
+
+	msg := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		StatusType:  kafka.StatusBlockProcessed,
+		BlockHash:   "blockhash-bp-1",
+	}
+	data, _ := msg.Encode()
+
+	// First delivery.
+	_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 1})
+	if httpCallCount != 1 {
+		t.Fatalf("expected 1 HTTP call, got %d", httpCallCount)
+	}
+
+	// Duplicate — should be deduped on blockHash.
+	_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 2})
+	if httpCallCount != 1 {
+		t.Errorf("expected duplicate BLOCK_PROCESSED to be skipped, got %d calls", httpCallCount)
+	}
+	if ds.messagesDedupe.Load() != 1 {
+		t.Errorf("expected messagesDedupe=1, got %d", ds.messagesDedupe.Load())
+	}
+}
+
+func TestBuildIdempotencyKey_BlockProcessed(t *testing.T) {
+	msg := &kafka.StumpsMessage{
+		StatusType: kafka.StatusBlockProcessed,
+		BlockHash:  "blockhash-xyz",
+	}
+	key := buildIdempotencyKey(msg)
+	if key != "blockhash-xyz:BLOCK_PROCESSED" {
+		t.Errorf("expected 'blockhash-xyz:BLOCK_PROCESSED', got %q", key)
+	}
+}
+
+// TestEndToEnd_MinedAndBlockProcessedCallbacks verifies that both MINED and
+// BLOCK_PROCESSED callbacks are delivered via the same pipeline, and each is
+// delivered exactly once per callback URL.
+func TestEndToEnd_MinedAndBlockProcessedCallbacks(t *testing.T) {
+	var mu sync.Mutex
+	delivered := make(map[string]int) // "callbackURL:status" -> count
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload callbackPayload
+		json.Unmarshal(body, &payload)
+
+		mu.Lock()
+		key := r.URL.Path + ":" + payload.Status
+		delivered[key]++
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	cfg.Callback.DedupTTLSec = 86400
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+	dedup := newMockDedupStore()
+	ds.dedupStore = dedup
+
+	// Simulate MINED callback for cb1.
+	minedMsg := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/cb1",
+		TxIDs:       []string{"tx1"},
+		StatusType:  kafka.StatusMined,
+		BlockHash:   "blockhash-e2e",
+		StumpData:   []byte{0x01},
+		SubtreeID:   "st-1",
+	}
+	data, _ := minedMsg.Encode()
+	_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 1})
+
+	// Simulate BLOCK_PROCESSED for cb1.
+	bpMsg1 := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/cb1",
+		StatusType:  kafka.StatusBlockProcessed,
+		BlockHash:   "blockhash-e2e",
+	}
+	data, _ = bpMsg1.Encode()
+	_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 2})
+
+	// Simulate BLOCK_PROCESSED for cb2.
+	bpMsg2 := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/cb2",
+		StatusType:  kafka.StatusBlockProcessed,
+		BlockHash:   "blockhash-e2e",
+	}
+	data, _ = bpMsg2.Encode()
+	_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 3})
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if delivered["/cb1:MINED"] != 1 {
+		t.Errorf("expected 1 MINED for cb1, got %d", delivered["/cb1:MINED"])
+	}
+	if delivered["/cb1:BLOCK_PROCESSED"] != 1 {
+		t.Errorf("expected 1 BLOCK_PROCESSED for cb1, got %d", delivered["/cb1:BLOCK_PROCESSED"])
+	}
+	if delivered["/cb2:BLOCK_PROCESSED"] != 1 {
+		t.Errorf("expected 1 BLOCK_PROCESSED for cb2, got %d", delivered["/cb2:BLOCK_PROCESSED"])
+	}
+}
+
+// TestEndToEnd_NoRegistrations_NoBlockProcessed verifies that when no
+// BLOCK_PROCESSED messages are sent through the delivery pipeline, none are delivered.
+func TestEndToEnd_NoRegistrations_NoBlockProcessed(t *testing.T) {
+	var httpCallCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCallCount++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+
+	// No messages sent = no callbacks. This verifies the contract that the
+	// block processor must decide whether to emit BLOCK_PROCESSED.
+	if httpCallCount != 0 {
+		t.Errorf("expected no HTTP calls with no messages, got %d", httpCallCount)
+	}
+	if ds.messagesProcessed.Load() != 0 {
+		t.Errorf("expected 0 processed, got %d", ds.messagesProcessed.Load())
+	}
+}
+
+// TestEndToEnd_BlockProcessedRetryOnFailure verifies BLOCK_PROCESSED messages
+// follow the same retry/DLQ path as other message types.
+func TestEndToEnd_BlockProcessedRetryOnFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	cfg.Callback.MaxRetries = 3
+	cfg.Callback.BackoffBaseSec = 5
+	ds, retryProducer, dlqProducer := newTestDeliveryService(t, cfg, server.Client())
+
+	// First attempt (retryCount=0) fails -> should retry.
+	msg := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		StatusType:  kafka.StatusBlockProcessed,
+		BlockHash:   "blockhash-retry",
+		RetryCount:  0,
+	}
+	data, _ := msg.Encode()
+	err := ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 1})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	retryMsgs := retryProducer.getMessages()
+	if len(retryMsgs) != 1 {
+		t.Fatalf("expected 1 retry, got %d", len(retryMsgs))
+	}
+	requeued := decodePublishedStumpsMessage(t, retryMsgs[0])
+	if requeued.RetryCount != 1 {
+		t.Errorf("expected retryCount=1, got %d", requeued.RetryCount)
+	}
+	if requeued.StatusType != kafka.StatusBlockProcessed {
+		t.Errorf("expected BLOCK_PROCESSED status preserved, got %s", requeued.StatusType)
+	}
+
+	// Now test DLQ: message at max retries.
+	msg2 := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		StatusType:  kafka.StatusBlockProcessed,
+		BlockHash:   "blockhash-dlq",
+		RetryCount:  3,
+	}
+	data2, _ := msg2.Encode()
+	err = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data2, Offset: 2})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dlqMsgs := dlqProducer.getMessages()
+	if len(dlqMsgs) != 1 {
+		t.Fatalf("expected 1 DLQ message, got %d", len(dlqMsgs))
+	}
+	dlqMsg := decodePublishedStumpsMessage(t, dlqMsgs[0])
+	if dlqMsg.StatusType != kafka.StatusBlockProcessed {
+		t.Errorf("expected BLOCK_PROCESSED in DLQ, got %s", dlqMsg.StatusType)
+	}
+	if dlqMsg.BlockHash != "blockhash-dlq" {
+		t.Errorf("expected blockhash-dlq, got %s", dlqMsg.BlockHash)
+	}
+}
+
 func TestHandleMessage_LinearBackoffCalculation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)

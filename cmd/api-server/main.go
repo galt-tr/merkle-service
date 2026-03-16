@@ -42,8 +42,16 @@ func main() {
 		logger,
 	)
 
+	urlRegistry := store.NewCallbackURLRegistry(
+		asClient,
+		cfg.Aerospike.CallbackURLRegistry,
+		cfg.Aerospike.MaxRetries,
+		cfg.Aerospike.RetryBaseMs,
+		logger,
+	)
+
 	// Create, init, and start the API server.
-	server := api.NewServer(cfg.API, regStore, asClient, logger)
+	server := api.NewServer(cfg.API, regStore, urlRegistry, asClient, logger)
 
 	if err := server.Init(nil); err != nil {
 		log.Fatal("failed to init api server: ", err)

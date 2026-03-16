@@ -33,7 +33,8 @@ type AerospikeConfig struct {
 	Namespace        string `yaml:"namespace"        mapstructure:"namespace"`
 	SetName          string `yaml:"setName"          mapstructure:"setname"`
 	SeenSet          string `yaml:"seenSet"          mapstructure:"seenset"`
-	CallbackDedupSet string `yaml:"callbackDedupSet" mapstructure:"callbackdedupset"`
+	CallbackDedupSet    string `yaml:"callbackDedupSet"    mapstructure:"callbackdedupset"`
+	CallbackURLRegistry string `yaml:"callbackUrlRegistry" mapstructure:"callbackurlregistry"`
 	MaxRetries       int    `yaml:"maxRetries"       mapstructure:"maxretries"`
 	RetryBaseMs      int    `yaml:"retryBaseMs"      mapstructure:"retrybasems"`
 }
@@ -104,6 +105,7 @@ func registerDefaults(v *viper.Viper) {
 	v.SetDefault("aerospike.setname", "registrations")
 	v.SetDefault("aerospike.seenset", "seen_counters")
 	v.SetDefault("aerospike.callbackdedupset", "callback_dedup")
+	v.SetDefault("aerospike.callbackurlregistry", "callback_urls")
 	v.SetDefault("aerospike.maxretries", 3)
 	v.SetDefault("aerospike.retrybasems", 100)
 
@@ -166,7 +168,8 @@ func bindEnvVars(v *viper.Viper) {
 		"aerospike.namespace":   "AEROSPIKE_NAMESPACE",
 		"aerospike.setname":     "AEROSPIKE_SET",
 		"aerospike.seenset":          "AEROSPIKE_SEEN_SET",
-		"aerospike.callbackdedupset": "AEROSPIKE_CALLBACK_DEDUP_SET",
+		"aerospike.callbackdedupset":    "AEROSPIKE_CALLBACK_DEDUP_SET",
+		"aerospike.callbackurlregistry": "AEROSPIKE_CALLBACK_URL_REGISTRY",
 		"aerospike.maxretries":  "AEROSPIKE_MAX_RETRIES",
 		"aerospike.retrybasems": "AEROSPIKE_RETRY_BASE_MS",
 

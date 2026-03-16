@@ -104,3 +104,40 @@ func TestStumpsMessage_EncodeDecode(t *testing.T) {
 		t.Errorf("retry count mismatch")
 	}
 }
+
+func TestBlockProcessedMessage_EncodeDecode(t *testing.T) {
+	msg := &StumpsMessage{
+		CallbackURL: "https://arcade.example.com/callback",
+		StatusType:  StatusBlockProcessed,
+		BlockHash:   "000000000000000003a2d78e5f7c9012",
+	}
+
+	data, err := msg.Encode()
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+
+	decoded, err := DecodeStumpsMessage(data)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+
+	if decoded.StatusType != StatusBlockProcessed {
+		t.Errorf("expected BLOCK_PROCESSED, got %s", decoded.StatusType)
+	}
+	if decoded.BlockHash != msg.BlockHash {
+		t.Errorf("blockHash mismatch: got %s", decoded.BlockHash)
+	}
+	if decoded.CallbackURL != msg.CallbackURL {
+		t.Errorf("callbackURL mismatch: got %s", decoded.CallbackURL)
+	}
+	if decoded.TxID != "" {
+		t.Errorf("expected empty txid, got %s", decoded.TxID)
+	}
+	if len(decoded.TxIDs) != 0 {
+		t.Errorf("expected empty txids, got %v", decoded.TxIDs)
+	}
+	if len(decoded.StumpData) != 0 {
+		t.Errorf("expected empty stumpData, got %v", decoded.StumpData)
+	}
+}

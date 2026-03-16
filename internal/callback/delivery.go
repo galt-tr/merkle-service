@@ -206,17 +206,14 @@ func (d *DeliveryService) handleMessage(ctx context.Context, msg *sarama.Consume
 
 	// Check callback dedup — skip if already delivered.
 	if d.dedupStore != nil {
-		txid := stumpsMsg.TxID
-		if txid == "" && len(stumpsMsg.TxIDs) > 0 {
-			txid = stumpsMsg.TxIDs[0]
-		}
-		if txid != "" {
-			exists, err := d.dedupStore.Exists(txid, stumpsMsg.CallbackURL, string(stumpsMsg.StatusType))
+		dedupKey := dedupKeyForMessage(stumpsMsg)
+		if dedupKey != "" {
+			exists, err := d.dedupStore.Exists(dedupKey, stumpsMsg.CallbackURL, string(stumpsMsg.StatusType))
 			if err != nil {
 				d.Logger.Warn("dedup check failed, proceeding with delivery", "error", err)
 			} else if exists {
 				d.Logger.Debug("skipping duplicate callback delivery",
-					"txid", txid,
+					"dedupKey", dedupKey,
 					"callbackUrl", stumpsMsg.CallbackURL,
 					"statusType", stumpsMsg.StatusType,
 				)
@@ -241,13 +238,10 @@ func (d *DeliveryService) handleMessage(ctx context.Context, msg *sarama.Consume
 	if err == nil {
 		// Record successful delivery for dedup.
 		if d.dedupStore != nil {
-			txid := stumpsMsg.TxID
-			if txid == "" && len(stumpsMsg.TxIDs) > 0 {
-				txid = stumpsMsg.TxIDs[0]
-			}
-			if txid != "" {
+			dedupKey := dedupKeyForMessage(stumpsMsg)
+			if dedupKey != "" {
 				ttl := time.Duration(d.cfg.Callback.DedupTTLSec) * time.Second
-				if recErr := d.dedupStore.Record(txid, stumpsMsg.CallbackURL, string(stumpsMsg.StatusType), ttl); recErr != nil {
+				if recErr := d.dedupStore.Record(dedupKey, stumpsMsg.CallbackURL, string(stumpsMsg.StatusType), ttl); recErr != nil {
 					d.Logger.Warn("failed to record callback dedup", "error", recErr)
 				}
 			}
@@ -345,11 +339,29 @@ func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.Stumps
 
 // buildIdempotencyKey creates a unique key for a callback delivery.
 func buildIdempotencyKey(msg *kafka.StumpsMessage) string {
+	if msg.StatusType == kafka.StatusBlockProcessed {
+		return msg.BlockHash + ":" + string(msg.StatusType)
+	}
 	if msg.TxID != "" {
 		return msg.TxID + ":" + string(msg.StatusType)
 	}
 	if msg.BlockHash != "" && msg.SubtreeID != "" {
 		return msg.BlockHash + ":" + msg.SubtreeID + ":" + string(msg.StatusType)
+	}
+	return ""
+}
+
+// dedupKeyForMessage returns the dedup key for a message.
+// For BLOCK_PROCESSED, uses blockHash; for other types, uses txid.
+func dedupKeyForMessage(msg *kafka.StumpsMessage) string {
+	if msg.StatusType == kafka.StatusBlockProcessed {
+		return msg.BlockHash
+	}
+	if msg.TxID != "" {
+		return msg.TxID
+	}
+	if len(msg.TxIDs) > 0 {
+		return msg.TxIDs[0]
 	}
 	return ""
 }

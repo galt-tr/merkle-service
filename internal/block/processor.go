@@ -25,6 +25,7 @@ type Processor struct {
 	stumpsProducer *kafka.Producer
 	regStore       *store.RegistrationStore
 	subtreeStore   *store.SubtreeStore
+	urlRegistry    *store.CallbackURLRegistry
 	dataHubClient  *datahub.Client
 	dedupCache     *cache.DedupCache
 }
@@ -36,15 +37,17 @@ func NewProcessor(
 	stumpsProducer *kafka.Producer,
 	regStore *store.RegistrationStore,
 	subtreeStore *store.SubtreeStore,
+	urlRegistry *store.CallbackURLRegistry,
 	logger *slog.Logger,
 ) *Processor {
 	p := &Processor{
-		kafkaCfg:   kafkaCfg,
-		blockCfg:   blockCfg,
-		datahubCfg: datahubCfg,
+		kafkaCfg:       kafkaCfg,
+		blockCfg:       blockCfg,
+		datahubCfg:     datahubCfg,
 		stumpsProducer: stumpsProducer,
 		regStore:       regStore,
 		subtreeStore:   subtreeStore,
+		urlRegistry:    urlRegistry,
 	}
 	p.InitBase("block-processor")
 	if logger != nil {
@@ -145,6 +148,7 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 	sem := make(chan struct{}, poolSize)
 	var wg sync.WaitGroup
 	var errCount int64
+	var hadRegistrations int64
 	var mu sync.Mutex
 
 	for _, stHash := range subtreeHashes {
@@ -155,7 +159,7 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			if err := ProcessBlockSubtree(
+			hadRegs, err := ProcessBlockSubtree(
 				ctx,
 				subtreeHash,
 				uint64(meta.Height),
@@ -167,7 +171,8 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 				p.stumpsProducer,
 				p.blockCfg.PostMineTTLSec,
 				p.Logger,
-			); err != nil {
+			)
+			if err != nil {
 				p.Logger.Error("failed to process block subtree",
 					"subtreeHash", subtreeHash,
 					"blockHash", blockMsg.Hash,
@@ -175,6 +180,11 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 				)
 				mu.Lock()
 				errCount++
+				mu.Unlock()
+			}
+			if hadRegs {
+				mu.Lock()
+				hadRegistrations++
 				mu.Unlock()
 			}
 		}(stHash)
@@ -190,6 +200,11 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 		)
 	}
 
+	// Emit BLOCK_PROCESSED if any subtree had registered txids.
+	if hadRegistrations > 0 {
+		p.emitBlockProcessed(blockMsg.Hash)
+	}
+
 	// 7.4: Update subtree store block height for DAH pruning.
 	p.subtreeStore.SetCurrentBlockHeight(uint64(meta.Height))
 
@@ -199,4 +214,47 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 	}
 
 	return nil
+}
+
+// emitBlockProcessed publishes a BLOCK_PROCESSED message to every registered callback URL.
+func (p *Processor) emitBlockProcessed(blockHash string) {
+	if p.urlRegistry == nil {
+		return
+	}
+
+	urls, err := p.urlRegistry.GetAll()
+	if err != nil {
+		p.Logger.Error("failed to get callback URLs for BLOCK_PROCESSED", "error", err)
+		return
+	}
+	if len(urls) == 0 {
+		return
+	}
+
+	for _, callbackURL := range urls {
+		msg := &kafka.StumpsMessage{
+			CallbackURL: callbackURL,
+			StatusType:  kafka.StatusBlockProcessed,
+			BlockHash:   blockHash,
+		}
+		data, err := msg.Encode()
+		if err != nil {
+			p.Logger.Error("failed to encode BLOCK_PROCESSED message",
+				"callbackURL", callbackURL,
+				"error", err,
+			)
+			continue
+		}
+		if err := p.stumpsProducer.PublishWithHashKey(callbackURL, data); err != nil {
+			p.Logger.Error("failed to publish BLOCK_PROCESSED callback",
+				"callbackURL", callbackURL,
+				"error", err,
+			)
+		}
+	}
+
+	p.Logger.Info("emitted BLOCK_PROCESSED callbacks",
+		"blockHash", blockHash,
+		"callbackURLs", len(urls),
+	)
 }
