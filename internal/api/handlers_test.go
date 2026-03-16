@@ -1,0 +1,73 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+)
+
+func newTestRouter() (*chi.Mux, *Server) {
+	router := chi.NewRouter()
+	s := &Server{}
+	s.InitBase("test")
+	router.Post("/watch", s.handleWatch)
+	router.Get("/health", s.handleHealth)
+	return router, s
+}
+
+func postWatch(router http.Handler, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/watch", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
+func TestHandleWatch_MissingTxID(t *testing.T) {
+	router, _ := newTestRouter()
+	w := postWatch(router, `{"callbackUrl": "https://example.com/cb"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	var resp ErrorResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Error != "txid is required" {
+		t.Fatalf("expected 'txid is required', got %q", resp.Error)
+	}
+}
+
+func TestHandleWatch_InvalidTxID(t *testing.T) {
+	router, _ := newTestRouter()
+	w := postWatch(router, `{"txid": "xyz", "callbackUrl": "https://example.com/cb"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleWatch_MissingCallbackURL(t *testing.T) {
+	router, _ := newTestRouter()
+	w := postWatch(router, `{"txid": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleWatch_InvalidCallbackURL(t *testing.T) {
+	router, _ := newTestRouter()
+	w := postWatch(router, `{"txid": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", "callbackUrl": "not-a-url"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleWatch_InvalidBody(t *testing.T) {
+	router, _ := newTestRouter()
+	w := postWatch(router, `not json`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}

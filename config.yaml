@@ -1,0 +1,222 @@
+# Merkle Service Configuration
+#
+# This file configures all components of the merkle-service. Every value shown
+# below is the built-in default. Override any setting here or via the
+# corresponding environment variable (listed in comments).
+#
+# Priority order: environment variables > this file > built-in defaults.
+#
+# To use a custom file path, set CONFIG_FILE=/path/to/config.yaml
+
+# ---------------------------------------------------------------------------
+# General
+# ---------------------------------------------------------------------------
+
+# Operating mode. "all-in-one" runs every service in a single process.
+# "microservice" is for running individual components via cmd/<service-name>.
+# Env: MODE
+mode: all-in-one
+
+# ---------------------------------------------------------------------------
+# API Server
+# ---------------------------------------------------------------------------
+api:
+  # HTTP listen port for the /watch and /health endpoints.
+  # Env: API_PORT
+  port: 8080
+
+# ---------------------------------------------------------------------------
+# Aerospike — registration store and seen-counter persistence
+# ---------------------------------------------------------------------------
+aerospike:
+  # Aerospike cluster seed node.
+  # Env: AEROSPIKE_HOST
+  host: localhost
+
+  # Aerospike client port.
+  # Env: AEROSPIKE_PORT
+  port: 3000
+
+  # Aerospike namespace for all merkle-service data.
+  # Env: AEROSPIKE_NAMESPACE
+  namespace: merkle
+
+  # Aerospike set used to store txid -> callback URL registrations.
+  # Env: AEROSPIKE_SET
+  setName: registrations
+
+  # Aerospike set used for per-txid seen counters (SEEN_MULTIPLE_NODES tracking).
+  # Env: AEROSPIKE_SEEN_SET
+  seenSet: seen_counters
+
+  # Maximum number of retries for transient Aerospike errors.
+  # Env: AEROSPIKE_MAX_RETRIES
+  maxRetries: 3
+
+  # Base delay in milliseconds between Aerospike retries (used with backoff).
+  # Env: AEROSPIKE_RETRY_BASE_MS
+  retryBaseMs: 100
+
+# ---------------------------------------------------------------------------
+# Kafka — async messaging between services
+# ---------------------------------------------------------------------------
+kafka:
+  # Comma-separated list of Kafka broker addresses.
+  # Env: KAFKA_BROKERS (comma-separated)
+  brokers:
+    - localhost:9092
+
+  # Topic for subtree messages published by the P2P client.
+  # Env: KAFKA_SUBTREE_TOPIC
+  subtreeTopic: subtree
+
+  # Topic for block messages published by the P2P client.
+  # Env: KAFKA_BLOCK_TOPIC
+  blockTopic: block
+
+  # Topic for STUMP and callback status messages (SEEN_ON_NETWORK, MINED, etc.).
+  # Env: KAFKA_STUMPS_TOPIC
+  stumpsTopic: stumps
+
+  # Dead-letter queue topic for permanently failed callback deliveries.
+  # Env: KAFKA_STUMPS_DLQ_TOPIC
+  stumpsDlqTopic: stumps-dlq
+
+  # Kafka consumer group ID shared across service instances.
+  # Env: KAFKA_CONSUMER_GROUP
+  consumerGroup: merkle-service
+
+# ---------------------------------------------------------------------------
+# P2P — Teranode network connectivity via go-p2p-message-bus
+# ---------------------------------------------------------------------------
+p2p:
+  # BSV network to connect to. Controls topic prefixes and protocol version.
+  # Topics become "{network}-subtree" and "{network}-block".
+  # Protocol becomes "/teranode/bitcoin/{network}/1.0.0".
+  # Valid values: mainnet, testnet, teratestnet
+  # Env: P2P_NETWORK
+  network: mainnet
+
+  # Peer name used to identify this node on the P2P network.
+  # Env: P2P_NAME
+  name: merkle-service
+
+  # Ed25519 private key for P2P identity (hex-encoded).
+  # If empty, a key is loaded from peerCacheDir/p2p.key or auto-generated.
+  # Env: P2P_PRIVATE_KEY
+  privateKey: ""
+
+  # Directory for persisting the peer cache and auto-generated P2P key.
+  # If empty, no peer cache or key file is written.
+  # Env: P2P_PEER_CACHE_DIR
+  peerCacheDir: ""
+
+  # TCP port for libp2p connections.
+  # Env: P2P_PORT
+  port: 9906
+
+  # Addresses to advertise to other peers (e.g., public IP with port).
+  # Env: P2P_ANNOUNCE_ADDRS (comma-separated)
+  announceAddrs: []
+
+  # Bootstrap peer multiaddrs for initial network connectivity.
+  # Required for connecting to the Teranode P2P network.
+  # Env: P2P_BOOTSTRAP_PEERS (comma-separated)
+  bootstrapPeers: []
+
+  # P2P topic suffix for subtree messages. Combined with network prefix at runtime.
+  # Env: P2P_SUBTREE_TOPIC
+  subtreeTopic: subtree
+
+  # P2P topic suffix for block messages. Combined with network prefix at runtime.
+  # Env: P2P_BLOCK_TOPIC
+  blockTopic: block
+
+  # DHT participation mode.
+  #   "off"    — connect only to bootstrap peers; lightest option (recommended)
+  #   "client" — query DHT but don't advertise; moderate overhead
+  #   "server" — full DHT participation; use for bootstrap nodes only
+  # Env: P2P_DHT_MODE
+  dhtMode: "off"
+
+  # Enable UPnP / NAT-PMP automatic port mapping.
+  # Env: P2P_ENABLE_NAT
+  enableNat: false
+
+  # Enable multicast DNS for local network peer discovery.
+  # Env: P2P_ENABLE_MDNS
+  enableMdns: false
+
+  # Allow connections to private (RFC 1918) IP addresses.
+  # Set to true for local development or private network deployments.
+  # Env: P2P_ALLOW_PRIVATE_IPS
+  allowPrivateIps: false
+
+# ---------------------------------------------------------------------------
+# Subtree Processor
+# ---------------------------------------------------------------------------
+subtree:
+  # When to store subtree data in the blob store.
+  #   "realtime" — store immediately when subtree is received from P2P
+  #   "deferred" — store during block processing instead
+  # Env: SUBTREE_STORAGE_MODE
+  storageMode: realtime
+
+  # Delete-at-height offset for subtree blob expiry.
+  # A value of 1 means subtrees are pruned after the next block.
+  # Env: SUBTREE_DAH_OFFSET
+  dahOffset: 1
+
+  # Maximum memory (MB) for the registration deduplication cache (txmetacache).
+  # Reduces Aerospike load by caching recently-checked txid registration results.
+  # Env: SUBTREE_CACHE_MAX_MB
+  cacheMaxMB: 64
+
+# ---------------------------------------------------------------------------
+# Block Processor
+# ---------------------------------------------------------------------------
+block:
+  # Number of parallel workers for processing subtrees within a block.
+  # Each worker retrieves a subtree, checks registrations, and builds STUMPs.
+  # Env: BLOCK_WORKER_POOL_SIZE
+  workerPoolSize: 16
+
+  # TTL in seconds applied to registration records after their block is processed.
+  # Allows time for fork/orphan handling before Aerospike evicts the record.
+  # Default: 1800 (30 minutes).
+  # Env: BLOCK_POST_MINE_TTL_SEC
+  postMineTTLSec: 1800
+
+# ---------------------------------------------------------------------------
+# Callback Delivery
+# ---------------------------------------------------------------------------
+callback:
+  # Maximum number of delivery attempts per callback before sending to the DLQ.
+  # Env: CALLBACK_MAX_RETRIES
+  maxRetries: 5
+
+  # Base delay in seconds for linear retry backoff.
+  # Actual delay = backoffBaseSec * retryCount (e.g., 30s, 60s, 90s, ...).
+  # Env: CALLBACK_BACKOFF_BASE_SEC
+  backoffBaseSec: 30
+
+  # HTTP request timeout in seconds for each callback delivery attempt.
+  # Env: CALLBACK_TIMEOUT_SEC
+  timeoutSec: 10
+
+  # Number of unique subtrees a txid must appear in before emitting
+  # a SEEN_MULTIPLE_NODES callback. Tracks network propagation confidence.
+  # Env: CALLBACK_SEEN_THRESHOLD
+  seenThreshold: 3
+
+# ---------------------------------------------------------------------------
+# Blob Store — subtree data storage
+# ---------------------------------------------------------------------------
+blobStore:
+  # Backend URL for subtree blob storage.
+  # Supports file:// (local filesystem) and http:// (remote blob server).
+  # Examples:
+  #   file:///var/lib/merkle-subtrees
+  #   http://blob-server:8080/subtrees
+  # Env: BLOB_STORE_URL
+  url: file:///tmp/merkle-subtrees
