@@ -1,4 +1,4 @@
-.PHONY: build test lint docker-up docker-down run
+.PHONY: build test lint docker-up docker-down run debug-dashboard
 
 build:
 	go build ./...
@@ -17,3 +17,6 @@ docker-down:
 
 run:
 	go run ./cmd/merkle-service
+
+debug-dashboard:
+	go run ./tools/debug-dashboard

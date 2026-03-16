@@ -1,13 +1,13 @@
 package p2p
 
 import (
-	"encoding/json"
 	"io"
 	"log/slog"
 	"sync"
 	"testing"
 
 	"github.com/IBM/sarama"
+	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
@@ -70,8 +70,8 @@ func newTestClient(t *testing.T) (*Client, *mockSyncProducer, *mockSyncProducer)
 	mockBlockProducer := &mockSyncProducer{}
 
 	cfg := config.P2PConfig{
-		SubtreeTopic: "test-subtree-topic",
-		BlockTopic:   "test-block-topic",
+		Network:     "main",
+		StoragePath: t.TempDir(),
 	}
 
 	client := NewClient(
@@ -86,28 +86,24 @@ func newTestClient(t *testing.T) (*Client, *mockSyncProducer, *mockSyncProducer)
 
 // --- handleSubtreeMessage tests ---
 
-func TestHandleSubtreeMessage_ValidJSON(t *testing.T) {
+func TestHandleSubtreeMessage_ValidMessage(t *testing.T) {
 	client, mockProducer, _ := newTestClient(t)
 
-	msg := kafka.SubtreeMessage{
-		SubtreeID:   "subtree-abc",
-		TxIDs:       []string{"tx1", "tx2", "tx3"},
-		MerkleData:  []byte{0xDE, 0xAD},
-		BlockHeight: 42,
-	}
-	data, err := json.Marshal(msg)
-	if err != nil {
-		t.Fatalf("failed to marshal test message: %v", err)
+	msg := teranode.SubtreeMessage{
+		Hash:       "subtree-abc",
+		DataHubURL: "https://datahub.example.com/subtree/abc",
+		PeerID:     "peer1",
+		ClientName: "teranode-v1",
 	}
 
-	client.handleSubtreeMessage(data)
+	client.handleSubtreeMessage(msg)
 
 	published := mockProducer.getMessages()
 	if len(published) != 1 {
 		t.Fatalf("expected 1 published message, got %d", len(published))
 	}
 
-	// Verify the key is the subtree ID.
+	// Verify the key is the subtree hash.
 	keyBytes, err := published[0].Key.Encode()
 	if err != nil {
 		t.Fatalf("failed to encode key: %v", err)
@@ -125,101 +121,50 @@ func TestHandleSubtreeMessage_ValidJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to decode published subtree message: %v", err)
 	}
-	if decoded.SubtreeID != "subtree-abc" {
-		t.Errorf("expected subtreeId 'subtree-abc', got %q", decoded.SubtreeID)
+	if decoded.Hash != "subtree-abc" {
+		t.Errorf("expected hash 'subtree-abc', got %q", decoded.Hash)
 	}
-	if len(decoded.TxIDs) != 3 {
-		t.Errorf("expected 3 txids, got %d", len(decoded.TxIDs))
+	if decoded.DataHubURL != "https://datahub.example.com/subtree/abc" {
+		t.Errorf("expected dataHubUrl, got %q", decoded.DataHubURL)
 	}
-	if decoded.BlockHeight != 42 {
-		t.Errorf("expected blockHeight 42, got %d", decoded.BlockHeight)
+	if decoded.PeerID != "peer1" {
+		t.Errorf("expected peerId 'peer1', got %q", decoded.PeerID)
 	}
 }
 
-func TestHandleSubtreeMessage_EmptyTxIDs(t *testing.T) {
+func TestHandleSubtreeMessage_EmptyHash(t *testing.T) {
 	client, mockProducer, _ := newTestClient(t)
 
-	msg := kafka.SubtreeMessage{
-		SubtreeID:   "subtree-empty",
-		TxIDs:       []string{},
-		BlockHeight: 1,
-	}
-	data, err := json.Marshal(msg)
-	if err != nil {
-		t.Fatalf("failed to marshal test message: %v", err)
+	msg := teranode.SubtreeMessage{
+		Hash:       "",
+		DataHubURL: "https://datahub.example.com/subtree/empty",
 	}
 
-	client.handleSubtreeMessage(data)
+	client.handleSubtreeMessage(msg)
 
+	// Should still publish (empty hash is valid from the P2P layer perspective).
 	published := mockProducer.getMessages()
 	if len(published) != 1 {
 		t.Fatalf("expected 1 published message, got %d", len(published))
-	}
-
-	valueBytes, err := published[0].Value.Encode()
-	if err != nil {
-		t.Fatalf("failed to encode value: %v", err)
-	}
-	decoded, err := kafka.DecodeSubtreeMessage(valueBytes)
-	if err != nil {
-		t.Fatalf("failed to decode published subtree message: %v", err)
-	}
-	if len(decoded.TxIDs) != 0 {
-		t.Errorf("expected 0 txids, got %d", len(decoded.TxIDs))
-	}
-}
-
-func TestHandleSubtreeMessage_InvalidJSON(t *testing.T) {
-	client, mockProducer, _ := newTestClient(t)
-
-	// Should not panic and should not publish anything.
-	client.handleSubtreeMessage([]byte("not valid json{{{"))
-
-	published := mockProducer.getMessages()
-	if len(published) != 0 {
-		t.Errorf("expected no published messages for invalid JSON, got %d", len(published))
-	}
-}
-
-func TestHandleSubtreeMessage_EmptyData(t *testing.T) {
-	client, mockProducer, _ := newTestClient(t)
-
-	client.handleSubtreeMessage([]byte{})
-
-	published := mockProducer.getMessages()
-	if len(published) != 0 {
-		t.Errorf("expected no published messages for empty data, got %d", len(published))
-	}
-}
-
-func TestHandleSubtreeMessage_NilData(t *testing.T) {
-	client, mockProducer, _ := newTestClient(t)
-
-	client.handleSubtreeMessage(nil)
-
-	published := mockProducer.getMessages()
-	if len(published) != 0 {
-		t.Errorf("expected no published messages for nil data, got %d", len(published))
 	}
 }
 
 // --- handleBlockMessage tests ---
 
-func TestHandleBlockMessage_ValidJSON(t *testing.T) {
+func TestHandleBlockMessage_ValidMessage(t *testing.T) {
 	client, _, mockProducer := newTestClient(t)
 
-	msg := kafka.BlockMessage{
-		BlockHash:   "00000000abc123",
-		BlockHeader: []byte{0x01, 0x02, 0x03},
-		BlockHeight: 800000,
-		SubtreeRefs: []string{"sub1", "sub2"},
-	}
-	data, err := json.Marshal(msg)
-	if err != nil {
-		t.Fatalf("failed to marshal test message: %v", err)
+	msg := teranode.BlockMessage{
+		Hash:       "00000000abc123",
+		Height:     800000,
+		Header:     "0100000000000000",
+		Coinbase:   "01000000010000",
+		DataHubURL: "https://datahub.example.com/block/abc123",
+		PeerID:     "peer2",
+		ClientName: "teranode-v1",
 	}
 
-	client.handleBlockMessage(data)
+	client.handleBlockMessage(msg)
 
 	published := mockProducer.getMessages()
 	if len(published) != 1 {
@@ -244,85 +189,36 @@ func TestHandleBlockMessage_ValidJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to decode published block message: %v", err)
 	}
-	if decoded.BlockHash != "00000000abc123" {
-		t.Errorf("expected blockHash '00000000abc123', got %q", decoded.BlockHash)
+	if decoded.Hash != "00000000abc123" {
+		t.Errorf("expected hash '00000000abc123', got %q", decoded.Hash)
 	}
-	if decoded.BlockHeight != 800000 {
-		t.Errorf("expected blockHeight 800000, got %d", decoded.BlockHeight)
+	if decoded.Height != 800000 {
+		t.Errorf("expected height 800000, got %d", decoded.Height)
 	}
-	if len(decoded.SubtreeRefs) != 2 {
-		t.Errorf("expected 2 subtreeRefs, got %d", len(decoded.SubtreeRefs))
+	if decoded.Header != "0100000000000000" {
+		t.Errorf("expected header '0100000000000000', got %q", decoded.Header)
 	}
-	if decoded.SubtreeRefs[0] != "sub1" || decoded.SubtreeRefs[1] != "sub2" {
-		t.Errorf("unexpected subtreeRefs: %v", decoded.SubtreeRefs)
+	if decoded.Coinbase != "01000000010000" {
+		t.Errorf("expected coinbase '01000000010000', got %q", decoded.Coinbase)
+	}
+	if decoded.DataHubURL != "https://datahub.example.com/block/abc123" {
+		t.Errorf("expected dataHubUrl, got %q", decoded.DataHubURL)
 	}
 }
 
-func TestHandleBlockMessage_NoSubtreeRefs(t *testing.T) {
+func TestHandleBlockMessage_ZeroHeight(t *testing.T) {
 	client, _, mockProducer := newTestClient(t)
 
-	msg := kafka.BlockMessage{
-		BlockHash:   "blockhash-no-refs",
-		BlockHeader: []byte{0xFF},
-		BlockHeight: 1,
-		SubtreeRefs: []string{},
-	}
-	data, err := json.Marshal(msg)
-	if err != nil {
-		t.Fatalf("failed to marshal test message: %v", err)
+	msg := teranode.BlockMessage{
+		Hash:   "genesis-hash",
+		Height: 0,
 	}
 
-	client.handleBlockMessage(data)
+	client.handleBlockMessage(msg)
 
 	published := mockProducer.getMessages()
 	if len(published) != 1 {
 		t.Fatalf("expected 1 published message, got %d", len(published))
-	}
-
-	valueBytes, err := published[0].Value.Encode()
-	if err != nil {
-		t.Fatalf("failed to encode value: %v", err)
-	}
-	decoded, err := kafka.DecodeBlockMessage(valueBytes)
-	if err != nil {
-		t.Fatalf("failed to decode published block message: %v", err)
-	}
-	if len(decoded.SubtreeRefs) != 0 {
-		t.Errorf("expected 0 subtreeRefs, got %d", len(decoded.SubtreeRefs))
-	}
-}
-
-func TestHandleBlockMessage_InvalidJSON(t *testing.T) {
-	client, _, mockProducer := newTestClient(t)
-
-	// Should not panic and should not publish anything.
-	client.handleBlockMessage([]byte("{invalid json"))
-
-	published := mockProducer.getMessages()
-	if len(published) != 0 {
-		t.Errorf("expected no published messages for invalid JSON, got %d", len(published))
-	}
-}
-
-func TestHandleBlockMessage_EmptyData(t *testing.T) {
-	client, _, mockProducer := newTestClient(t)
-
-	client.handleBlockMessage([]byte{})
-
-	published := mockProducer.getMessages()
-	if len(published) != 0 {
-		t.Errorf("expected no published messages for empty data, got %d", len(published))
-	}
-}
-
-func TestHandleBlockMessage_NilData(t *testing.T) {
-	client, _, mockProducer := newTestClient(t)
-
-	client.handleBlockMessage(nil)
-
-	published := mockProducer.getMessages()
-	if len(published) != 0 {
-		t.Errorf("expected no published messages for nil data, got %d", len(published))
 	}
 }
 
@@ -344,9 +240,6 @@ func TestHealth_InitialState(t *testing.T) {
 func TestHealth_Connected_NoPeers(t *testing.T) {
 	client, _, _ := newTestClient(t)
 	client.setConnected(true)
-	client.mu.Lock()
-	client.peerCount = 0
-	client.mu.Unlock()
 
 	health := client.Health()
 	if health.Status != "degraded" {
@@ -354,32 +247,11 @@ func TestHealth_Connected_NoPeers(t *testing.T) {
 	}
 }
 
-func TestHealth_Connected_WithPeers(t *testing.T) {
-	client, _, _ := newTestClient(t)
-	client.setConnected(true)
-	client.mu.Lock()
-	client.peerCount = 3
-	client.mu.Unlock()
-
-	health := client.Health()
-	if health.Status != "healthy" {
-		t.Errorf("expected status 'healthy', got %q", health.Status)
-	}
-	if health.Details["peerCount"] != "3" {
-		t.Errorf("expected peerCount '3', got %q", health.Details["peerCount"])
-	}
-}
-
 func TestHealth_Disconnected(t *testing.T) {
 	client, _, _ := newTestClient(t)
 	client.setConnected(false)
-	client.mu.Lock()
-	client.peerCount = 5
-	client.mu.Unlock()
 
 	health := client.Health()
-	// Disconnected overrides to unhealthy, but 0-peer check may also apply.
-	// With peerCount=5 and disconnected, the status should be unhealthy.
 	if health.Details["connection"] != "disconnected" {
 		t.Errorf("expected connection 'disconnected', got %q", health.Details["connection"])
 	}
@@ -392,7 +264,7 @@ func TestInit_MissingSubtreeProducer(t *testing.T) {
 	mockProducer := &mockSyncProducer{}
 
 	client := NewClient(
-		config.P2PConfig{SubtreeTopic: "st", BlockTopic: "bt"},
+		config.P2PConfig{Network: "main"},
 		nil, // missing subtree producer
 		kafka.NewTestProducer(mockProducer, "block", logger),
 		logger,
@@ -409,7 +281,7 @@ func TestInit_MissingBlockProducer(t *testing.T) {
 	mockProducer := &mockSyncProducer{}
 
 	client := NewClient(
-		config.P2PConfig{SubtreeTopic: "st", BlockTopic: "bt"},
+		config.P2PConfig{Network: "main"},
 		kafka.NewTestProducer(mockProducer, "subtree", logger),
 		nil, // missing block producer
 		logger,
@@ -418,42 +290,6 @@ func TestInit_MissingBlockProducer(t *testing.T) {
 	err := client.Init(nil)
 	if err == nil {
 		t.Fatal("expected error for nil block producer")
-	}
-}
-
-func TestInit_MissingSubtreeTopic(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	mockSP := &mockSyncProducer{}
-	mockBP := &mockSyncProducer{}
-
-	client := NewClient(
-		config.P2PConfig{SubtreeTopic: "", BlockTopic: "bt"},
-		kafka.NewTestProducer(mockSP, "subtree", logger),
-		kafka.NewTestProducer(mockBP, "block", logger),
-		logger,
-	)
-
-	err := client.Init(nil)
-	if err == nil {
-		t.Fatal("expected error for empty subtree topic")
-	}
-}
-
-func TestInit_MissingBlockTopic(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	mockSP := &mockSyncProducer{}
-	mockBP := &mockSyncProducer{}
-
-	client := NewClient(
-		config.P2PConfig{SubtreeTopic: "st", BlockTopic: ""},
-		kafka.NewTestProducer(mockSP, "subtree", logger),
-		kafka.NewTestProducer(mockBP, "block", logger),
-		logger,
-	)
-
-	err := client.Init(nil)
-	if err == nil {
-		t.Fatal("expected error for empty block topic")
 	}
 }
 
@@ -471,16 +307,13 @@ func TestInit_Success(t *testing.T) {
 func TestHandleSubtreeMessage_MultipleMessages(t *testing.T) {
 	client, mockProducer, _ := newTestClient(t)
 
-	for i, id := range []string{"sub-1", "sub-2", "sub-3"} {
-		msg := kafka.SubtreeMessage{
-			SubtreeID:   id,
-			BlockHeight: uint64(i + 1),
+	hashes := []string{"hash-1", "hash-2", "hash-3"}
+	for _, hash := range hashes {
+		msg := teranode.SubtreeMessage{
+			Hash:       hash,
+			DataHubURL: "https://datahub.example.com/subtree/" + hash,
 		}
-		data, err := json.Marshal(msg)
-		if err != nil {
-			t.Fatalf("failed to marshal message %d: %v", i, err)
-		}
-		client.handleSubtreeMessage(data)
+		client.handleSubtreeMessage(msg)
 	}
 
 	published := mockProducer.getMessages()
@@ -488,15 +321,14 @@ func TestHandleSubtreeMessage_MultipleMessages(t *testing.T) {
 		t.Fatalf("expected 3 published messages, got %d", len(published))
 	}
 
-	// Verify keys match expected subtree IDs.
-	expectedKeys := []string{"sub-1", "sub-2", "sub-3"}
+	// Verify keys match expected hashes.
 	for i, pm := range published {
 		keyBytes, err := pm.Key.Encode()
 		if err != nil {
 			t.Fatalf("failed to encode key %d: %v", i, err)
 		}
-		if string(keyBytes) != expectedKeys[i] {
-			t.Errorf("message %d: expected key %q, got %q", i, expectedKeys[i], string(keyBytes))
+		if string(keyBytes) != hashes[i] {
+			t.Errorf("message %d: expected key %q, got %q", i, hashes[i], string(keyBytes))
 		}
 	}
 }
@@ -505,48 +337,15 @@ func TestHandleBlockMessage_MultipleMessages(t *testing.T) {
 	client, _, mockProducer := newTestClient(t)
 
 	for i, hash := range []string{"hash-a", "hash-b"} {
-		msg := kafka.BlockMessage{
-			BlockHash:   hash,
-			BlockHeight: uint64(i + 100),
+		msg := teranode.BlockMessage{
+			Hash:   hash,
+			Height: uint32(i + 100),
 		}
-		data, err := json.Marshal(msg)
-		if err != nil {
-			t.Fatalf("failed to marshal message %d: %v", i, err)
-		}
-		client.handleBlockMessage(data)
+		client.handleBlockMessage(msg)
 	}
 
 	published := mockProducer.getMessages()
 	if len(published) != 2 {
 		t.Fatalf("expected 2 published messages, got %d", len(published))
-	}
-}
-
-// --- Partial/extra JSON fields test ---
-
-func TestHandleSubtreeMessage_ExtraJSONFields(t *testing.T) {
-	client, mockProducer, _ := newTestClient(t)
-
-	// JSON with extra fields that are not in the struct should not cause an error.
-	data := []byte(`{"subtreeId":"sub-extra","txids":["tx1"],"merkleData":"AQID","blockHeight":10,"unknownField":"value"}`)
-
-	client.handleSubtreeMessage(data)
-
-	published := mockProducer.getMessages()
-	if len(published) != 1 {
-		t.Fatalf("expected 1 published message, got %d", len(published))
-	}
-}
-
-func TestHandleBlockMessage_ExtraJSONFields(t *testing.T) {
-	client, _, mockProducer := newTestClient(t)
-
-	data := []byte(`{"blockHash":"hash-extra","blockHeader":"AQ==","blockHeight":99,"subtreeRefs":["s1"],"extra":true}`)
-
-	client.handleBlockMessage(data)
-
-	published := mockProducer.getMessages()
-	if len(published) != 1 {
-		t.Fatalf("expected 1 published message, got %d", len(published))
 	}
 }

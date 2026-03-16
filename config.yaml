@@ -87,70 +87,19 @@ kafka:
   consumerGroup: merkle-service
 
 # ---------------------------------------------------------------------------
-# P2P — Teranode network connectivity via go-p2p-message-bus
+# P2P — Teranode network connectivity via go-teranode-p2p-client
 # ---------------------------------------------------------------------------
 p2p:
-  # BSV network to connect to. Controls topic prefixes and protocol version.
-  # Topics become "{network}-subtree" and "{network}-block".
-  # Protocol becomes "/teranode/bitcoin/{network}/1.0.0".
-  # Valid values: mainnet, testnet, teratestnet
+  # BSV network to connect to. The go-teranode-p2p-client library automatically
+  # configures topics, bootstrap peers, and protocol version based on this value.
+  # Valid values: main, test, stn, teratestnet
   # Env: P2P_NETWORK
-  network: mainnet
+  network: main
 
-  # Peer name used to identify this node on the P2P network.
-  # Env: P2P_NAME
-  name: merkle-service
-
-  # Ed25519 private key for P2P identity (hex-encoded).
-  # If empty, a key is loaded from peerCacheDir/p2p.key or auto-generated.
-  # Env: P2P_PRIVATE_KEY
-  privateKey: ""
-
-  # Directory for persisting the peer cache and auto-generated P2P key.
-  # If empty, no peer cache or key file is written.
-  # Env: P2P_PEER_CACHE_DIR
-  peerCacheDir: ""
-
-  # TCP port for libp2p connections.
-  # Env: P2P_PORT
-  port: 9906
-
-  # Addresses to advertise to other peers (e.g., public IP with port).
-  # Env: P2P_ANNOUNCE_ADDRS (comma-separated)
-  announceAddrs: []
-
-  # Bootstrap peer multiaddrs for initial network connectivity.
-  # Required for connecting to the Teranode P2P network.
-  # Env: P2P_BOOTSTRAP_PEERS (comma-separated)
-  bootstrapPeers: []
-
-  # P2P topic suffix for subtree messages. Combined with network prefix at runtime.
-  # Env: P2P_SUBTREE_TOPIC
-  subtreeTopic: subtree
-
-  # P2P topic suffix for block messages. Combined with network prefix at runtime.
-  # Env: P2P_BLOCK_TOPIC
-  blockTopic: block
-
-  # DHT participation mode.
-  #   "off"    — connect only to bootstrap peers; lightest option (recommended)
-  #   "client" — query DHT but don't advertise; moderate overhead
-  #   "server" — full DHT participation; use for bootstrap nodes only
-  # Env: P2P_DHT_MODE
-  dhtMode: "off"
-
-  # Enable UPnP / NAT-PMP automatic port mapping.
-  # Env: P2P_ENABLE_NAT
-  enableNat: false
-
-  # Enable multicast DNS for local network peer discovery.
-  # Env: P2P_ENABLE_MDNS
-  enableMdns: false
-
-  # Allow connections to private (RFC 1918) IP addresses.
-  # Set to true for local development or private network deployments.
-  # Env: P2P_ALLOW_PRIVATE_IPS
-  allowPrivateIps: false
+  # Directory for persisting the P2P identity key and peer cache.
+  # The library manages key generation and peer persistence automatically.
+  # Env: P2P_STORAGE_PATH
+  storagePath: ~/.merkle-service/p2p
 
 # ---------------------------------------------------------------------------
 # Subtree Processor
@@ -219,4 +168,16 @@ blobStore:
   #   file:///var/lib/merkle-subtrees
   #   http://blob-server:8080/subtrees
   # Env: BLOB_STORE_URL
-  url: file:///tmp/merkle-subtrees
+  url: file:///mnt/nvme/merkle-subtreestore
+
+# ---------------------------------------------------------------------------
+# DataHub — HTTP client for fetching subtree/block data from Teranode
+# ---------------------------------------------------------------------------
+datahub:
+  # HTTP request timeout in seconds for DataHub requests.
+  # Env: DATAHUB_TIMEOUT_SEC
+  timeoutSec: 30
+
+  # Maximum number of retries for failed DataHub requests.
+  # Env: DATAHUB_MAX_RETRIES
+  maxRetries: 3

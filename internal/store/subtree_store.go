@@ -50,13 +50,22 @@ func NewSubtreeStore(store BlobStore, dahOffset uint64, logger *slog.Logger) *Su
 }
 
 // StoreSubtree stores subtree data with delete-at-height.
+// If blockHeight is 0 (unknown, e.g. during realtime subtree processing),
+// the blob is stored without a DAH and won't be auto-pruned until
+// re-stored with a real block height during block processing.
 func (s *SubtreeStore) StoreSubtree(id string, data []byte, blockHeight uint64) error {
-	dah := blockHeight + s.dahOffset
-	err := s.store.Set(id, data, WithDeleteAtHeight(dah))
+	var opts []BlobOption
+	if blockHeight > 0 {
+		dah := blockHeight + s.dahOffset
+		opts = append(opts, WithDeleteAtHeight(dah))
+		s.logger.Info("stored subtree", "id", id, "dah", dah)
+	} else {
+		s.logger.Info("stored subtree", "id", id, "dah", "none")
+	}
+	err := s.store.Set(id, data, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to store subtree %s: %w", id, err)
 	}
-	s.logger.Debug("stored subtree", "id", id, "dah", dah)
 	return nil
 }
 

@@ -6,7 +6,9 @@ services:
       - "3001:3001"
       - "3002:3002"
     volumes:
-      - aerospike-data:/opt/aerospike/data
+      - aerospike-data:/opt/aerospike/data:Z
+      - ./aerospike.conf:/opt/aerospike/etc/aerospike.conf:Z
+    command: ["--config-file", "/opt/aerospike/etc/aerospike.conf"]
     networks:
       - merkle-net
 

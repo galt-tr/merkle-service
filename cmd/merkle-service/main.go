@@ -57,7 +57,10 @@ func main() {
 		logger,
 	)
 
-	blobStore := store.NewMemoryBlobStore()
+	blobStore, err := store.NewBlobStoreFromURL(cfg.BlobStore.URL)
+	if err != nil {
+		log.Fatal("failed to create blob store: ", err)
+	}
 	subtreeStore := store.NewSubtreeStore(
 		blobStore,
 		uint64(cfg.Subtree.DAHOffset),
@@ -87,7 +90,7 @@ func main() {
 	apiServer := api.NewServer(cfg.API, regStore, asClient, logger)
 	p2pClient := p2p.NewClient(cfg.P2P, subtreeProducer, blockProducer, logger)
 	subtreeProcessor := subtree.NewProcessor(cfg, regStore, seenStore, subtreeStore)
-	blockProcessor := block.NewProcessor(cfg.Kafka, cfg.Block, stumpsProducer, regStore, subtreeStore, logger)
+	blockProcessor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, stumpsProducer, regStore, subtreeStore, logger)
 	callbackDelivery := callback.NewDeliveryService(cfg)
 
 	// Initialize all services.

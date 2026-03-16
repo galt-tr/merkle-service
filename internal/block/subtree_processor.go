@@ -2,192 +2,157 @@ package block
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"fmt"
+	"log/slog"
+	"time"
 
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+
+	"github.com/bsv-blockchain/merkle-service/internal/datahub"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
+	"github.com/bsv-blockchain/merkle-service/internal/store"
 	"github.com/bsv-blockchain/merkle-service/internal/stump"
 )
 
-// processSubtree processes a single subtree within a block.
-func (p *Processor) processSubtree(
+// ProcessBlockSubtree processes a single subtree within a block: retrieves the
+// subtree data, checks registrations, builds a STUMP, and emits MINED callbacks.
+func ProcessBlockSubtree(
 	ctx context.Context,
-	blockMsg *kafka.BlockMessage,
-	subtreeID string,
-	subtreeIdx int,
-	registeredTxIDs chan<- string,
+	subtreeHash string,
+	blockHeight uint64,
+	blockHash string,
+	dataHubURL string,
+	dhClient *datahub.Client,
+	subtreeStore *store.SubtreeStore,
+	regStore *store.RegistrationStore,
+	stumpsProducer *kafka.Producer,
+	postMineTTLSec int,
+	logger *slog.Logger,
 ) error {
-	// Retrieve subtree data from blob store
-	subtreeData, err := p.subtreeStore.GetSubtree(subtreeID)
+	// 6.2: Retrieve subtree data from blob store, falling back to DataHub.
+	rawData, err := subtreeStore.GetSubtree(subtreeHash)
+	if err != nil || rawData == nil {
+		logger.Debug("subtree not in blob store, fetching from DataHub",
+			"subtreeHash", subtreeHash,
+			"blockHash", blockHash,
+		)
+		rawData, err = dhClient.FetchSubtreeRaw(ctx, dataHubURL, subtreeHash)
+		if err != nil {
+			return fmt.Errorf("fetching subtree %s from DataHub: %w", subtreeHash, err)
+		}
+		// Store for potential future use.
+		if storeErr := subtreeStore.StoreSubtree(subtreeHash, rawData, blockHeight); storeErr != nil {
+			logger.Warn("failed to store fetched subtree", "hash", subtreeHash, "error", storeErr)
+		}
+	}
+
+	// 6.3: Parse raw binary data into nodes.
+	// DataHub returns concatenated 32-byte hashes, not full go-subtree Serialize() format.
+	nodes, err := datahub.ParseRawNodes(rawData)
 	if err != nil {
-		p.Logger.Error("failed to retrieve subtree", "subtreeId", subtreeID, "error", err)
-		return nil // Skip this subtree, don't fail the block
+		return fmt.Errorf("parsing subtree %s: %w", subtreeHash, err)
 	}
 
-	// Parse subtree to extract txids and merkle tree
-	// For now, assume subtree data is a JSON-encoded SubtreeMessage
-	var subtreeMsg kafka.SubtreeMessage
-	if err := json.Unmarshal(subtreeData, &subtreeMsg); err != nil {
-		p.Logger.Error("failed to parse subtree data", "subtreeId", subtreeID, "error", err)
+	if len(nodes) == 0 {
 		return nil
 	}
 
-	txids := subtreeMsg.TxIDs
-	if len(txids) == 0 {
-		return nil
+	// 6.4: Extract TxIDs and batch-lookup registrations.
+	txids := make([]string, len(nodes))
+	txidToIndex := make(map[string]int, len(nodes))
+	for i, node := range nodes {
+		txid := node.Hash.String()
+		txids[i] = txid
+		txidToIndex[txid] = i
 	}
 
-	// Batch check registrations
-	registrations, err := p.regStore.BatchGet(txids)
+	registrations, err := regStore.BatchGet(txids)
 	if err != nil {
-		p.Logger.Error("failed to check registrations", "subtreeId", subtreeID, "error", err)
-		return nil
+		return fmt.Errorf("batch get registrations for subtree %s: %w", subtreeHash, err)
 	}
 
 	if len(registrations) == 0 {
 		return nil
 	}
 
-	// Send registered txids for TTL update
+	// 6.5: Build full merkle tree from subtree nodes.
+	merkleTreeStore, err := subtreepkg.BuildMerkleTreeStoreFromBytes(nodes)
+	if err != nil {
+		return fmt.Errorf("building merkle tree for subtree %s: %w", subtreeHash, err)
+	}
+
+	// Convert chainhash.Hash merkle tree to [][]byte for stump.Build.
+	merkleTree := make([][]byte, len(*merkleTreeStore))
+	for i, h := range *merkleTreeStore {
+		hashCopy := make([]byte, chainhash.HashSize)
+		copy(hashCopy, h[:])
+		merkleTree[i] = hashCopy
+	}
+
+	// 6.6: Map registered txids to their leaf indices in the subtree.
+	registeredIndices := make(map[int]string)
 	for txid := range registrations {
-		select {
-		case registeredTxIDs <- txid:
-		case <-ctx.Done():
-			return ctx.Err()
+		if idx, ok := txidToIndex[txid]; ok {
+			registeredIndices[idx] = txid
 		}
 	}
 
-	// Build txid index map for STUMP construction
-	txidIndex := make(map[int]string)
-	for i, txid := range txids {
-		if _, registered := registrations[txid]; registered {
-			txidIndex[i] = txid
-		}
+	// 6.7: Build STUMP.
+	s := stump.Build(blockHeight, merkleTree, registeredIndices)
+	if s == nil {
+		return nil
 	}
 
-	// Handle coinbase placeholder for subtree 0
-	isCoinbaseSubtree := subtreeIdx == 0
+	// 6.8: Encode STUMP to BRC-0074 binary.
+	stumpData := s.Encode()
 
-	// Group by callback URL
+	// 6.9: Group txids by callback URL.
 	callbackGroups := stump.GroupByCallback(registrations)
 
-	// Build STUMP per callback URL
-	// Reconstruct merkle tree from subtree data
-	merkleTree := buildMerkleTree(txids, subtreeMsg.MerkleData)
-
-	for callbackURL, cbTxIDs := range callbackGroups {
-		// Build registered indices for this callback
-		indices := make(map[int]string)
-		for i, txid := range txids {
-			for _, cbTxID := range cbTxIDs {
-				if txid == cbTxID {
-					// Skip coinbase entry (index 0 in subtree 0)
-					if isCoinbaseSubtree && i == 0 {
-						continue
-					}
-					indices[i] = txid
-				}
-			}
-		}
-
-		if len(indices) == 0 {
-			continue
-		}
-
-		// Build STUMP
-		s := stump.Build(blockMsg.BlockHeight, merkleTree, indices)
-		if s == nil {
-			continue
-		}
-
-		stumpData := s.Encode()
-
-		// Publish STUMP to Kafka stumps topic
+	// 6.10: Emit MINED callback for each callback URL group.
+	for callbackURL, groupTxids := range callbackGroups {
 		stumpsMsg := &kafka.StumpsMessage{
 			CallbackURL: callbackURL,
-			TxIDs:       cbTxIDs,
+			TxIDs:       groupTxids,
 			StumpData:   stumpData,
 			StatusType:  kafka.StatusMined,
-			BlockHash:   blockMsg.BlockHash,
-			SubtreeID:   subtreeID,
+			BlockHash:   blockHash,
+			SubtreeID:   subtreeHash,
 		}
-
 		data, err := stumpsMsg.Encode()
 		if err != nil {
-			p.Logger.Error("failed to encode STUMP message", "error", err)
+			logger.Error("failed to encode MINED stumps message",
+				"callbackURL", callbackURL,
+				"error", err,
+			)
 			continue
 		}
-
-		if err := p.stumpsProducer.PublishWithHashKey(callbackURL, data); err != nil {
-			p.Logger.Error("failed to publish STUMP", "callbackUrl", callbackURL, "error", err)
+		if err := stumpsProducer.PublishWithHashKey(callbackURL, data); err != nil {
+			logger.Error("failed to publish MINED callback",
+				"callbackURL", callbackURL,
+				"error", err,
+			)
 		}
 	}
+
+	// 6.11: Batch update registration TTLs (skip if postMineTTLSec is 0).
+	if postMineTTLSec > 0 {
+		registeredTxids := make([]string, 0, len(registrations))
+		for txid := range registrations {
+			registeredTxids = append(registeredTxids, txid)
+		}
+		ttl := time.Duration(postMineTTLSec) * time.Second
+		if err := regStore.BatchUpdateTTL(registeredTxids, ttl); err != nil {
+			logger.Warn("failed to batch update TTLs (ensure Aerospike namespace has nsup-period configured)", "error", err)
+		}
+	}
+
+	logger.Info("processed block subtree",
+		"subtreeHash", subtreeHash,
+		"blockHash", blockHash,
+		"registeredTxids", len(registrations),
+	)
 
 	return nil
-}
-
-// buildMerkleTree constructs a flat merkle tree from txids and merkle data.
-// The tree is stored as a flat array where level 0 contains the leaves (txid hashes).
-func buildMerkleTree(txids []string, merkleData []byte) [][]byte {
-	// If we have pre-computed merkle data, use it
-	if len(merkleData) > 0 {
-		return parseMerkleData(merkleData)
-	}
-
-	// Otherwise, build from txids (simplified - in production this would use double-SHA256)
-	leaves := make([][]byte, len(txids))
-	for i, txid := range txids {
-		hash, err := hex.DecodeString(txid)
-		if err != nil {
-			leaves[i] = make([]byte, 32)
-		} else {
-			leaves[i] = hash
-		}
-	}
-
-	tree := make([][]byte, 0, len(leaves)*2)
-	tree = append(tree, leaves...)
-
-	// Build levels
-	current := leaves
-	for len(current) > 1 {
-		var next [][]byte
-		for i := 0; i < len(current); i += 2 {
-			if i+1 < len(current) {
-				next = append(next, hashPair(current[i], current[i+1]))
-			} else {
-				next = append(next, hashPair(current[i], current[i]))
-			}
-		}
-		tree = append(tree, next...)
-		current = next
-	}
-
-	return tree
-}
-
-func parseMerkleData(data []byte) [][]byte {
-	// Parse pre-serialized merkle tree data
-	// Each node is 32 bytes
-	var nodes [][]byte
-	for i := 0; i < len(data); i += 32 {
-		end := i + 32
-		if end > len(data) {
-			break
-		}
-		node := make([]byte, 32)
-		copy(node, data[i:end])
-		nodes = append(nodes, node)
-	}
-	return nodes
-}
-
-func hashPair(a, b []byte) []byte {
-	combined := make([]byte, 64)
-	copy(combined[:32], a)
-	copy(combined[32:], b)
-	first := sha256.Sum256(combined)
-	second := sha256.Sum256(first[:])
-	return second[:]
 }

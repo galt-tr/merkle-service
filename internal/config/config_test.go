@@ -18,10 +18,7 @@ func clearConfigEnv(t *testing.T) {
 		"AEROSPIKE_MAX_RETRIES", "AEROSPIKE_RETRY_BASE_MS",
 		"KAFKA_BROKERS", "KAFKA_SUBTREE_TOPIC", "KAFKA_BLOCK_TOPIC",
 		"KAFKA_STUMPS_TOPIC", "KAFKA_STUMPS_DLQ_TOPIC", "KAFKA_CONSUMER_GROUP",
-		"P2P_NETWORK", "P2P_NAME", "P2P_PRIVATE_KEY", "P2P_PEER_CACHE_DIR",
-		"P2P_PORT", "P2P_ANNOUNCE_ADDRS", "P2P_BOOTSTRAP_PEERS",
-		"P2P_SUBTREE_TOPIC", "P2P_BLOCK_TOPIC", "P2P_DHT_MODE",
-		"P2P_ENABLE_NAT", "P2P_ENABLE_MDNS", "P2P_ALLOW_PRIVATE_IPS",
+		"P2P_NETWORK", "P2P_STORAGE_PATH",
 		"SUBTREE_STORAGE_MODE", "SUBTREE_DAH_OFFSET", "SUBTREE_CACHE_MAX_MB",
 		"BLOCK_WORKER_POOL_SIZE", "BLOCK_POST_MINE_TTL_SEC",
 		"CALLBACK_MAX_RETRIES", "CALLBACK_BACKOFF_BASE_SEC",
@@ -88,26 +85,11 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 
 	// P2P defaults
-	if cfg.P2P.Network != "mainnet" {
-		t.Errorf("P2P.Network: expected %q, got %q", "mainnet", cfg.P2P.Network)
+	if cfg.P2P.Network != "main" {
+		t.Errorf("P2P.Network: expected %q, got %q", "main", cfg.P2P.Network)
 	}
-	if cfg.P2P.Name != "merkle-service" {
-		t.Errorf("P2P.Name: expected %q, got %q", "merkle-service", cfg.P2P.Name)
-	}
-	if cfg.P2P.Port != 9906 {
-		t.Errorf("P2P.Port: expected 9906, got %d", cfg.P2P.Port)
-	}
-	if cfg.P2P.SubtreeTopic != "subtree" {
-		t.Errorf("P2P.SubtreeTopic: expected %q, got %q", "subtree", cfg.P2P.SubtreeTopic)
-	}
-	if cfg.P2P.BlockTopic != "block" {
-		t.Errorf("P2P.BlockTopic: expected %q, got %q", "block", cfg.P2P.BlockTopic)
-	}
-	if cfg.P2P.DHTMode != "off" {
-		t.Errorf("P2P.DHTMode: expected %q, got %q", "off", cfg.P2P.DHTMode)
-	}
-	if cfg.P2P.EnableNAT != false {
-		t.Errorf("P2P.EnableNAT: expected false, got %v", cfg.P2P.EnableNAT)
+	if cfg.P2P.StoragePath != "~/.merkle-service/p2p" {
+		t.Errorf("P2P.StoragePath: expected %q, got %q", "~/.merkle-service/p2p", cfg.P2P.StoragePath)
 	}
 
 	// Subtree defaults
@@ -164,12 +146,7 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	os.Setenv("KAFKA_STUMPS_DLQ_TOPIC", "my-stumps-dlq")
 	os.Setenv("KAFKA_CONSUMER_GROUP", "my-group")
 	os.Setenv("P2P_NETWORK", "testnet")
-	os.Setenv("P2P_NAME", "my-peer")
-	os.Setenv("P2P_BOOTSTRAP_PEERS", "peer1,peer2")
-	os.Setenv("P2P_SUBTREE_TOPIC", "p2p-sub")
-	os.Setenv("P2P_BLOCK_TOPIC", "p2p-blk")
-	os.Setenv("P2P_DHT_MODE", "server")
-	os.Setenv("P2P_ENABLE_NAT", "true")
+	os.Setenv("P2P_STORAGE_PATH", "/tmp/p2p-test")
 	os.Setenv("SUBTREE_STORAGE_MODE", "deferred")
 	os.Setenv("SUBTREE_DAH_OFFSET", "3")
 	os.Setenv("SUBTREE_CACHE_MAX_MB", "128")
@@ -215,14 +192,8 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	if cfg.P2P.Network != "testnet" {
 		t.Errorf("P2P.Network: expected %q, got %q", "testnet", cfg.P2P.Network)
 	}
-	if cfg.P2P.Name != "my-peer" {
-		t.Errorf("P2P.Name: expected %q, got %q", "my-peer", cfg.P2P.Name)
-	}
-	if cfg.P2P.DHTMode != "server" {
-		t.Errorf("P2P.DHTMode: expected %q, got %q", "server", cfg.P2P.DHTMode)
-	}
-	if cfg.P2P.EnableNAT != true {
-		t.Errorf("P2P.EnableNAT: expected true, got %v", cfg.P2P.EnableNAT)
+	if cfg.P2P.StoragePath != "/tmp/p2p-test" {
+		t.Errorf("P2P.StoragePath: expected %q, got %q", "/tmp/p2p-test", cfg.P2P.StoragePath)
 	}
 	if cfg.Subtree.StorageMode != "deferred" {
 		t.Errorf("Subtree.StorageMode: expected %q, got %q", "deferred", cfg.Subtree.StorageMode)
@@ -316,28 +287,5 @@ func TestLoad_InvalidYAMLReturnsError(t *testing.T) {
 	_, err := Load()
 	if err == nil {
 		t.Fatal("expected error for invalid YAML, got nil")
-	}
-}
-
-func TestLoad_BooleanEnvVar(t *testing.T) {
-	clearConfigEnv(t)
-	os.Setenv("CONFIG_FILE", "/tmp/nonexistent-config-file.yaml")
-	os.Setenv("P2P_ENABLE_NAT", "true")
-	os.Setenv("P2P_ENABLE_MDNS", "true")
-	os.Setenv("P2P_ALLOW_PRIVATE_IPS", "true")
-	defer clearConfigEnv(t)
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() failed: %v", err)
-	}
-	if !cfg.P2P.EnableNAT {
-		t.Error("P2P.EnableNAT: expected true")
-	}
-	if !cfg.P2P.EnableMDNS {
-		t.Error("P2P.EnableMDNS: expected true")
-	}
-	if !cfg.P2P.AllowPrivateIPs {
-		t.Error("P2P.AllowPrivateIPs: expected true")
 	}
 }

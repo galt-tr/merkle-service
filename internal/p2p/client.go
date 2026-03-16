@@ -2,16 +2,14 @@ package p2p
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
-	"path/filepath"
 	"sync"
 	"time"
 
-	p2pMessageBus "github.com/bsv-blockchain/go-p2p-message-bus"
-	"github.com/libp2p/go-libp2p/core/crypto"
+	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
+	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
@@ -25,25 +23,14 @@ const (
 	baseRetryDelay = 500 * time.Millisecond
 )
 
-// slogAdapter adapts *slog.Logger to the logger interface expected by go-p2p-message-bus.
-type slogAdapter struct {
-	logger *slog.Logger
-}
-
-func (s *slogAdapter) Infof(format string, args ...any)  { s.logger.Info(fmt.Sprintf(format, args...)) }
-func (s *slogAdapter) Debugf(format string, args ...any) { s.logger.Debug(fmt.Sprintf(format, args...)) }
-func (s *slogAdapter) Warnf(format string, args ...any)  { s.logger.Warn(fmt.Sprintf(format, args...)) }
-func (s *slogAdapter) Errorf(format string, args ...any) { s.logger.Error(fmt.Sprintf(format, args...)) }
-
 // Client is a P2P client service that connects to the Teranode P2P network
-// via go-p2p-message-bus, subscribes to subtree and block topics, and publishes
+// via go-teranode-p2p-client, subscribes to subtree and block topics, and publishes
 // received messages to Kafka.
 type Client struct {
 	service.BaseService
 
 	cfg       config.P2PConfig
-	p2pClient p2pMessageBus.Client
-	privKey   crypto.PrivKey
+	p2pClient *p2p.Client
 
 	subtreeProducer *kafka.Producer
 	blockProducer   *kafka.Producer
@@ -53,17 +40,6 @@ type Client struct {
 
 	mu        sync.RWMutex
 	connected bool
-	peerCount int
-}
-
-// buildTopicName returns a network-namespaced topic name in the form "{network}-{suffix}".
-func buildTopicName(network, suffix string) string {
-	return network + "-" + suffix
-}
-
-// buildProtocolVersion returns the protocol version string for the given network.
-func buildProtocolVersion(network string) string {
-	return "/teranode/bitcoin/" + network + "/1.0.0"
 }
 
 // NewClient creates a new P2P client with the given configuration and Kafka producers.
@@ -85,8 +61,7 @@ func NewClient(
 	return c
 }
 
-// Init validates the configuration, loads/generates the private key, and
-// prepares the client for startup.
+// Init validates the configuration and prepares the client for startup.
 func (c *Client) Init(_ interface{}) error {
 	if c.subtreeProducer == nil {
 		return fmt.Errorf("subtree kafka producer is required")
@@ -94,92 +69,53 @@ func (c *Client) Init(_ interface{}) error {
 	if c.blockProducer == nil {
 		return fmt.Errorf("block kafka producer is required")
 	}
-	if c.cfg.SubtreeTopic == "" {
-		return fmt.Errorf("P2P subtree topic is required")
-	}
-	if c.cfg.BlockTopic == "" {
-		return fmt.Errorf("P2P block topic is required")
-	}
-
-	// Load or generate the Ed25519 private key.
-	privKey, err := loadOrGeneratePrivateKey(c.cfg)
-	if err != nil {
-		return fmt.Errorf("failed to load/generate private key: %w", err)
-	}
-	c.privKey = privKey
 
 	c.Logger.Info("p2p client initialized",
-		"subtreeTopic", c.cfg.SubtreeTopic,
-		"blockTopic", c.cfg.BlockTopic,
-		"bootstrapPeers", len(c.cfg.BootstrapPeers),
+		"network", c.cfg.Network,
+		"storagePath", c.cfg.StoragePath,
 	)
 	return nil
 }
 
-// Start creates the p2p message bus client, subscribes to topics, and begins
-// processing incoming messages.
+// Start creates the p2p client via go-teranode-p2p-client, subscribes to topics,
+// and begins processing incoming messages.
 func (c *Client) Start(ctx context.Context) error {
 	ctx, c.cancel = context.WithCancel(ctx)
 
 	network := c.cfg.Network
 	if network == "" {
-		network = "mainnet"
+		network = "main"
 	}
 
-	// Build the peer cache file path if PeerCacheDir is configured.
-	var peerCacheFile string
-	if c.cfg.PeerCacheDir != "" {
-		peerCacheFile = filepath.Join(c.cfg.PeerCacheDir, "peers.json")
+	p2pCfg := p2p.Config{
+		Network:     network,
+		StoragePath: c.cfg.StoragePath,
 	}
 
-	// Build the p2p message bus config.
-	p2pCfg := p2pMessageBus.Config{
-		Name:            c.cfg.Name,
-		PrivateKey:      c.privKey,
-		Port:            c.cfg.Port,
-		AnnounceAddrs:   c.cfg.AnnounceAddrs,
-		BootstrapPeers:  c.cfg.BootstrapPeers,
-		ProtocolVersion: buildProtocolVersion(network),
-		PeerCacheFile:   peerCacheFile,
-		DHTMode:         c.cfg.DHTMode,
-		EnableNAT:       c.cfg.EnableNAT,
-		EnableMDNS:      c.cfg.EnableMDNS,
-		AllowPrivateIPs: c.cfg.AllowPrivateIPs,
-		Logger:          &slogAdapter{logger: c.Logger},
-	}
-
-	// Create the p2p message bus client.
-	client, err := p2pMessageBus.NewClient(p2pCfg)
+	client, err := p2pCfg.Initialize(ctx, "merkle-service")
 	if err != nil {
-		return fmt.Errorf("failed to create p2p message bus client: %w", err)
+		return fmt.Errorf("failed to initialize p2p client: %w", err)
 	}
 	c.p2pClient = client
 
-	c.Logger.Info("p2p message bus client created",
+	c.Logger.Info("p2p client created",
 		"peerID", client.GetID(),
-		"network", network,
+		"network", client.GetNetwork(),
 	)
 
-	// Build network-aware topic names.
-	subtreeTopicName := buildTopicName(network, c.cfg.SubtreeTopic)
-	blockTopicName := buildTopicName(network, c.cfg.BlockTopic)
-
-	// Subscribe to topics.
-	subtreeCh := c.p2pClient.Subscribe(subtreeTopicName)
-	blockCh := c.p2pClient.Subscribe(blockTopicName)
+	// Subscribe to typed channels.
+	subtreeCh := c.p2pClient.SubscribeSubtrees(ctx)
+	blockCh := c.p2pClient.SubscribeBlocks(ctx)
 
 	// Start message processing goroutines.
 	c.wg.Add(2)
-	go c.processMessages(ctx, subtreeCh, c.handleSubtreeMessage, "subtree")
-	go c.processMessages(ctx, blockCh, c.handleBlockMessage, "block")
+	go c.processSubtreeMessages(ctx, subtreeCh)
+	go c.processBlockMessages(ctx, blockCh)
 
 	c.SetStarted(true)
 	c.setConnected(true)
 
-	c.Logger.Info("p2p client started",
-		"subtreeTopic", subtreeTopicName,
-		"blockTopic", blockTopicName,
-	)
+	c.Logger.Info("p2p client started")
 	return nil
 }
 
@@ -207,7 +143,7 @@ func (c *Client) Stop() error {
 
 	if c.p2pClient != nil {
 		if err := c.p2pClient.Close(); err != nil {
-			c.Logger.Error("error closing p2p message bus client", "error", err)
+			c.Logger.Error("error closing p2p client", "error", err)
 		}
 	}
 
@@ -223,8 +159,7 @@ func (c *Client) Health() service.HealthStatus {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// Update peer count from the p2p client if available.
-	peerCount := c.peerCount
+	peerCount := 0
 	if c.p2pClient != nil {
 		peerCount = len(c.p2pClient.GetPeers())
 	}
@@ -253,88 +188,102 @@ func (c *Client) Health() service.HealthStatus {
 	}
 }
 
-// processMessages reads messages from a subscription channel and dispatches
-// them to the given handler function.
-func (c *Client) processMessages(ctx context.Context, ch <-chan p2pMessageBus.Message, handler func([]byte), topicLabel string) {
+// processSubtreeMessages reads typed subtree messages and publishes them to Kafka.
+func (c *Client) processSubtreeMessages(ctx context.Context, ch <-chan teranode.SubtreeMessage) {
 	defer c.wg.Done()
 
-	c.Logger.Info("starting message processing loop", "topic", topicLabel)
+	c.Logger.Info("starting subtree message processing loop")
 
 	for {
 		select {
 		case msg, ok := <-ch:
 			if !ok {
-				c.Logger.Info("message channel closed", "topic", topicLabel)
+				c.Logger.Info("subtree message channel closed")
 				return
 			}
-			handler(msg.Data)
+			c.handleSubtreeMessage(msg)
 		case <-ctx.Done():
-			c.Logger.Info("message loop exiting: context cancelled", "topic", topicLabel)
+			c.Logger.Info("subtree message loop exiting: context cancelled")
 			return
 		}
 	}
 }
 
-// handleSubtreeMessage deserializes a raw subtree message and publishes it to Kafka.
-func (c *Client) handleSubtreeMessage(data []byte) {
-	// Deserialize the P2P message. Currently using JSON encoding;
-	// this will be replaced with protobuf when Teranode schemas are finalized.
-	var subtreeMsg kafka.SubtreeMessage
-	if err := json.Unmarshal(data, &subtreeMsg); err != nil {
-		c.Logger.Error("failed to deserialize subtree message",
-			"error", err,
-			"dataLen", len(data),
-		)
-		return
+// processBlockMessages reads typed block messages and publishes them to Kafka.
+func (c *Client) processBlockMessages(ctx context.Context, ch <-chan teranode.BlockMessage) {
+	defer c.wg.Done()
+
+	c.Logger.Info("starting block message processing loop")
+
+	for {
+		select {
+		case msg, ok := <-ch:
+			if !ok {
+				c.Logger.Info("block message channel closed")
+				return
+			}
+			c.handleBlockMessage(msg)
+		case <-ctx.Done():
+			c.Logger.Info("block message loop exiting: context cancelled")
+			return
+		}
 	}
-
-	c.Logger.Debug("received subtree message",
-		"subtreeId", subtreeMsg.SubtreeID,
-		"blockHeight", subtreeMsg.BlockHeight,
-		"txCount", len(subtreeMsg.TxIDs),
-	)
-
-	encoded, err := subtreeMsg.Encode()
-	if err != nil {
-		c.Logger.Error("failed to encode subtree message for kafka",
-			"subtreeId", subtreeMsg.SubtreeID,
-			"error", err,
-		)
-		return
-	}
-
-	c.publishWithRetry(c.subtreeProducer, subtreeMsg.SubtreeID, encoded, "subtree")
 }
 
-// handleBlockMessage deserializes a raw block message and publishes it to Kafka.
-func (c *Client) handleBlockMessage(data []byte) {
-	// Deserialize the P2P message. Currently using JSON encoding;
-	// this will be replaced with protobuf when Teranode schemas are finalized.
-	var blockMsg kafka.BlockMessage
-	if err := json.Unmarshal(data, &blockMsg); err != nil {
-		c.Logger.Error("failed to deserialize block message",
-			"error", err,
-			"dataLen", len(data),
-		)
-		return
-	}
-
-	c.Logger.Debug("received block message",
-		"blockHash", blockMsg.BlockHash,
-		"blockHeight", blockMsg.BlockHeight,
-		"subtreeRefs", len(blockMsg.SubtreeRefs),
+// handleSubtreeMessage maps a teranode SubtreeMessage to a Kafka SubtreeMessage and publishes it.
+func (c *Client) handleSubtreeMessage(msg teranode.SubtreeMessage) {
+	c.Logger.Debug("received subtree announcement",
+		"hash", msg.Hash,
+		"dataHubUrl", msg.DataHubURL,
 	)
 
-	encoded, err := blockMsg.Encode()
+	kafkaMsg := kafka.SubtreeMessage{
+		Hash:       msg.Hash,
+		DataHubURL: msg.DataHubURL,
+		PeerID:     msg.PeerID,
+		ClientName: msg.ClientName,
+	}
+
+	encoded, err := kafkaMsg.Encode()
 	if err != nil {
-		c.Logger.Error("failed to encode block message for kafka",
-			"blockHash", blockMsg.BlockHash,
+		c.Logger.Error("failed to encode subtree message for kafka",
+			"hash", msg.Hash,
 			"error", err,
 		)
 		return
 	}
 
-	c.publishWithRetry(c.blockProducer, blockMsg.BlockHash, encoded, "block")
+	c.publishWithRetry(c.subtreeProducer, msg.Hash, encoded, "subtree")
+}
+
+// handleBlockMessage maps a teranode BlockMessage to a Kafka BlockMessage and publishes it.
+func (c *Client) handleBlockMessage(msg teranode.BlockMessage) {
+	c.Logger.Debug("received block announcement",
+		"hash", msg.Hash,
+		"height", msg.Height,
+		"dataHubUrl", msg.DataHubURL,
+	)
+
+	kafkaMsg := kafka.BlockMessage{
+		Hash:       msg.Hash,
+		Height:     msg.Height,
+		Header:     msg.Header,
+		Coinbase:   msg.Coinbase,
+		DataHubURL: msg.DataHubURL,
+		PeerID:     msg.PeerID,
+		ClientName: msg.ClientName,
+	}
+
+	encoded, err := kafkaMsg.Encode()
+	if err != nil {
+		c.Logger.Error("failed to encode block message for kafka",
+			"hash", msg.Hash,
+			"error", err,
+		)
+		return
+	}
+
+	c.publishWithRetry(c.blockProducer, msg.Hash, encoded, "block")
 }
 
 // publishWithRetry attempts to publish a message to Kafka with exponential backoff retries.

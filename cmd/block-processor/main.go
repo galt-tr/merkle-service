@@ -44,7 +44,10 @@ func main() {
 		logger,
 	)
 
-	blobStore := store.NewMemoryBlobStore()
+	blobStore, err := store.NewBlobStoreFromURL(cfg.BlobStore.URL)
+	if err != nil {
+		log.Fatal("failed to create blob store: ", err)
+	}
 	subtreeStore := store.NewSubtreeStore(
 		blobStore,
 		uint64(cfg.Subtree.DAHOffset),
@@ -59,7 +62,7 @@ func main() {
 	defer stumpsProducer.Close()
 
 	// Create, init, and start the block processor.
-	processor := block.NewProcessor(cfg.Kafka, cfg.Block, stumpsProducer, regStore, subtreeStore, logger)
+	processor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, stumpsProducer, regStore, subtreeStore, logger)
 
 	if err := processor.Init(nil); err != nil {
 		log.Fatal("failed to init block processor: ", err)

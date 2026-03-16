@@ -165,13 +165,10 @@ func (s *RegistrationStore) BatchUpdateTTL(txids []string, ttl time.Duration) er
 		return nil
 	}
 
-	expiration := uint32(ttl.Seconds())
-
 	for _, txid := range txids {
 		if err := s.UpdateTTL(txid, ttl); err != nil {
-			s.logger.Warn("failed to update TTL", "txid", txid, "error", err)
+			s.logger.Warn("failed to update TTL (check Aerospike nsup-period config)", "txid", txid, "error", err)
 		}
 	}
-	_ = expiration // used in the loop via ttl param
 	return nil
 }

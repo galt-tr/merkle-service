@@ -7,10 +7,10 @@ import (
 
 func TestSubtreeMessage_EncodeDecode(t *testing.T) {
 	msg := &SubtreeMessage{
-		SubtreeID:   "sub123",
-		TxIDs:       []string{"tx1", "tx2"},
-		MerkleData:  []byte{0x01, 0x02},
-		BlockHeight: 100,
+		Hash:       "subtree-hash-123",
+		DataHubURL: "https://datahub.example.com/subtree/123",
+		PeerID:     "peer1",
+		ClientName: "teranode-v1",
 	}
 
 	data, err := msg.Encode()
@@ -23,23 +23,29 @@ func TestSubtreeMessage_EncodeDecode(t *testing.T) {
 		t.Fatalf("decode failed: %v", err)
 	}
 
-	if decoded.SubtreeID != msg.SubtreeID {
-		t.Errorf("subtree ID mismatch")
+	if decoded.Hash != msg.Hash {
+		t.Errorf("hash mismatch")
 	}
-	if len(decoded.TxIDs) != 2 {
-		t.Errorf("expected 2 txids")
+	if decoded.DataHubURL != msg.DataHubURL {
+		t.Errorf("dataHubUrl mismatch")
 	}
-	if decoded.BlockHeight != 100 {
-		t.Errorf("block height mismatch")
+	if decoded.PeerID != msg.PeerID {
+		t.Errorf("peerId mismatch")
+	}
+	if decoded.ClientName != msg.ClientName {
+		t.Errorf("clientName mismatch")
 	}
 }
 
 func TestBlockMessage_EncodeDecode(t *testing.T) {
 	msg := &BlockMessage{
-		BlockHash:   "blockhash123",
-		BlockHeader: []byte{0x01},
-		BlockHeight: 200,
-		SubtreeRefs: []string{"sub1", "sub2"},
+		Hash:       "blockhash123",
+		Height:     200,
+		Header:     "0100000000000000",
+		Coinbase:   "01000000010000",
+		DataHubURL: "https://datahub.example.com/block/123",
+		PeerID:     "peer2",
+		ClientName: "teranode-v1",
 	}
 
 	data, err := msg.Encode()
@@ -52,11 +58,20 @@ func TestBlockMessage_EncodeDecode(t *testing.T) {
 		t.Fatalf("decode failed: %v", err)
 	}
 
-	if decoded.BlockHash != msg.BlockHash {
-		t.Errorf("block hash mismatch")
+	if decoded.Hash != msg.Hash {
+		t.Errorf("hash mismatch")
 	}
-	if len(decoded.SubtreeRefs) != 2 {
-		t.Errorf("expected 2 subtree refs")
+	if decoded.Height != 200 {
+		t.Errorf("height mismatch")
+	}
+	if decoded.Header != msg.Header {
+		t.Errorf("header mismatch")
+	}
+	if decoded.Coinbase != msg.Coinbase {
+		t.Errorf("coinbase mismatch")
+	}
+	if decoded.DataHubURL != msg.DataHubURL {
+		t.Errorf("dataHubUrl mismatch")
 	}
 }
 

@@ -4,14 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
+	"sync"
 
 	"github.com/IBM/sarama"
 	"github.com/bsv-blockchain/merkle-service/internal/config"
+	"github.com/bsv-blockchain/merkle-service/internal/datahub"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
 	"github.com/bsv-blockchain/merkle-service/internal/service"
 	"github.com/bsv-blockchain/merkle-service/internal/store"
-	"golang.org/x/sync/errgroup"
 )
 
 // Processor implements the block processor service.
@@ -19,23 +19,27 @@ type Processor struct {
 	service.BaseService
 	kafkaCfg       config.KafkaConfig
 	blockCfg       config.BlockConfig
+	datahubCfg     config.DataHubConfig
 	consumer       *kafka.Consumer
 	stumpsProducer *kafka.Producer
 	regStore       *store.RegistrationStore
 	subtreeStore   *store.SubtreeStore
+	dataHubClient  *datahub.Client
 }
 
 func NewProcessor(
 	kafkaCfg config.KafkaConfig,
 	blockCfg config.BlockConfig,
+	datahubCfg config.DataHubConfig,
 	stumpsProducer *kafka.Producer,
 	regStore *store.RegistrationStore,
 	subtreeStore *store.SubtreeStore,
 	logger *slog.Logger,
 ) *Processor {
 	p := &Processor{
-		kafkaCfg:       kafkaCfg,
-		blockCfg:       blockCfg,
+		kafkaCfg:   kafkaCfg,
+		blockCfg:   blockCfg,
+		datahubCfg: datahubCfg,
 		stumpsProducer: stumpsProducer,
 		regStore:       regStore,
 		subtreeStore:   subtreeStore,
@@ -48,6 +52,8 @@ func NewProcessor(
 }
 
 func (p *Processor) Init(cfg interface{}) error {
+	p.dataHubClient = datahub.NewClient(p.datahubCfg.TimeoutSec, p.datahubCfg.MaxRetries, p.Logger)
+
 	consumer, err := kafka.NewConsumer(
 		p.kafkaCfg.Brokers,
 		p.kafkaCfg.ConsumerGroup+"-block",
@@ -92,65 +98,87 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 		return err
 	}
 
-	p.Logger.Info("processing block",
-		"blockHash", blockMsg.BlockHash,
-		"blockHeight", blockMsg.BlockHeight,
-		"subtreeCount", len(blockMsg.SubtreeRefs),
+	p.Logger.Info("processing block announcement",
+		"hash", blockMsg.Hash,
+		"height", blockMsg.Height,
+		"dataHubUrl", blockMsg.DataHubURL,
 	)
 
-	// Update current block height for DAH
-	p.subtreeStore.SetCurrentBlockHeight(blockMsg.BlockHeight)
-
-	// Process all subtrees in parallel with bounded worker pool
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(p.blockCfg.WorkerPoolSize)
-
-	allRegisteredTxIDs := make(chan string, 1000)
-
-	for i, subtreeRef := range blockMsg.SubtreeRefs {
-		subtreeID := subtreeRef
-		subtreeIdx := i
-		g.Go(func() error {
-			return p.processSubtree(gctx, blockMsg, subtreeID, subtreeIdx, allRegisteredTxIDs)
-		})
+	// 5.2: Fetch block metadata from DataHub.
+	meta, err := p.dataHubClient.FetchBlockMetadata(ctx, blockMsg.DataHubURL, blockMsg.Hash)
+	if err != nil {
+		p.Logger.Error("failed to fetch block metadata", "hash", blockMsg.Hash, "error", err)
+		return fmt.Errorf("fetching block metadata %s: %w", blockMsg.Hash, err)
 	}
 
-	// Wait for all subtree processors to complete
-	go func() {
-		g.Wait()
-		close(allRegisteredTxIDs)
-	}()
-
-	// Collect all registered txids for TTL update
-	var registeredTxIDs []string
-	for txid := range allRegisteredTxIDs {
-		registeredTxIDs = append(registeredTxIDs, txid)
-	}
-
-	if err := g.Wait(); err != nil {
-		p.Logger.Error("block processing error", "blockHash", blockMsg.BlockHash, "error", err)
-		return err
-	}
-
-	// Post-block TTL updates
-	if len(registeredTxIDs) > 0 {
-		ttl := time.Duration(p.blockCfg.PostMineTTLSec) * time.Second
-		if err := p.regStore.BatchUpdateTTL(registeredTxIDs, ttl); err != nil {
-			p.Logger.Error("failed to update TTLs", "error", err)
-		}
-	}
-
-	// Cleanup subtree store
-	for _, subtreeRef := range blockMsg.SubtreeRefs {
-		if err := p.subtreeStore.DeleteSubtree(subtreeRef); err != nil {
-			p.Logger.Warn("failed to delete subtree (DAH will handle)", "subtreeId", subtreeRef, "error", err)
-		}
-	}
-
-	p.Logger.Info("block processing complete",
-		"blockHash", blockMsg.BlockHash,
-		"registeredTxCount", len(registeredTxIDs),
+	// 5.3: Extract subtree hashes from block metadata.
+	subtreeHashes := meta.Subtrees
+	p.Logger.Info("block metadata fetched",
+		"hash", blockMsg.Hash,
+		"height", meta.Height,
+		"subtreeCount", len(subtreeHashes),
 	)
+
+	if len(subtreeHashes) == 0 {
+		return nil
+	}
+
+	// 7.1-7.3: Dispatch subtree processing to a bounded worker pool.
+	poolSize := p.blockCfg.WorkerPoolSize
+	if poolSize > len(subtreeHashes) {
+		poolSize = len(subtreeHashes)
+	}
+
+	sem := make(chan struct{}, poolSize)
+	var wg sync.WaitGroup
+	var errCount int64
+	var mu sync.Mutex
+
+	for _, stHash := range subtreeHashes {
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(subtreeHash string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if err := ProcessBlockSubtree(
+				ctx,
+				subtreeHash,
+				uint64(meta.Height),
+				blockMsg.Hash,
+				blockMsg.DataHubURL,
+				p.dataHubClient,
+				p.subtreeStore,
+				p.regStore,
+				p.stumpsProducer,
+				p.blockCfg.PostMineTTLSec,
+				p.Logger,
+			); err != nil {
+				p.Logger.Error("failed to process block subtree",
+					"subtreeHash", subtreeHash,
+					"blockHash", blockMsg.Hash,
+					"error", err,
+				)
+				mu.Lock()
+				errCount++
+				mu.Unlock()
+			}
+		}(stHash)
+	}
+
+	wg.Wait()
+
+	if errCount > 0 {
+		p.Logger.Warn("block processing completed with errors",
+			"blockHash", blockMsg.Hash,
+			"subtreeErrors", errCount,
+			"totalSubtrees", len(subtreeHashes),
+		)
+	}
+
+	// 7.4: Update subtree store block height for DAH pruning.
+	p.subtreeStore.SetCurrentBlockHeight(uint64(meta.Height))
 
 	return nil
 }

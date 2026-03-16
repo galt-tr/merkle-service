@@ -14,20 +14,23 @@ const (
 	StatusMined          StatusType = "MINED"
 )
 
-// SubtreeMessage represents a subtree received from P2P.
+// SubtreeMessage represents a subtree announcement received from P2P.
 type SubtreeMessage struct {
-	SubtreeID   string   `json:"subtreeId"`
-	TxIDs       []string `json:"txids"`
-	MerkleData  []byte   `json:"merkleData"`
-	BlockHeight uint64   `json:"blockHeight"`
+	Hash       string `json:"hash"`
+	DataHubURL string `json:"dataHubUrl"`
+	PeerID     string `json:"peerId"`
+	ClientName string `json:"clientName"`
 }
 
-// BlockMessage represents a block received from P2P.
+// BlockMessage represents a block announcement received from P2P.
 type BlockMessage struct {
-	BlockHash   string   `json:"blockHash"`
-	BlockHeader []byte   `json:"blockHeader"`
-	BlockHeight uint64   `json:"blockHeight"`
-	SubtreeRefs []string `json:"subtreeRefs"`
+	Hash       string `json:"hash"`
+	Height     uint32 `json:"height"`
+	Header     string `json:"header"`
+	Coinbase   string `json:"coinbase"`
+	DataHubURL string `json:"dataHubUrl"`
+	PeerID     string `json:"peerId"`
+	ClientName string `json:"clientName"`
 }
 
 // StumpsMessage represents a callback notification (STUMP or status).

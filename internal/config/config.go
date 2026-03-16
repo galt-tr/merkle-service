@@ -18,6 +18,7 @@ type Config struct {
 	Block     BlockConfig     `yaml:"block"     mapstructure:"block"`
 	Callback  CallbackConfig  `yaml:"callback"  mapstructure:"callback"`
 	BlobStore BlobStoreConfig `yaml:"blobStore" mapstructure:"blobstore"`
+	DataHub   DataHubConfig   `yaml:"datahub"   mapstructure:"datahub"`
 }
 
 // APIConfig holds HTTP API configuration.
@@ -48,19 +49,8 @@ type KafkaConfig struct {
 
 // P2PConfig holds peer-to-peer network configuration.
 type P2PConfig struct {
-	Network         string   `yaml:"network"        mapstructure:"network"`
-	Name            string   `yaml:"name"           mapstructure:"name"`
-	PrivateKey      string   `yaml:"privateKey"     mapstructure:"privatekey"`
-	PeerCacheDir    string   `yaml:"peerCacheDir"   mapstructure:"peercachedir"`
-	Port            int      `yaml:"port"           mapstructure:"port"`
-	AnnounceAddrs   []string `yaml:"announceAddrs"  mapstructure:"announceaddrs"`
-	BootstrapPeers  []string `yaml:"bootstrapPeers" mapstructure:"bootstrappeers"`
-	SubtreeTopic    string   `yaml:"subtreeTopic"   mapstructure:"subtreetopic"`
-	BlockTopic      string   `yaml:"blockTopic"     mapstructure:"blocktopic"`
-	DHTMode         string   `yaml:"dhtMode"        mapstructure:"dhtmode"`
-	EnableNAT       bool     `yaml:"enableNat"      mapstructure:"enablenat"`
-	EnableMDNS      bool     `yaml:"enableMdns"     mapstructure:"enablemdns"`
-	AllowPrivateIPs bool     `yaml:"allowPrivateIps" mapstructure:"allowprivateips"`
+	Network     string `yaml:"network"     mapstructure:"network"`
+	StoragePath string `yaml:"storagePath" mapstructure:"storagepath"`
 }
 
 // SubtreeConfig holds subtree processing configuration.
@@ -89,6 +79,12 @@ type BlobStoreConfig struct {
 	URL string `yaml:"url" mapstructure:"url"`
 }
 
+// DataHubConfig holds DataHub HTTP client configuration.
+type DataHubConfig struct {
+	TimeoutSec int `yaml:"timeoutSec" mapstructure:"timeoutsec"`
+	MaxRetries int `yaml:"maxRetries" mapstructure:"maxretries"`
+}
+
 // registerDefaults sets all default values in the Viper instance.
 func registerDefaults(v *viper.Viper) {
 	// General
@@ -115,16 +111,8 @@ func registerDefaults(v *viper.Viper) {
 	v.SetDefault("kafka.consumergroup", "merkle-service")
 
 	// P2P
-	v.SetDefault("p2p.network", "mainnet")
-	v.SetDefault("p2p.name", "merkle-service")
-	v.SetDefault("p2p.port", 9906)
-	v.SetDefault("p2p.bootstrappeers", []string{})
-	v.SetDefault("p2p.subtreetopic", "subtree")
-	v.SetDefault("p2p.blocktopic", "block")
-	v.SetDefault("p2p.dhtmode", "off")
-	v.SetDefault("p2p.enablenat", false)
-	v.SetDefault("p2p.enablemdns", false)
-	v.SetDefault("p2p.allowprivateips", false)
+	v.SetDefault("p2p.network", "main")
+	v.SetDefault("p2p.storagepath", "~/.merkle-service/p2p")
 
 	// Subtree
 	v.SetDefault("subtree.storagemode", "realtime")
@@ -143,6 +131,10 @@ func registerDefaults(v *viper.Viper) {
 
 	// BlobStore
 	v.SetDefault("blobstore.url", "file:///tmp/merkle-subtrees")
+
+	// DataHub
+	v.SetDefault("datahub.timeoutsec", 30)
+	v.SetDefault("datahub.maxretries", 3)
 }
 
 // bindEnvVars explicitly binds environment variable names to Viper keys.
@@ -178,19 +170,8 @@ func bindEnvVars(v *viper.Viper) {
 		"kafka.consumergroup":  "KAFKA_CONSUMER_GROUP",
 
 		// P2P
-		"p2p.network":         "P2P_NETWORK",
-		"p2p.name":            "P2P_NAME",
-		"p2p.privatekey":      "P2P_PRIVATE_KEY",
-		"p2p.peercachedir":    "P2P_PEER_CACHE_DIR",
-		"p2p.port":            "P2P_PORT",
-		"p2p.announceaddrs":   "P2P_ANNOUNCE_ADDRS",
-		"p2p.bootstrappeers":  "P2P_BOOTSTRAP_PEERS",
-		"p2p.subtreetopic":    "P2P_SUBTREE_TOPIC",
-		"p2p.blocktopic":      "P2P_BLOCK_TOPIC",
-		"p2p.dhtmode":         "P2P_DHT_MODE",
-		"p2p.enablenat":       "P2P_ENABLE_NAT",
-		"p2p.enablemdns":      "P2P_ENABLE_MDNS",
-		"p2p.allowprivateips": "P2P_ALLOW_PRIVATE_IPS",
+		"p2p.network":     "P2P_NETWORK",
+		"p2p.storagepath": "P2P_STORAGE_PATH",
 
 		// Subtree
 		"subtree.storagemode": "SUBTREE_STORAGE_MODE",
@@ -209,6 +190,10 @@ func bindEnvVars(v *viper.Viper) {
 
 		// BlobStore
 		"blobstore.url": "BLOB_STORE_URL",
+
+		// DataHub
+		"datahub.timeoutsec": "DATAHUB_TIMEOUT_SEC",
+		"datahub.maxretries": "DATAHUB_MAX_RETRIES",
 	}
 
 	for key, env := range bindings {
