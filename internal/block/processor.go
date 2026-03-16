@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/IBM/sarama"
+	"github.com/bsv-blockchain/merkle-service/internal/cache"
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/datahub"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
@@ -25,6 +26,7 @@ type Processor struct {
 	regStore       *store.RegistrationStore
 	subtreeStore   *store.SubtreeStore
 	dataHubClient  *datahub.Client
+	dedupCache     *cache.DedupCache
 }
 
 func NewProcessor(
@@ -53,6 +55,11 @@ func NewProcessor(
 
 func (p *Processor) Init(cfg interface{}) error {
 	p.dataHubClient = datahub.NewClient(p.datahubCfg.TimeoutSec, p.datahubCfg.MaxRetries, p.Logger)
+
+	// Initialize message dedup cache.
+	if p.blockCfg.DedupCacheSize > 0 {
+		p.dedupCache = cache.NewDedupCache(p.blockCfg.DedupCacheSize)
+	}
 
 	consumer, err := kafka.NewConsumer(
 		p.kafkaCfg.Brokers,
@@ -103,6 +110,12 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 		"height", blockMsg.Height,
 		"dataHubUrl", blockMsg.DataHubURL,
 	)
+
+	// Check dedup cache — skip if already successfully processed.
+	if p.dedupCache != nil && p.dedupCache.Contains(blockMsg.Hash) {
+		p.Logger.Debug("skipping duplicate block message", "hash", blockMsg.Hash)
+		return nil
+	}
 
 	// 5.2: Fetch block metadata from DataHub.
 	meta, err := p.dataHubClient.FetchBlockMetadata(ctx, blockMsg.DataHubURL, blockMsg.Hash)
@@ -179,6 +192,11 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 
 	// 7.4: Update subtree store block height for DAH pruning.
 	p.subtreeStore.SetCurrentBlockHeight(uint64(meta.Height))
+
+	// Mark block as successfully processed for dedup.
+	if p.dedupCache != nil {
+		p.dedupCache.Add(blockMsg.Hash)
+	}
 
 	return nil
 }

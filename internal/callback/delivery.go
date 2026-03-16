@@ -17,6 +17,12 @@ import (
 	"github.com/bsv-blockchain/merkle-service/internal/service"
 )
 
+// CallbackDeduper abstracts callback deduplication for testability.
+type CallbackDeduper interface {
+	Exists(txid, callbackURL, statusType string) (bool, error)
+	Record(txid, callbackURL, statusType string, ttl time.Duration) error
+}
+
 // callbackPayload is the JSON body sent to the callback URL.
 type callbackPayload struct {
 	TxID      string   `json:"txid,omitempty"`
@@ -36,16 +42,19 @@ type DeliveryService struct {
 	producer    *kafka.Producer
 	dlqProducer *kafka.Producer
 	httpClient  *http.Client
+	dedupStore  CallbackDeduper
 
 	messagesProcessed atomic.Int64
 	messagesRetried   atomic.Int64
 	messagesFailed    atomic.Int64
+	messagesDedupe    atomic.Int64
 }
 
 // NewDeliveryService creates a new callback DeliveryService.
-func NewDeliveryService(cfg *config.Config) *DeliveryService {
+func NewDeliveryService(cfg *config.Config, dedupStore CallbackDeduper) *DeliveryService {
 	return &DeliveryService{
-		cfg: cfg,
+		cfg:        cfg,
+		dedupStore: dedupStore,
 	}
 }
 
@@ -195,6 +204,28 @@ func (d *DeliveryService) handleMessage(ctx context.Context, msg *sarama.Consume
 		"retryCount", stumpsMsg.RetryCount,
 	)
 
+	// Check callback dedup — skip if already delivered.
+	if d.dedupStore != nil {
+		txid := stumpsMsg.TxID
+		if txid == "" && len(stumpsMsg.TxIDs) > 0 {
+			txid = stumpsMsg.TxIDs[0]
+		}
+		if txid != "" {
+			exists, err := d.dedupStore.Exists(txid, stumpsMsg.CallbackURL, string(stumpsMsg.StatusType))
+			if err != nil {
+				d.Logger.Warn("dedup check failed, proceeding with delivery", "error", err)
+			} else if exists {
+				d.Logger.Debug("skipping duplicate callback delivery",
+					"txid", txid,
+					"callbackUrl", stumpsMsg.CallbackURL,
+					"statusType", stumpsMsg.StatusType,
+				)
+				d.messagesDedupe.Add(1)
+				return nil
+			}
+		}
+	}
+
 	// Check if the message has a delay that hasn't elapsed yet.
 	if !stumpsMsg.NextRetryAt.IsZero() && time.Now().Before(stumpsMsg.NextRetryAt) {
 		d.Logger.Debug("message not yet due for retry, re-enqueuing",
@@ -208,6 +239,19 @@ func (d *DeliveryService) handleMessage(ctx context.Context, msg *sarama.Consume
 	// Attempt HTTP POST delivery.
 	err = d.deliverCallback(ctx, stumpsMsg)
 	if err == nil {
+		// Record successful delivery for dedup.
+		if d.dedupStore != nil {
+			txid := stumpsMsg.TxID
+			if txid == "" && len(stumpsMsg.TxIDs) > 0 {
+				txid = stumpsMsg.TxIDs[0]
+			}
+			if txid != "" {
+				ttl := time.Duration(d.cfg.Callback.DedupTTLSec) * time.Second
+				if recErr := d.dedupStore.Record(txid, stumpsMsg.CallbackURL, string(stumpsMsg.StatusType), ttl); recErr != nil {
+					d.Logger.Warn("failed to record callback dedup", "error", recErr)
+				}
+			}
+		}
 		// Success: offset will be committed by the consumer.
 		d.messagesProcessed.Add(1)
 		d.Logger.Debug("callback delivered successfully",
@@ -280,6 +324,12 @@ func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.Stumps
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// Add idempotency key header for receiver-side dedup.
+	idempotencyKey := buildIdempotencyKey(msg)
+	if idempotencyKey != "" {
+		req.Header.Set("X-Idempotency-Key", idempotencyKey)
+	}
+
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("HTTP request failed: %w", err)
@@ -291,6 +341,17 @@ func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.Stumps
 	}
 
 	return fmt.Errorf("callback returned non-2xx status: %d", resp.StatusCode)
+}
+
+// buildIdempotencyKey creates a unique key for a callback delivery.
+func buildIdempotencyKey(msg *kafka.StumpsMessage) string {
+	if msg.TxID != "" {
+		return msg.TxID + ":" + string(msg.StatusType)
+	}
+	if msg.BlockHash != "" && msg.SubtreeID != "" {
+		return msg.BlockHash + ":" + msg.SubtreeID + ":" + string(msg.StatusType)
+	}
+	return ""
 }
 
 // reenqueue publishes the message back to the stumps topic for later processing.

@@ -23,7 +23,7 @@ type RegistrationGetter interface {
 
 // SeenCounter abstracts seen-count tracking for testability.
 type SeenCounter interface {
-	Increment(txid string) (*store.IncrementResult, error)
+	Increment(txid string, subtreeID string) (*store.IncrementResult, error)
 }
 
 // RegCache abstracts the registration deduplication cache for testability.
@@ -45,6 +45,7 @@ type Processor struct {
 	seenCounterStore  SeenCounter
 	subtreeStore      *store.SubtreeStore
 	regCache          RegCache
+	dedupCache        *cache.DedupCache
 	dataHubClient     *datahub.Client
 
 	messagesProcessed atomic.Int64
@@ -71,6 +72,11 @@ func (p *Processor) Init(_ interface{}) error {
 
 	// Initialize DataHub client.
 	p.dataHubClient = datahub.NewClient(p.cfg.DataHub.TimeoutSec, p.cfg.DataHub.MaxRetries, p.Logger)
+
+	// Initialize message dedup cache.
+	if p.cfg.Subtree.DedupCacheSize > 0 {
+		p.dedupCache = cache.NewDedupCache(p.cfg.Subtree.DedupCacheSize)
+	}
 
 	// Initialize registration deduplication cache (txmetacache).
 	regCache, err := cache.NewRegistrationCache(p.cfg.Subtree.CacheMaxMB, p.Logger)
@@ -186,6 +192,12 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 		"dataHubUrl", subtreeMsg.DataHubURL,
 	)
 
+	// Check dedup cache — skip if already successfully processed.
+	if p.dedupCache != nil && p.dedupCache.Contains(subtreeMsg.Hash) {
+		p.Logger.Debug("skipping duplicate subtree message", "hash", subtreeMsg.Hash)
+		return nil
+	}
+
 	// 3.2: Fetch binary subtree data from DataHub.
 	rawData, err := p.dataHubClient.FetchSubtreeRaw(ctx, subtreeMsg.DataHubURL, subtreeMsg.Hash)
 	if err != nil {
@@ -214,6 +226,9 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 	p.Logger.Debug("processing subtree txids", "length", len(txids), "hash", subtreeMsg.Hash)
 
 	if len(txids) == 0 {
+		if p.dedupCache != nil {
+			p.dedupCache.Add(subtreeMsg.Hash)
+		}
 		p.messagesProcessed.Add(1)
 		return nil
 	}
@@ -230,6 +245,11 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 		if err := p.emitSeenCallbacks(txid, subtreeMsg.Hash); err != nil {
 			p.Logger.Error("failed to emit callbacks", "txid", txid, "error", err)
 		}
+	}
+
+	// Mark subtree as successfully processed for dedup.
+	if p.dedupCache != nil {
+		p.dedupCache.Add(subtreeMsg.Hash)
 	}
 
 	p.messagesProcessed.Add(1)
@@ -311,8 +331,8 @@ func (p *Processor) emitSeenCallbacks(txid string, subtreeID string) error {
 		}
 	}
 
-	// 4.6: Increment seen counter and check threshold.
-	result, err := p.seenCounterStore.Increment(txid)
+	// 4.6: Increment seen counter and check threshold (idempotent per subtreeID).
+	result, err := p.seenCounterStore.Increment(txid, subtreeID)
 	if err != nil {
 		p.Logger.Warn("failed to increment seen counter", "txid", txid, "error", err)
 		return nil

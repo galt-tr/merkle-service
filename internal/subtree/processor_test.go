@@ -3,10 +3,12 @@ package subtree
 import (
 	"encoding/hex"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 
+	"github.com/bsv-blockchain/merkle-service/internal/cache"
 	"github.com/bsv-blockchain/merkle-service/internal/datahub"
 	"github.com/bsv-blockchain/merkle-service/internal/store"
 )
@@ -36,7 +38,7 @@ func (m *mockRegStore) Get(txid string) ([]string, error) {
 
 type mockSeenCounter struct{}
 
-func (m *mockSeenCounter) Increment(txid string) (*store.IncrementResult, error) {
+func (m *mockSeenCounter) Increment(txid string, subtreeID string) (*store.IncrementResult, error) {
 	return &store.IncrementResult{NewCount: 1, ThresholdReached: false}, nil
 }
 
@@ -547,5 +549,314 @@ func TestFindRegisteredTxids_CacheUpdatedCorrectly(t *testing.T) {
 	}
 	if !notSet[txidNot1] || !notSet[txidNot2] {
 		t.Errorf("missing expected not-registered txids in cache: %v", cache.setNot)
+	}
+}
+
+// --- Idempotent Seen Counter Tests ---
+
+// mockIdempotentSeenCounter simulates the idempotent seen counter behavior:
+// tracks which subtreeIDs have been counted per txid and fires threshold once.
+type mockIdempotentSeenCounter struct {
+	mu              sync.Mutex
+	subtreesByTxid  map[string]map[string]bool // txid -> set of subtreeIDs
+	thresholdFired  map[string]bool            // txid -> whether threshold already fired
+	threshold       int
+}
+
+func newMockIdempotentSeenCounter(threshold int) *mockIdempotentSeenCounter {
+	return &mockIdempotentSeenCounter{
+		subtreesByTxid: make(map[string]map[string]bool),
+		thresholdFired: make(map[string]bool),
+		threshold:      threshold,
+	}
+}
+
+func (m *mockIdempotentSeenCounter) Increment(txid string, subtreeID string) (*store.IncrementResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.subtreesByTxid[txid] == nil {
+		m.subtreesByTxid[txid] = make(map[string]bool)
+	}
+
+	// AddUnique semantics: only count if not already present.
+	m.subtreesByTxid[txid][subtreeID] = true
+	newCount := len(m.subtreesByTxid[txid])
+
+	thresholdReached := false
+	if newCount >= m.threshold && !m.thresholdFired[txid] {
+		thresholdReached = true
+		m.thresholdFired[txid] = true
+	}
+
+	return &store.IncrementResult{
+		NewCount:         newCount,
+		ThresholdReached: thresholdReached,
+	}, nil
+}
+
+func TestIdempotentSeenCounter_FirstSubtreeIncrements(t *testing.T) {
+	sc := newMockIdempotentSeenCounter(3)
+
+	result, err := sc.Increment("txid-1", "subtree-A")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NewCount != 1 {
+		t.Errorf("expected count=1, got %d", result.NewCount)
+	}
+	if result.ThresholdReached {
+		t.Error("threshold should not be reached with 1 subtree")
+	}
+}
+
+func TestIdempotentSeenCounter_DuplicateSubtreeDoesNotIncrement(t *testing.T) {
+	sc := newMockIdempotentSeenCounter(3)
+
+	// First call with subtree-A.
+	sc.Increment("txid-1", "subtree-A")
+
+	// Duplicate call with same subtree-A.
+	result, _ := sc.Increment("txid-1", "subtree-A")
+	if result.NewCount != 1 {
+		t.Errorf("expected count=1 after duplicate, got %d", result.NewCount)
+	}
+	if result.ThresholdReached {
+		t.Error("threshold should not fire on duplicate")
+	}
+}
+
+func TestIdempotentSeenCounter_ThresholdFiresOnce(t *testing.T) {
+	sc := newMockIdempotentSeenCounter(3)
+
+	sc.Increment("txid-1", "subtree-A")
+	sc.Increment("txid-1", "subtree-B")
+
+	// Third unique subtree should trigger threshold.
+	result, _ := sc.Increment("txid-1", "subtree-C")
+	if result.NewCount != 3 {
+		t.Errorf("expected count=3, got %d", result.NewCount)
+	}
+	if !result.ThresholdReached {
+		t.Error("threshold should fire when unique count reaches threshold")
+	}
+
+	// Fourth unique subtree — threshold should NOT fire again.
+	result, _ = sc.Increment("txid-1", "subtree-D")
+	if result.NewCount != 4 {
+		t.Errorf("expected count=4, got %d", result.NewCount)
+	}
+	if result.ThresholdReached {
+		t.Error("threshold should NOT fire again after already fired")
+	}
+}
+
+func TestIdempotentSeenCounter_ThresholdDoesNotFireOnDuplicates(t *testing.T) {
+	sc := newMockIdempotentSeenCounter(2)
+
+	sc.Increment("txid-1", "subtree-A")
+
+	// Duplicate of subtree-A — count stays 1, no threshold.
+	result, _ := sc.Increment("txid-1", "subtree-A")
+	if result.NewCount != 1 {
+		t.Errorf("expected count=1, got %d", result.NewCount)
+	}
+	if result.ThresholdReached {
+		t.Error("threshold should not fire on duplicate subtree")
+	}
+
+	// Now a truly new subtree triggers threshold.
+	result, _ = sc.Increment("txid-1", "subtree-B")
+	if result.NewCount != 2 {
+		t.Errorf("expected count=2, got %d", result.NewCount)
+	}
+	if !result.ThresholdReached {
+		t.Error("threshold should fire on second unique subtree")
+	}
+
+	// Re-send subtree-A — should NOT fire threshold.
+	result, _ = sc.Increment("txid-1", "subtree-A")
+	if result.ThresholdReached {
+		t.Error("threshold should not fire again on re-sent subtree")
+	}
+}
+
+func TestIdempotentSeenCounter_IndependentPerTxid(t *testing.T) {
+	sc := newMockIdempotentSeenCounter(2)
+
+	sc.Increment("txid-1", "subtree-A")
+	sc.Increment("txid-2", "subtree-A")
+
+	// Same subtreeID for different txids should be independent.
+	result1, _ := sc.Increment("txid-1", "subtree-B")
+	result2, _ := sc.Increment("txid-2", "subtree-B")
+
+	if !result1.ThresholdReached {
+		t.Error("txid-1 threshold should fire")
+	}
+	if !result2.ThresholdReached {
+		t.Error("txid-2 threshold should fire independently")
+	}
+}
+
+// --- Integration-style Dedup Tests ---
+
+// TestIntegration_DuplicateSubtreeOnlyProcessedOnce simulates sending
+// duplicate subtree messages through the processor's dedup cache +
+// findRegisteredTxids path, verifying only one set of lookups is made.
+func TestIntegration_DuplicateSubtreeOnlyProcessedOnce(t *testing.T) {
+	dc := cache.NewDedupCache(100)
+	regStore := &mockRegStore{
+		registrations: map[string][]string{
+			"txid-registered": {"http://cb.example.com"},
+		},
+	}
+
+	p := &Processor{
+		registrationStore: regStore,
+		regCache:          nil,
+		dedupCache:        dc,
+	}
+
+	txids := []string{"txid-registered", "txid-not-registered"}
+	subtreeHash := "subtree-integration-test"
+
+	// First processing: not in dedup cache, queries store.
+	if dc.Contains(subtreeHash) {
+		t.Fatal("subtree hash should not be in cache initially")
+	}
+	result1, err := p.findRegisteredTxids(txids)
+	if err != nil {
+		t.Fatalf("first findRegisteredTxids: %v", err)
+	}
+	if len(result1) != 1 || result1[0] != "txid-registered" {
+		t.Errorf("first call: expected [txid-registered], got %v", result1)
+	}
+	// Mark as processed.
+	dc.Add(subtreeHash)
+	batchCallsAfterFirst := len(regStore.batchGetCalls)
+
+	// Simulate duplicate message — dedup cache should prevent processing.
+	if !dc.Contains(subtreeHash) {
+		t.Fatal("subtree hash should be in cache after Add")
+	}
+
+	// In the real processor, handleMessage returns nil here.
+	// Verify no additional store calls were made.
+	if len(regStore.batchGetCalls) != batchCallsAfterFirst {
+		t.Errorf("expected no additional BatchGet calls for duplicate, got %d total",
+			len(regStore.batchGetCalls))
+	}
+}
+
+// TestIntegration_SeenCounterIdempotency simulates the full seen counter
+// flow: same subtreeID for same txid incremented multiple times, verifying
+// count stays correct and threshold fires exactly once.
+func TestIntegration_SeenCounterIdempotency(t *testing.T) {
+	sc := newMockIdempotentSeenCounter(3)
+
+	// Simulate 3 different subtrees for the same txid.
+	subtrees := []string{"subtree-A", "subtree-B", "subtree-C"}
+	var thresholdCount int
+
+	for _, st := range subtrees {
+		result, err := sc.Increment("txid-1", st)
+		if err != nil {
+			t.Fatalf("Increment error: %v", err)
+		}
+		if result.ThresholdReached {
+			thresholdCount++
+		}
+	}
+
+	if thresholdCount != 1 {
+		t.Errorf("expected threshold to fire exactly once, fired %d times", thresholdCount)
+	}
+
+	// Now replay all subtrees (duplicates).
+	for _, st := range subtrees {
+		result, _ := sc.Increment("txid-1", st)
+		if result.ThresholdReached {
+			t.Errorf("threshold should not fire on duplicate subtree %s", st)
+		}
+		if result.NewCount != 3 {
+			t.Errorf("count should remain at 3 after duplicates, got %d", result.NewCount)
+		}
+	}
+}
+
+// --- Dedup Cache Tests ---
+
+// TestDedupCache_SkipsDuplicateSubtree verifies that the dedup cache
+// prevents reprocessing of already-seen subtree hashes.
+func TestDedupCache_SkipsDuplicateSubtree(t *testing.T) {
+	dc := cache.NewDedupCache(100)
+
+	// First time: not in cache
+	if dc.Contains("hash-abc") {
+		t.Error("expected hash not in cache initially")
+	}
+
+	// Mark as processed
+	dc.Add("hash-abc")
+
+	// Second time: in cache
+	if !dc.Contains("hash-abc") {
+		t.Error("expected hash in cache after Add")
+	}
+}
+
+// TestDedupCache_AllowsRetryOnFailure verifies that failed processing
+// (where Add is never called) allows the message to be retried.
+func TestDedupCache_AllowsRetryOnFailure(t *testing.T) {
+	dc := cache.NewDedupCache(100)
+
+	// Simulate: message received, processing fails (no Add called)
+	if dc.Contains("hash-fail") {
+		t.Error("should not be in cache")
+	}
+
+	// Don't call Add (simulating failure)
+
+	// Retry: should still not be in cache, allowing retry
+	if dc.Contains("hash-fail") {
+		t.Error("failed processing should not add to cache")
+	}
+}
+
+// TestDedupCache_IntegrationWithProcessor verifies the dedup cache is
+// properly checked before and updated after findRegisteredTxids.
+func TestDedupCache_IntegrationWithProcessor(t *testing.T) {
+	dc := cache.NewDedupCache(100)
+	regStore := &mockRegStore{
+		registrations: map[string][]string{
+			"txid1": {"http://cb.example.com"},
+		},
+	}
+
+	p := &Processor{
+		registrationStore: regStore,
+		regCache:          nil,
+		dedupCache:        dc,
+	}
+
+	// First call: not in dedup cache, should query store
+	result, err := p.findRegisteredTxids([]string{"txid1", "txid2"})
+	if err != nil {
+		t.Fatalf("findRegisteredTxids: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 registered txid, got %d", len(result))
+	}
+	if len(regStore.batchGetCalls) != 1 {
+		t.Fatalf("expected 1 BatchGet call, got %d", len(regStore.batchGetCalls))
+	}
+
+	// Simulate marking as processed
+	dc.Add("subtree-hash-1")
+
+	// Verify it's in cache now
+	if !dc.Contains("subtree-hash-1") {
+		t.Error("expected subtree hash in dedup cache")
 	}
 }

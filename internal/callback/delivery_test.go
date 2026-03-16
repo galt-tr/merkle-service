@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -655,6 +656,334 @@ func TestDeliverCallback_ContextCancelled(t *testing.T) {
 	err := ds.deliverCallback(ctx, msg)
 	if err == nil {
 		t.Fatal("expected error for cancelled context, got nil")
+	}
+}
+
+func TestBuildIdempotencyKey_SingleTxid(t *testing.T) {
+	msg := &kafka.StumpsMessage{
+		TxID:       "abc123",
+		StatusType: kafka.StatusSeenOnNetwork,
+	}
+	key := buildIdempotencyKey(msg)
+	if key != "abc123:SEEN_ON_NETWORK" {
+		t.Errorf("expected 'abc123:SEEN_ON_NETWORK', got %q", key)
+	}
+}
+
+func TestBuildIdempotencyKey_MinedWithBlockHash(t *testing.T) {
+	msg := &kafka.StumpsMessage{
+		TxIDs:      []string{"tx1", "tx2"},
+		StatusType: kafka.StatusMined,
+		BlockHash:  "blockhash",
+		SubtreeID:  "subtree123",
+	}
+	key := buildIdempotencyKey(msg)
+	if key != "blockhash:subtree123:MINED" {
+		t.Errorf("expected 'blockhash:subtree123:MINED', got %q", key)
+	}
+}
+
+func TestBuildIdempotencyKey_Empty(t *testing.T) {
+	msg := &kafka.StumpsMessage{
+		StatusType: kafka.StatusMined,
+	}
+	key := buildIdempotencyKey(msg)
+	if key != "" {
+		t.Errorf("expected empty key for message without txid or blockhash, got %q", key)
+	}
+}
+
+func TestDeliverCallback_IdempotencyKeyHeader(t *testing.T) {
+	var receivedIdempotencyKey string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedIdempotencyKey = r.Header.Get("X-Idempotency-Key")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+
+	msg := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		TxID:        "txid-abc",
+		StatusType:  kafka.StatusSeenOnNetwork,
+	}
+
+	err := ds.deliverCallback(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if receivedIdempotencyKey != "txid-abc:SEEN_ON_NETWORK" {
+		t.Errorf("expected X-Idempotency-Key 'txid-abc:SEEN_ON_NETWORK', got %q", receivedIdempotencyKey)
+	}
+}
+
+// --- Callback Dedup Tests ---
+
+type mockDedupStore struct {
+	mu       sync.Mutex
+	records  map[string]bool
+	failNext bool
+}
+
+func newMockDedupStore() *mockDedupStore {
+	return &mockDedupStore{records: make(map[string]bool)}
+}
+
+func (m *mockDedupStore) Exists(txid, callbackURL, statusType string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failNext {
+		m.failNext = false
+		return false, fmt.Errorf("dedup store unavailable")
+	}
+	key := txid + ":" + callbackURL + ":" + statusType
+	return m.records[key], nil
+}
+
+func (m *mockDedupStore) Record(txid, callbackURL, statusType string, ttl time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := txid + ":" + callbackURL + ":" + statusType
+	m.records[key] = true
+	return nil
+}
+
+func TestHandleMessage_DedupFirstDeliveryProceeds(t *testing.T) {
+	var httpCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	cfg.Callback.DedupTTLSec = 86400
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+	dedup := newMockDedupStore()
+	ds.dedupStore = dedup
+
+	stumpsMsg := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		TxID:        "tx-first",
+		StatusType:  kafka.StatusSeenOnNetwork,
+	}
+	data, _ := stumpsMsg.Encode()
+
+	err := ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 1})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !httpCalled {
+		t.Error("expected HTTP callback to be called on first delivery")
+	}
+	if ds.messagesProcessed.Load() != 1 {
+		t.Errorf("expected messagesProcessed=1, got %d", ds.messagesProcessed.Load())
+	}
+	// Verify dedup was recorded.
+	exists, _ := dedup.Exists("tx-first", server.URL+"/callback", "SEEN_ON_NETWORK")
+	if !exists {
+		t.Error("expected dedup record after successful delivery")
+	}
+}
+
+func TestHandleMessage_DedupDuplicateSkipped(t *testing.T) {
+	var httpCallCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCallCount++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	cfg.Callback.DedupTTLSec = 86400
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+	dedup := newMockDedupStore()
+	ds.dedupStore = dedup
+
+	stumpsMsg := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		TxID:        "tx-dup",
+		StatusType:  kafka.StatusSeenOnNetwork,
+	}
+	data, _ := stumpsMsg.Encode()
+
+	// First delivery.
+	err := ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 1})
+	if err != nil {
+		t.Fatalf("first delivery error: %v", err)
+	}
+	if httpCallCount != 1 {
+		t.Fatalf("expected 1 HTTP call after first delivery, got %d", httpCallCount)
+	}
+
+	// Duplicate delivery — should be skipped.
+	err = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 2})
+	if err != nil {
+		t.Fatalf("duplicate delivery error: %v", err)
+	}
+	if httpCallCount != 1 {
+		t.Errorf("expected HTTP not called again for duplicate, got %d calls", httpCallCount)
+	}
+	if ds.messagesDedupe.Load() != 1 {
+		t.Errorf("expected messagesDedupe=1, got %d", ds.messagesDedupe.Load())
+	}
+}
+
+func TestHandleMessage_DedupFailedDeliveryDoesNotRecord(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	cfg.Callback.MaxRetries = 10
+	cfg.Callback.DedupTTLSec = 86400
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+	dedup := newMockDedupStore()
+	ds.dedupStore = dedup
+
+	stumpsMsg := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		TxID:        "tx-fail-dedup",
+		StatusType:  kafka.StatusMined,
+		RetryCount:  0,
+	}
+	data, _ := stumpsMsg.Encode()
+
+	err := ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 1})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify dedup was NOT recorded (delivery failed).
+	exists, _ := dedup.Exists("tx-fail-dedup", server.URL+"/callback", "MINED")
+	if exists {
+		t.Error("dedup should NOT be recorded after failed delivery")
+	}
+}
+
+func TestHandleMessage_DedupDifferentStatusTypesNotDeduplicated(t *testing.T) {
+	var httpCallCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCallCount++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	cfg.Callback.DedupTTLSec = 86400
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+	dedup := newMockDedupStore()
+	ds.dedupStore = dedup
+
+	// Deliver SEEN_ON_NETWORK.
+	msg1 := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		TxID:        "tx-multi",
+		StatusType:  kafka.StatusSeenOnNetwork,
+	}
+	data1, _ := msg1.Encode()
+	_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data1, Offset: 1})
+
+	// Deliver MINED for same txid — should NOT be deduplicated.
+	msg2 := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		TxID:        "tx-multi",
+		StatusType:  kafka.StatusMined,
+	}
+	data2, _ := msg2.Encode()
+	_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data2, Offset: 2})
+
+	if httpCallCount != 2 {
+		t.Errorf("expected 2 HTTP calls (different status types), got %d", httpCallCount)
+	}
+}
+
+// TestEndToEnd_ExactlyOneCallbackPerStatusType verifies the full dedup pipeline:
+// each txid/callbackURL receives exactly one SEEN_ON_NETWORK, one SEEN_MULTIPLE_NODES,
+// and one MINED callback. Duplicates of each are skipped.
+func TestEndToEnd_ExactlyOneCallbackPerStatusType(t *testing.T) {
+	var mu sync.Mutex
+	deliveredCallbacks := make(map[string]int) // "txid:statusType" -> delivery count
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload callbackPayload
+		body, _ := io.ReadAll(r.Body)
+		json.Unmarshal(body, &payload)
+
+		mu.Lock()
+		key := payload.TxID + ":" + payload.Status
+		deliveredCallbacks[key]++
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	cfg.Callback.DedupTTLSec = 86400
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+	dedup := newMockDedupStore()
+	ds.dedupStore = dedup
+
+	txid := "txid-e2e"
+	callbackURL := server.URL + "/callback"
+
+	statusTypes := []kafka.StatusType{
+		kafka.StatusSeenOnNetwork,
+		kafka.StatusSeenMultiNodes,
+		kafka.StatusMined,
+	}
+
+	// Deliver each status type twice — first should succeed, second should be deduped.
+	for _, st := range statusTypes {
+		msg := &kafka.StumpsMessage{
+			CallbackURL: callbackURL,
+			TxID:        txid,
+			StatusType:  st,
+		}
+		data, _ := msg.Encode()
+
+		// First delivery.
+		err := ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 1})
+		if err != nil {
+			t.Fatalf("first %s delivery error: %v", st, err)
+		}
+
+		// Duplicate delivery.
+		err = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 2})
+		if err != nil {
+			t.Fatalf("duplicate %s delivery error: %v", st, err)
+		}
+	}
+
+	// Verify: exactly 1 delivery per status type, 3 total.
+	mu.Lock()
+	defer mu.Unlock()
+
+	for _, st := range statusTypes {
+		key := txid + ":" + string(st)
+		count := deliveredCallbacks[key]
+		if count != 1 {
+			t.Errorf("expected exactly 1 %s callback, got %d", st, count)
+		}
+	}
+
+	totalDeliveries := 0
+	for _, count := range deliveredCallbacks {
+		totalDeliveries += count
+	}
+	if totalDeliveries != 3 {
+		t.Errorf("expected 3 total deliveries (one per status type), got %d", totalDeliveries)
+	}
+
+	if ds.messagesDedupe.Load() != 3 {
+		t.Errorf("expected 3 deduplicated messages, got %d", ds.messagesDedupe.Load())
 	}
 }
 

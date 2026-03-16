@@ -8,7 +8,8 @@ import (
 )
 
 const (
-	seenCountBin = "count"
+	seenSubtreesBin    = "subtrees"
+	seenThresholdFired = "tfired"
 )
 
 // SeenCounterStore manages atomic seen-count tracking per txid in Aerospike.
@@ -38,8 +39,10 @@ type IncrementResult struct {
 	ThresholdReached bool // true only when count equals threshold (not above)
 }
 
-// Increment atomically increments the seen counter for a txid and returns the new count.
-func (s *SeenCounterStore) Increment(txid string) (*IncrementResult, error) {
+// Increment idempotently records that a txid was seen in a specific subtree.
+// Uses Aerospike CDT list with AddUnique to ensure each subtreeID is counted only once.
+// ThresholdReached is true only once: when the unique count first reaches the threshold.
+func (s *SeenCounterStore) Increment(txid string, subtreeID string) (*IncrementResult, error) {
 	key, err := as.NewKey(s.client.Namespace(), s.setName, txid)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create key: %w", err)
@@ -48,9 +51,12 @@ func (s *SeenCounterStore) Increment(txid string) (*IncrementResult, error) {
 	wp := s.client.WritePolicy(s.maxRetries, s.retryBaseMs)
 	wp.RecordExistsAction = as.UPDATE
 
+	// AddUnique + NoFail: appends subtreeID only if not already present, no error on duplicate.
+	listPolicy := as.NewListPolicy(as.ListOrderUnordered, as.ListWriteFlagsAddUnique|as.ListWriteFlagsNoFail)
 	ops := []*as.Operation{
-		as.AddOp(as.NewBin(seenCountBin, 1)),
-		as.GetOp(),
+		as.ListAppendWithPolicyOp(listPolicy, seenSubtreesBin, subtreeID),
+		as.ListSizeOp(seenSubtreesBin),
+		as.GetBinOp(seenThresholdFired),
 	}
 
 	record, err := s.client.Client().Operate(wp, key, ops...)
@@ -58,15 +64,32 @@ func (s *SeenCounterStore) Increment(txid string) (*IncrementResult, error) {
 		return nil, fmt.Errorf("failed to increment seen counter: %w", err)
 	}
 
-	countVal := record.Bins[seenCountBin]
-	count, ok := countVal.(int)
+	sizeVal := record.Bins[seenSubtreesBin]
+	newSize, ok := sizeVal.(int)
 	if !ok {
-		return nil, fmt.Errorf("unexpected type for seen counter")
+		return nil, fmt.Errorf("unexpected type for seen counter list size: %T", sizeVal)
+	}
+
+	// Check if threshold was already fired previously.
+	alreadyFired := false
+	if firedVal := record.Bins[seenThresholdFired]; firedVal != nil {
+		if v, ok := firedVal.(int); ok && v == 1 {
+			alreadyFired = true
+		}
+	}
+
+	thresholdReached := false
+	if newSize >= s.threshold && !alreadyFired {
+		// Mark threshold as fired so it won't fire again.
+		thresholdReached = true
+		markWP := s.client.WritePolicy(s.maxRetries, s.retryBaseMs)
+		markWP.RecordExistsAction = as.UPDATE
+		_ = s.client.Client().Put(markWP, key, as.BinMap{seenThresholdFired: 1})
 	}
 
 	return &IncrementResult{
-		NewCount:         count,
-		ThresholdReached: count == s.threshold,
+		NewCount:         newSize,
+		ThresholdReached: thresholdReached,
 	}, nil
 }
 

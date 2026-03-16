@@ -49,6 +49,10 @@ aerospike:
   # Env: AEROSPIKE_SEEN_SET
   seenSet: seen_counters
 
+  # Aerospike set used for callback delivery deduplication records.
+  # Env: AEROSPIKE_CALLBACK_DEDUP_SET
+  callbackDedupSet: callback_dedup
+
   # Maximum number of retries for transient Aerospike errors.
   # Env: AEROSPIKE_MAX_RETRIES
   maxRetries: 3
@@ -121,6 +125,11 @@ subtree:
   # Env: SUBTREE_CACHE_MAX_MB
   cacheMaxMB: 64
 
+  # Maximum number of processed subtree hashes to track for message deduplication.
+  # Prevents reprocessing of subtrees already successfully handled.
+  # Env: SUBTREE_DEDUP_CACHE_SIZE
+  dedupCacheSize: 100000
+
 # ---------------------------------------------------------------------------
 # Block Processor
 # ---------------------------------------------------------------------------
@@ -135,6 +144,11 @@ block:
   # Default: 1800 (30 minutes).
   # Env: BLOCK_POST_MINE_TTL_SEC
   postMineTTLSec: 1800
+
+  # Maximum number of processed block hashes to track for message deduplication.
+  # Prevents reprocessing of blocks already successfully handled.
+  # Env: BLOCK_DEDUP_CACHE_SIZE
+  dedupCacheSize: 10000
 
 # ---------------------------------------------------------------------------
 # Callback Delivery
@@ -157,6 +171,11 @@ callback:
   # a SEEN_MULTIPLE_NODES callback. Tracks network propagation confidence.
   # Env: CALLBACK_SEEN_THRESHOLD
   seenThreshold: 3
+
+  # TTL in seconds for callback delivery deduplication records in Aerospike.
+  # After expiry, a very late duplicate could be redelivered. Default: 86400 (24 hours).
+  # Env: CALLBACK_DEDUP_TTL_SEC
+  dedupTTLSec: 86400
 
 # ---------------------------------------------------------------------------
 # Blob Store — subtree data storage

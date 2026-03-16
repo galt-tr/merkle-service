@@ -28,13 +28,14 @@ type APIConfig struct {
 
 // AerospikeConfig holds Aerospike connection configuration.
 type AerospikeConfig struct {
-	Host        string `yaml:"host"        mapstructure:"host"`
-	Port        int    `yaml:"port"        mapstructure:"port"`
-	Namespace   string `yaml:"namespace"   mapstructure:"namespace"`
-	SetName     string `yaml:"setName"     mapstructure:"setname"`
-	SeenSet     string `yaml:"seenSet"     mapstructure:"seenset"`
-	MaxRetries  int    `yaml:"maxRetries"  mapstructure:"maxretries"`
-	RetryBaseMs int    `yaml:"retryBaseMs" mapstructure:"retrybasems"`
+	Host             string `yaml:"host"             mapstructure:"host"`
+	Port             int    `yaml:"port"             mapstructure:"port"`
+	Namespace        string `yaml:"namespace"        mapstructure:"namespace"`
+	SetName          string `yaml:"setName"          mapstructure:"setname"`
+	SeenSet          string `yaml:"seenSet"          mapstructure:"seenset"`
+	CallbackDedupSet string `yaml:"callbackDedupSet" mapstructure:"callbackdedupset"`
+	MaxRetries       int    `yaml:"maxRetries"       mapstructure:"maxretries"`
+	RetryBaseMs      int    `yaml:"retryBaseMs"      mapstructure:"retrybasems"`
 }
 
 // KafkaConfig holds Kafka connection configuration.
@@ -55,15 +56,17 @@ type P2PConfig struct {
 
 // SubtreeConfig holds subtree processing configuration.
 type SubtreeConfig struct {
-	StorageMode string `yaml:"storageMode" mapstructure:"storagemode"`
-	DAHOffset   int    `yaml:"dahOffset"   mapstructure:"dahoffset"`
-	CacheMaxMB  int    `yaml:"cacheMaxMB"  mapstructure:"cachemaxmb"`
+	StorageMode    string `yaml:"storageMode"    mapstructure:"storagemode"`
+	DAHOffset      int    `yaml:"dahOffset"      mapstructure:"dahoffset"`
+	CacheMaxMB     int    `yaml:"cacheMaxMB"     mapstructure:"cachemaxmb"`
+	DedupCacheSize int    `yaml:"dedupCacheSize" mapstructure:"dedupcachesize"`
 }
 
 // BlockConfig holds block processing configuration.
 type BlockConfig struct {
 	WorkerPoolSize int `yaml:"workerPoolSize" mapstructure:"workerpoolsize"`
 	PostMineTTLSec int `yaml:"postMineTTLSec" mapstructure:"postminettlsec"`
+	DedupCacheSize int `yaml:"dedupCacheSize" mapstructure:"dedupcachesize"`
 }
 
 // CallbackConfig holds callback delivery configuration.
@@ -72,6 +75,7 @@ type CallbackConfig struct {
 	BackoffBaseSec int `yaml:"backoffBaseSec" mapstructure:"backoffbasesec"`
 	TimeoutSec     int `yaml:"timeoutSec"     mapstructure:"timeoutsec"`
 	SeenThreshold  int `yaml:"seenThreshold"  mapstructure:"seenthreshold"`
+	DedupTTLSec    int `yaml:"dedupTTLSec"    mapstructure:"dedupttlsec"`
 }
 
 // BlobStoreConfig holds blob store configuration.
@@ -99,6 +103,7 @@ func registerDefaults(v *viper.Viper) {
 	v.SetDefault("aerospike.namespace", "merkle")
 	v.SetDefault("aerospike.setname", "registrations")
 	v.SetDefault("aerospike.seenset", "seen_counters")
+	v.SetDefault("aerospike.callbackdedupset", "callback_dedup")
 	v.SetDefault("aerospike.maxretries", 3)
 	v.SetDefault("aerospike.retrybasems", 100)
 
@@ -118,16 +123,19 @@ func registerDefaults(v *viper.Viper) {
 	v.SetDefault("subtree.storagemode", "realtime")
 	v.SetDefault("subtree.dahoffset", 1)
 	v.SetDefault("subtree.cachemaxmb", 64)
+	v.SetDefault("subtree.dedupcachesize", 100000)
 
 	// Block
 	v.SetDefault("block.workerpoolsize", 16)
 	v.SetDefault("block.postminettlsec", 1800)
+	v.SetDefault("block.dedupcachesize", 10000)
 
 	// Callback
 	v.SetDefault("callback.maxretries", 5)
 	v.SetDefault("callback.backoffbasesec", 30)
 	v.SetDefault("callback.timeoutsec", 10)
 	v.SetDefault("callback.seenthreshold", 3)
+	v.SetDefault("callback.dedupttlsec", 86400)
 
 	// BlobStore
 	v.SetDefault("blobstore.url", "file:///tmp/merkle-subtrees")
@@ -157,7 +165,8 @@ func bindEnvVars(v *viper.Viper) {
 		"aerospike.port":        "AEROSPIKE_PORT",
 		"aerospike.namespace":   "AEROSPIKE_NAMESPACE",
 		"aerospike.setname":     "AEROSPIKE_SET",
-		"aerospike.seenset":     "AEROSPIKE_SEEN_SET",
+		"aerospike.seenset":          "AEROSPIKE_SEEN_SET",
+		"aerospike.callbackdedupset": "AEROSPIKE_CALLBACK_DEDUP_SET",
 		"aerospike.maxretries":  "AEROSPIKE_MAX_RETRIES",
 		"aerospike.retrybasems": "AEROSPIKE_RETRY_BASE_MS",
 
@@ -176,17 +185,20 @@ func bindEnvVars(v *viper.Viper) {
 		// Subtree
 		"subtree.storagemode": "SUBTREE_STORAGE_MODE",
 		"subtree.dahoffset":   "SUBTREE_DAH_OFFSET",
-		"subtree.cachemaxmb":  "SUBTREE_CACHE_MAX_MB",
+		"subtree.cachemaxmb":      "SUBTREE_CACHE_MAX_MB",
+		"subtree.dedupcachesize":  "SUBTREE_DEDUP_CACHE_SIZE",
 
 		// Block
 		"block.workerpoolsize": "BLOCK_WORKER_POOL_SIZE",
-		"block.postminettlsec": "BLOCK_POST_MINE_TTL_SEC",
+		"block.postminettlsec":  "BLOCK_POST_MINE_TTL_SEC",
+		"block.dedupcachesize":  "BLOCK_DEDUP_CACHE_SIZE",
 
 		// Callback
 		"callback.maxretries":     "CALLBACK_MAX_RETRIES",
 		"callback.backoffbasesec": "CALLBACK_BACKOFF_BASE_SEC",
 		"callback.timeoutsec":     "CALLBACK_TIMEOUT_SEC",
 		"callback.seenthreshold":  "CALLBACK_SEEN_THRESHOLD",
+		"callback.dedupttlsec":    "CALLBACK_DEDUP_TTL_SEC",
 
 		// BlobStore
 		"blobstore.url": "BLOB_STORE_URL",

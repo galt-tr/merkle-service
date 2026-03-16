@@ -91,7 +91,14 @@ func main() {
 	p2pClient := p2p.NewClient(cfg.P2P, subtreeProducer, blockProducer, logger)
 	subtreeProcessor := subtree.NewProcessor(cfg, regStore, seenStore, subtreeStore)
 	blockProcessor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, stumpsProducer, regStore, subtreeStore, logger)
-	callbackDelivery := callback.NewDeliveryService(cfg)
+	callbackDedupStore := store.NewCallbackDedupStore(
+		asClient,
+		cfg.Aerospike.CallbackDedupSet,
+		cfg.Aerospike.MaxRetries,
+		cfg.Aerospike.RetryBaseMs,
+		logger,
+	)
+	callbackDelivery := callback.NewDeliveryService(cfg, callbackDedupStore)
 
 	// Initialize all services.
 	services := []service.Service{apiServer, p2pClient, subtreeProcessor, blockProcessor, callbackDelivery}

@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/merkle-service/internal/callback"
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/service"
+	"github.com/bsv-blockchain/merkle-service/internal/store"
 )
 
 func main() {
@@ -19,8 +20,30 @@ func main() {
 		log.Fatal("failed to load config: ", err)
 	}
 
+	// Create Aerospike client for callback dedup.
+	asClient, err := store.NewAerospikeClient(
+		cfg.Aerospike.Host,
+		cfg.Aerospike.Port,
+		cfg.Aerospike.Namespace,
+		cfg.Aerospike.MaxRetries,
+		cfg.Aerospike.RetryBaseMs,
+		logger,
+	)
+	if err != nil {
+		log.Fatal("failed to create aerospike client: ", err)
+	}
+	defer asClient.Close()
+
+	callbackDedupStore := store.NewCallbackDedupStore(
+		asClient,
+		cfg.Aerospike.CallbackDedupSet,
+		cfg.Aerospike.MaxRetries,
+		cfg.Aerospike.RetryBaseMs,
+		logger,
+	)
+
 	// Create, init, and start the callback delivery service.
-	deliverySvc := callback.NewDeliveryService(cfg)
+	deliverySvc := callback.NewDeliveryService(cfg, callbackDedupStore)
 
 	if err := deliverySvc.Init(nil); err != nil {
 		log.Fatal("failed to init callback delivery service: ", err)

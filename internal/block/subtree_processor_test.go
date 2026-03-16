@@ -12,6 +12,7 @@ import (
 
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 
+	"github.com/bsv-blockchain/merkle-service/internal/cache"
 	"github.com/bsv-blockchain/merkle-service/internal/datahub"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
 	"github.com/bsv-blockchain/merkle-service/internal/store"
@@ -301,6 +302,70 @@ func TestMinedStumpsMessageEncoding(t *testing.T) {
 	}
 	if decoded.BlockHash != "blockhash123" {
 		t.Errorf("unexpected block hash: %s", decoded.BlockHash)
+	}
+}
+
+// --- Block Dedup Cache Tests ---
+
+// TestBlockDedupCache_SkipsDuplicateBlock verifies that the dedup cache
+// prevents reprocessing of already-seen block hashes.
+func TestBlockDedupCache_SkipsDuplicateBlock(t *testing.T) {
+	dc := cache.NewDedupCache(100)
+
+	// First time: not in cache.
+	if dc.Contains("block-hash-abc") {
+		t.Error("expected block hash not in cache initially")
+	}
+
+	// Simulate successful processing.
+	dc.Add("block-hash-abc")
+
+	// Second time: in cache, should be skipped.
+	if !dc.Contains("block-hash-abc") {
+		t.Error("expected block hash in cache after processing")
+	}
+}
+
+// TestBlockDedupCache_AllowsRetryOnFailure verifies that if block processing
+// fails (Add is never called), the same block hash can be retried.
+func TestBlockDedupCache_AllowsRetryOnFailure(t *testing.T) {
+	dc := cache.NewDedupCache(100)
+
+	// Simulate: block message received, processing fails (no Add called).
+	if dc.Contains("block-hash-fail") {
+		t.Error("should not be in cache")
+	}
+
+	// Don't call Add (simulating failure — e.g., DataHub unreachable).
+
+	// Retry: should still not be in cache, allowing retry.
+	if dc.Contains("block-hash-fail") {
+		t.Error("failed block processing should not add to cache")
+	}
+
+	// Now simulate successful retry.
+	dc.Add("block-hash-fail")
+	if !dc.Contains("block-hash-fail") {
+		t.Error("expected block hash in cache after successful retry")
+	}
+}
+
+// TestBlockDedupCache_MultipleBlocksIndependent verifies that different block
+// hashes are tracked independently.
+func TestBlockDedupCache_MultipleBlocksIndependent(t *testing.T) {
+	dc := cache.NewDedupCache(100)
+
+	dc.Add("block-1")
+	dc.Add("block-2")
+
+	if !dc.Contains("block-1") {
+		t.Error("block-1 should be in cache")
+	}
+	if !dc.Contains("block-2") {
+		t.Error("block-2 should be in cache")
+	}
+	if dc.Contains("block-3") {
+		t.Error("block-3 should NOT be in cache")
 	}
 }
 
