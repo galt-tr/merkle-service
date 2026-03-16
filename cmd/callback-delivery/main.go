@@ -42,8 +42,23 @@ func main() {
 		logger,
 	)
 
+	// Create STUMP cache for StumpRef resolution.
+	stumpCache, err := store.NewStumpCacheFromConfig(
+		cfg.Callback.StumpCacheMode,
+		asClient,
+		cfg.Aerospike.StumpCacheSet,
+		cfg.Callback.StumpCacheTTLSec,
+		cfg.Callback.StumpCacheLRUSize,
+		cfg.Aerospike.MaxRetries,
+		cfg.Aerospike.RetryBaseMs,
+	)
+	if err != nil {
+		log.Fatal("failed to create stump cache: ", err)
+	}
+	defer stumpCache.Close()
+
 	// Create, init, and start the callback delivery service.
-	deliverySvc := callback.NewDeliveryService(cfg, callbackDedupStore)
+	deliverySvc := callback.NewDeliveryService(cfg, callbackDedupStore, stumpCache)
 
 	if err := deliverySvc.Init(nil); err != nil {
 		log.Fatal("failed to init callback delivery service: ", err)

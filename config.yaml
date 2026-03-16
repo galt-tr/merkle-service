@@ -53,6 +53,18 @@ aerospike:
   # Env: AEROSPIKE_CALLBACK_DEDUP_SET
   callbackDedupSet: callback_dedup
 
+  # Aerospike set used for subtree completion counters (BLOCK_PROCESSED coordination).
+  # Env: AEROSPIKE_SUBTREE_COUNTER_SET
+  subtreeCounterSet: subtree_counters
+
+  # Aerospike set used for distributed STUMP cache (when stumpCacheMode is "aerospike").
+  # Env: AEROSPIKE_STUMP_CACHE_SET
+  stumpCacheSet: stump_cache
+
+  # TTL in seconds for subtree counter records. Should exceed maximum block processing time.
+  # Env: AEROSPIKE_SUBTREE_COUNTER_TTL_SEC
+  subtreeCounterTTLSec: 600
+
   # Maximum number of retries for transient Aerospike errors.
   # Env: AEROSPIKE_MAX_RETRIES
   maxRetries: 3
@@ -85,6 +97,10 @@ kafka:
   # Dead-letter queue topic for permanently failed callback deliveries.
   # Env: KAFKA_STUMPS_DLQ_TOPIC
   stumpsDlqTopic: stumps-dlq
+
+  # Topic for subtree work items dispatched by the block processor for parallel processing.
+  # Env: KAFKA_SUBTREE_WORK_TOPIC
+  subtreeWorkTopic: subtree-work
 
   # Kafka consumer group ID shared across service instances.
   # Env: KAFKA_CONSUMER_GROUP
@@ -176,6 +192,34 @@ callback:
   # After expiry, a very late duplicate could be redelivered. Default: 86400 (24 hours).
   # Env: CALLBACK_DEDUP_TTL_SEC
   dedupTTLSec: 86400
+
+  # Number of concurrent worker goroutines for HTTP callback delivery.
+  # Higher values improve throughput for I/O-bound delivery to many endpoints.
+  # Env: CALLBACK_DELIVERY_WORKERS
+  deliveryWorkers: 64
+
+  # Maximum concurrent HTTP connections per callback endpoint.
+  # Env: CALLBACK_MAX_CONNS_PER_HOST
+  maxConnsPerHost: 32
+
+  # Maximum idle HTTP connections kept alive per callback endpoint.
+  # Env: CALLBACK_MAX_IDLE_CONNS_PER_HOST
+  maxIdleConnsPerHost: 16
+
+  # TTL in seconds for the STUMP cache used by delivery workers.
+  # STUMPs are resolved from cache via StumpRef instead of inline Kafka data.
+  # Env: CALLBACK_STUMP_CACHE_TTL_SEC
+  stumpCacheTTLSec: 300
+
+  # STUMP cache backend: "memory" (in-process sync.Map) or "aerospike" (distributed).
+  # Use "memory" for all-in-one/dev mode, "aerospike" for Kubernetes/production.
+  # Env: CALLBACK_STUMP_CACHE_MODE
+  stumpCacheMode: memory
+
+  # Maximum entries in the local LRU read-through cache (aerospike mode only).
+  # Reduces Aerospike reads when multiple delivery workers resolve the same StumpRef.
+  # Env: CALLBACK_STUMP_CACHE_LRU_SIZE
+  stumpCacheLRUSize: 1024
 
 # ---------------------------------------------------------------------------
 # Blob Store — subtree data storage

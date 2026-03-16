@@ -6,7 +6,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
 	"github.com/bsv-blockchain/merkle-service/internal/service"
+	"github.com/bsv-blockchain/merkle-service/internal/store"
 )
 
 // CallbackDeduper abstracts callback deduplication for testability.
@@ -43,6 +46,11 @@ type DeliveryService struct {
 	dlqProducer *kafka.Producer
 	httpClient  *http.Client
 	dedupStore  CallbackDeduper
+	stumpCache  store.StumpCache
+
+	// Worker pool for concurrent delivery.
+	workCh   chan *kafka.StumpsMessage
+	workerWg sync.WaitGroup
 
 	messagesProcessed atomic.Int64
 	messagesRetried   atomic.Int64
@@ -51,10 +59,11 @@ type DeliveryService struct {
 }
 
 // NewDeliveryService creates a new callback DeliveryService.
-func NewDeliveryService(cfg *config.Config, dedupStore CallbackDeduper) *DeliveryService {
+func NewDeliveryService(cfg *config.Config, dedupStore CallbackDeduper, stumpCache store.StumpCache) *DeliveryService {
 	return &DeliveryService{
 		cfg:        cfg,
 		dedupStore: dedupStore,
+		stumpCache: stumpCache,
 	}
 }
 
@@ -62,9 +71,31 @@ func NewDeliveryService(cfg *config.Config, dedupStore CallbackDeduper) *Deliver
 func (d *DeliveryService) Init(_ interface{}) error {
 	d.InitBase("callback-delivery")
 
-	// Set up the HTTP client with configurable timeout.
+	// Set up the HTTP client with tuned transport for high-throughput delivery.
+	maxConnsPerHost := d.cfg.Callback.MaxConnsPerHost
+	if maxConnsPerHost <= 0 {
+		maxConnsPerHost = 32
+	}
+	maxIdleConnsPerHost := d.cfg.Callback.MaxIdleConnsPerHost
+	if maxIdleConnsPerHost <= 0 {
+		maxIdleConnsPerHost = 16
+	}
+
+	transport := &http.Transport{
+		MaxIdleConns:        maxConnsPerHost * 10, // global pool
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+		MaxConnsPerHost:     maxConnsPerHost,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true, // small JSON payloads — compression adds latency
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+
 	d.httpClient = &http.Client{
-		Timeout: time.Duration(d.cfg.Callback.TimeoutSec) * time.Second,
+		Timeout:   time.Duration(d.cfg.Callback.TimeoutSec) * time.Second,
+		Transport: transport,
 	}
 
 	// Create producer for re-enqueuing retries to the stumps topic.
@@ -102,20 +133,40 @@ func (d *DeliveryService) Init(_ interface{}) error {
 	}
 	d.consumer = consumer
 
+	// Initialize the work channel for the worker pool.
+	workers := d.cfg.Callback.DeliveryWorkers
+	if workers <= 0 {
+		workers = 64
+	}
+	d.workCh = make(chan *kafka.StumpsMessage, workers*2)
+
 	d.Logger.Info("callback delivery service initialized",
 		"stumpsTopic", d.cfg.Kafka.StumpsTopic,
 		"stumpsDlqTopic", d.cfg.Kafka.StumpsDLQTopic,
 		"maxRetries", d.cfg.Callback.MaxRetries,
 		"backoffBaseSec", d.cfg.Callback.BackoffBaseSec,
 		"timeoutSec", d.cfg.Callback.TimeoutSec,
+		"deliveryWorkers", workers,
+		"maxConnsPerHost", maxConnsPerHost,
+		"maxIdleConnsPerHost", maxIdleConnsPerHost,
 	)
 
 	return nil
 }
 
-// Start begins consuming callback messages from Kafka.
+// Start begins consuming callback messages from Kafka and launches delivery workers.
 func (d *DeliveryService) Start(ctx context.Context) error {
 	d.Logger.Info("starting callback delivery service")
+
+	// Launch delivery workers.
+	workers := d.cfg.Callback.DeliveryWorkers
+	if workers <= 0 {
+		workers = 64
+	}
+	d.workerWg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go d.deliveryWorker()
+	}
 
 	if err := d.consumer.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start stumps consumer: %w", err)
@@ -127,10 +178,17 @@ func (d *DeliveryService) Start(ctx context.Context) error {
 }
 
 // Stop gracefully shuts down the delivery service.
+// Closes the work channel first to drain in-flight deliveries, then stops consumer and producers.
 func (d *DeliveryService) Stop() error {
 	d.Logger.Info("stopping callback delivery service")
 
 	var firstErr error
+
+	// Close work channel to signal workers to drain and exit.
+	if d.workCh != nil {
+		close(d.workCh)
+		d.workerWg.Wait()
+	}
 
 	if d.consumer != nil {
 		if err := d.consumer.Stop(); err != nil {
@@ -185,8 +243,9 @@ func (d *DeliveryService) Health() service.HealthStatus {
 	}
 }
 
-// handleMessage processes a single stumps message from Kafka.
-func (d *DeliveryService) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage) error {
+// handleMessage decodes a Kafka message and dispatches it to the worker pool.
+// The Kafka offset is marked immediately after dispatch (at-least-once with dedup).
+func (d *DeliveryService) handleMessage(_ context.Context, msg *sarama.ConsumerMessage) error {
 	stumpsMsg, err := kafka.DecodeStumpsMessage(msg.Value)
 	if err != nil {
 		d.Logger.Error("failed to decode stumps message",
@@ -197,12 +256,63 @@ func (d *DeliveryService) handleMessage(ctx context.Context, msg *sarama.Consume
 		return fmt.Errorf("failed to decode stumps message: %w", err)
 	}
 
+	// Check delay for retry messages before dispatching.
+	if !stumpsMsg.NextRetryAt.IsZero() && time.Now().Before(stumpsMsg.NextRetryAt) {
+		d.Logger.Debug("message not yet due for retry, re-enqueuing",
+			"callbackUrl", stumpsMsg.CallbackURL,
+			"txid", stumpsMsg.TxID,
+			"nextRetryAt", stumpsMsg.NextRetryAt,
+		)
+		return d.reenqueue(stumpsMsg)
+	}
+
+	// Dispatch to worker pool (blocking send provides backpressure).
+	d.workCh <- stumpsMsg
+	return nil
+}
+
+// deliveryWorker is a goroutine that processes delivery jobs from the work channel.
+func (d *DeliveryService) deliveryWorker() {
+	defer d.workerWg.Done()
+	for msg := range d.workCh {
+		d.processDelivery(msg)
+	}
+}
+
+// processDelivery handles dedup check, HTTP delivery, dedup record, and retry/DLQ logic for a single message.
+func (d *DeliveryService) processDelivery(stumpsMsg *kafka.StumpsMessage) {
 	d.Logger.Debug("processing callback message",
 		"callbackUrl", stumpsMsg.CallbackURL,
 		"txid", stumpsMsg.TxID,
 		"statusType", stumpsMsg.StatusType,
 		"retryCount", stumpsMsg.RetryCount,
 	)
+
+	// Resolve STUMP data: inline StumpData takes priority, then StumpRef via cache.
+	var resolvedStumpData []byte
+	if len(stumpsMsg.StumpData) > 0 {
+		resolvedStumpData = stumpsMsg.StumpData
+	} else if stumpsMsg.StumpRef != "" {
+		if d.stumpCache != nil {
+			data, ok, _ := d.stumpCache.Get(stumpsMsg.StumpRef, stumpsMsg.BlockHash)
+			if !ok {
+				d.Logger.Warn("stump cache miss for StumpRef, re-enqueuing for retry",
+					"stumpRef", stumpsMsg.StumpRef,
+					"blockHash", stumpsMsg.BlockHash,
+					"callbackUrl", stumpsMsg.CallbackURL,
+				)
+				stumpsMsg.RetryCount++
+				backoffSec := d.cfg.Callback.BackoffBaseSec * stumpsMsg.RetryCount
+				stumpsMsg.NextRetryAt = time.Now().Add(time.Duration(backoffSec) * time.Second)
+				d.messagesRetried.Add(1)
+				if err := d.reenqueue(stumpsMsg); err != nil {
+					d.Logger.Error("failed to reenqueue after cache miss", "error", err)
+				}
+				return
+			}
+			resolvedStumpData = data
+		}
+	}
 
 	// Check callback dedup — skip if already delivered.
 	if d.dedupStore != nil {
@@ -218,23 +328,13 @@ func (d *DeliveryService) handleMessage(ctx context.Context, msg *sarama.Consume
 					"statusType", stumpsMsg.StatusType,
 				)
 				d.messagesDedupe.Add(1)
-				return nil
+				return
 			}
 		}
 	}
 
-	// Check if the message has a delay that hasn't elapsed yet.
-	if !stumpsMsg.NextRetryAt.IsZero() && time.Now().Before(stumpsMsg.NextRetryAt) {
-		d.Logger.Debug("message not yet due for retry, re-enqueuing",
-			"callbackUrl", stumpsMsg.CallbackURL,
-			"txid", stumpsMsg.TxID,
-			"nextRetryAt", stumpsMsg.NextRetryAt,
-		)
-		return d.reenqueue(stumpsMsg)
-	}
-
 	// Attempt HTTP POST delivery.
-	err = d.deliverCallback(ctx, stumpsMsg)
+	err := d.deliverCallback(context.Background(), stumpsMsg, resolvedStumpData)
 	if err == nil {
 		// Record successful delivery for dedup.
 		if d.dedupStore != nil {
@@ -246,14 +346,13 @@ func (d *DeliveryService) handleMessage(ctx context.Context, msg *sarama.Consume
 				}
 			}
 		}
-		// Success: offset will be committed by the consumer.
 		d.messagesProcessed.Add(1)
 		d.Logger.Debug("callback delivered successfully",
 			"callbackUrl", stumpsMsg.CallbackURL,
 			"txid", stumpsMsg.TxID,
 			"statusType", stumpsMsg.StatusType,
 		)
-		return nil
+		return
 	}
 
 	d.Logger.Warn("callback delivery failed",
@@ -273,7 +372,10 @@ func (d *DeliveryService) handleMessage(ctx context.Context, msg *sarama.Consume
 			"retryCount", stumpsMsg.RetryCount,
 		)
 		d.messagesFailed.Add(1)
-		return d.publishToDLQ(stumpsMsg)
+		if err := d.publishToDLQ(stumpsMsg); err != nil {
+			d.Logger.Error("failed to publish to DLQ", "error", err)
+		}
+		return
 	}
 
 	// Increment retry count and calculate next retry time with linear backoff.
@@ -290,11 +392,13 @@ func (d *DeliveryService) handleMessage(ctx context.Context, msg *sarama.Consume
 	)
 
 	d.messagesRetried.Add(1)
-	return d.reenqueue(stumpsMsg)
+	if err := d.reenqueue(stumpsMsg); err != nil {
+		d.Logger.Error("failed to reenqueue message", "error", err)
+	}
 }
 
 // deliverCallback makes an HTTP POST to the callback URL with the appropriate payload.
-func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.StumpsMessage) error {
+func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.StumpsMessage, stumpData []byte) error {
 	payload := callbackPayload{
 		TxID:      msg.TxID,
 		TxIDs:     msg.TxIDs,
@@ -303,8 +407,8 @@ func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.Stumps
 	}
 
 	// Encode stump data as base64 if present.
-	if len(msg.StumpData) > 0 {
-		payload.StumpData = base64.StdEncoding.EncodeToString(msg.StumpData)
+	if len(stumpData) > 0 {
+		payload.StumpData = base64.StdEncoding.EncodeToString(stumpData)
 	}
 
 	body, err := json.Marshal(payload)

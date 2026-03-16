@@ -183,7 +183,7 @@ func startDeliveryService(t *testing.T, stumpsTopic string) *callback.DeliverySe
 		},
 	}
 
-	ds := callback.NewDeliveryService(cfg)
+	ds := callback.NewDeliveryService(cfg, nil, nil)
 	if err := ds.Init(nil); err != nil {
 		t.Fatalf("failed to init delivery service: %v", err)
 	}

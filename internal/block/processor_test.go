@@ -1,6 +1,7 @@
 package block
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"testing"
@@ -51,105 +52,34 @@ func decodePublished(t *testing.T, pm *sarama.ProducerMessage) *kafka.StumpsMess
 	return msg
 }
 
-func newTestProcessor(t *testing.T) (*Processor, *mockSyncProducer) {
+func decodeSubtreeWork(t *testing.T, pm *sarama.ProducerMessage) *kafka.SubtreeWorkMessage {
+	t.Helper()
+	val, err := pm.Value.Encode()
+	if err != nil {
+		t.Fatalf("failed to encode producer message value: %v", err)
+	}
+	var msg kafka.SubtreeWorkMessage
+	if err := json.Unmarshal(val, &msg); err != nil {
+		t.Fatalf("failed to decode subtree work message: %v", err)
+	}
+	return &msg
+}
+
+func newTestProcessor(t *testing.T) (*Processor, *mockSyncProducer, *mockSyncProducer) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	mock := &mockSyncProducer{}
-	producer := kafka.NewTestProducer(mock, "stumps-test", logger)
+	stumpsMock := &mockSyncProducer{}
+	stumpsProducer := kafka.NewTestProducer(stumpsMock, "stumps-test", logger)
+	workMock := &mockSyncProducer{}
+	workProducer := kafka.NewTestProducer(workMock, "subtree-work-test", logger)
 
 	p := &Processor{
-		stumpsProducer: producer,
+		stumpsProducer:      stumpsProducer,
+		subtreeWorkProducer: workProducer,
 	}
 	p.InitBase("block-processor-test")
 	p.Logger = logger
-	return p, mock
-}
-
-// TestEmitBlockProcessed_NilRegistry verifies no panic or messages when registry is nil.
-func TestEmitBlockProcessed_NilRegistry(t *testing.T) {
-	p, mock := newTestProcessor(t)
-	p.urlRegistry = nil
-
-	p.emitBlockProcessed("blockhash-123")
-
-	if len(mock.messages) != 0 {
-		t.Errorf("expected no messages with nil registry, got %d", len(mock.messages))
-	}
-}
-
-// TestEmitBlockProcessed_ConditionalOnRegistrations verifies that emitBlockProcessed
-// is only called when at least one subtree had registered txids.
-func TestEmitBlockProcessed_ConditionalOnRegistrations(t *testing.T) {
-	p, mock := newTestProcessor(t)
-
-	// Simulate handleMessage logic: hadRegistrations tracks whether any subtree had regs.
-	tests := []struct {
-		name             string
-		hadRegistrations int64
-		expectEmit       bool
-	}{
-		{"no registrations", 0, false},
-		{"one subtree with registrations", 1, true},
-		{"multiple subtrees with registrations", 3, true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mock.messages = nil
-			if tt.hadRegistrations > 0 {
-				p.emitBlockProcessed("blockhash-" + tt.name)
-			}
-			// With nil urlRegistry, emitBlockProcessed returns early.
-			// This tests the conditional gate, not the registry call.
-			if tt.expectEmit && p.urlRegistry != nil {
-				if len(mock.messages) == 0 {
-					t.Error("expected BLOCK_PROCESSED messages to be published")
-				}
-			} else {
-				if len(mock.messages) != 0 {
-					t.Errorf("expected no messages, got %d", len(mock.messages))
-				}
-			}
-		})
-	}
-}
-
-// TestEmitBlockProcessed_PartialSubtreeFailures verifies that BLOCK_PROCESSED
-// is emitted when at least one subtree had registrations, even if other subtrees
-// failed. This tests the logic from handleMessage where errCount > 0 but
-// hadRegistrations > 0 still triggers emitBlockProcessed.
-func TestEmitBlockProcessed_PartialSubtreeFailures(t *testing.T) {
-	p, mock := newTestProcessor(t)
-
-	// Simulate: 3 subtrees, 1 failed, 2 succeeded, 1 of the successful ones had registrations.
-	var errCount int64 = 1
-	var hadRegistrations int64 = 1
-
-	// This mirrors the handleMessage logic after wg.Wait().
-	if errCount > 0 {
-		// errors were logged (we just note it here)
-	}
-	if hadRegistrations > 0 {
-		p.emitBlockProcessed("blockhash-partial")
-	}
-
-	// With nil urlRegistry, emitBlockProcessed returns early without publishing.
-	// The key assertion is that the conditional gate was entered (hadRegistrations > 0).
-	// In production with a real registry, messages would be published here.
-	if len(mock.messages) != 0 {
-		// Expected: nil registry means no actual messages, but the gate was entered.
-	}
-
-	// Now verify the inverse: hadRegistrations=0 means no emit even with errors.
-	hadRegistrations = 0
-	errCount = 3
-	mock.messages = nil
-	if hadRegistrations > 0 {
-		p.emitBlockProcessed("blockhash-all-failed")
-	}
-	if len(mock.messages) != 0 {
-		t.Error("expected no BLOCK_PROCESSED when all subtrees failed (no registrations)")
-	}
+	return p, stumpsMock, workMock
 }
 
 // TestBlockProcessedMessage_CorrectFields verifies BLOCK_PROCESSED StumpsMessage
@@ -194,5 +124,45 @@ func TestBlockProcessedMessage_CorrectFields(t *testing.T) {
 	}
 	if decoded.CallbackURL != "http://example.com/cb" {
 		t.Errorf("decoded callbackURL: expected http://example.com/cb, got %s", decoded.CallbackURL)
+	}
+}
+
+// TestSubtreeWorkMessage_Published verifies that SubtreeWorkMessages are published
+// to the subtree-work producer for each subtree hash.
+func TestSubtreeWorkMessage_Published(t *testing.T) {
+	_, _, workMock := newTestProcessor(t)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	workProducer := kafka.NewTestProducer(workMock, "subtree-work-test", logger)
+
+	subtreeHashes := []string{"subtree-a", "subtree-b", "subtree-c"}
+	for _, stHash := range subtreeHashes {
+		workMsg := &kafka.SubtreeWorkMessage{
+			BlockHash:   "block-123",
+			BlockHeight: 850000,
+			SubtreeHash: stHash,
+			DataHubURL:  "http://datahub/subtree",
+		}
+		data, err := workMsg.Encode()
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+		if err := workProducer.PublishWithHashKey(stHash, data); err != nil {
+			t.Fatalf("publish failed: %v", err)
+		}
+	}
+
+	if len(workMock.messages) != 3 {
+		t.Fatalf("expected 3 work messages, got %d", len(workMock.messages))
+	}
+
+	for i, pm := range workMock.messages {
+		msg := decodeSubtreeWork(t, pm)
+		if msg.BlockHash != "block-123" {
+			t.Errorf("message %d: expected blockHash 'block-123', got %s", i, msg.BlockHash)
+		}
+		if msg.SubtreeHash != subtreeHashes[i] {
+			t.Errorf("message %d: expected subtreeHash %s, got %s", i, subtreeHashes[i], msg.SubtreeHash)
+		}
 	}
 }

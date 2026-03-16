@@ -63,7 +63,7 @@ func TestCallbackDelivery_SuccessfulCallback(t *testing.T) {
 		},
 	}
 
-	svc := callback.NewDeliveryService(cfg)
+	svc := callback.NewDeliveryService(cfg, nil, nil)
 	if err := svc.Init(nil); err != nil {
 		t.Fatalf("DeliveryService.Init failed: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestCallbackDelivery_RetryOnFailure(t *testing.T) {
 		},
 	}
 
-	svc := callback.NewDeliveryService(cfg)
+	svc := callback.NewDeliveryService(cfg, nil, nil)
 	if err := svc.Init(nil); err != nil {
 		t.Fatalf("DeliveryService.Init failed: %v", err)
 	}

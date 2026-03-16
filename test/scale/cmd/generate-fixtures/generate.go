@@ -82,6 +82,12 @@ func writeSubtrees(outDir string, txids [][]byte, subtreeCount, txidsPerSubtree 
 		subtreeGroups[st] = append(subtreeGroups[st], j)
 	}
 
+	// Use 3-digit format for subtree filenames when there are more than 99 subtrees.
+	fmtStr := "%02d.bin"
+	if subtreeCount > 99 {
+		fmtStr = "%03d.bin"
+	}
+
 	hashes := make([]string, subtreeCount)
 	for i := 0; i < subtreeCount; i++ {
 		if len(subtreeGroups[i]) != txidsPerSubtree {
@@ -99,7 +105,7 @@ func writeSubtrees(outDir string, txids [][]byte, subtreeCount, txidsPerSubtree 
 		hashes[i] = fmt.Sprintf("%x", h)
 
 		// Write subtree file.
-		filename := filepath.Join(subtreeDir, fmt.Sprintf("%02d.bin", i))
+		filename := filepath.Join(subtreeDir, fmt.Sprintf(fmtStr, i))
 		if err := os.WriteFile(filename, rawData, 0644); err != nil {
 			return nil, fmt.Errorf("writing subtree %d: %w", i, err)
 		}

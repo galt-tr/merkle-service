@@ -40,6 +40,7 @@ type StumpsMessage struct {
 	TxID        string     `json:"txid,omitempty"`
 	TxIDs       []string   `json:"txids,omitempty"`
 	StumpData   []byte     `json:"stumpData,omitempty"`
+	StumpRef    string     `json:"stumpRef,omitempty"`
 	StatusType  StatusType `json:"statusType"`
 	BlockHash   string     `json:"blockHash,omitempty"`
 	SubtreeID   string     `json:"subtreeId,omitempty"`
@@ -63,6 +64,24 @@ func (m *BlockMessage) Encode() ([]byte, error) {
 
 func DecodeBlockMessage(data []byte) (*BlockMessage, error) {
 	var msg BlockMessage
+	err := json.Unmarshal(data, &msg)
+	return &msg, err
+}
+
+// SubtreeWorkMessage represents a subtree processing work item dispatched by the block processor.
+type SubtreeWorkMessage struct {
+	BlockHash   string `json:"blockHash"`
+	BlockHeight uint32 `json:"blockHeight"`
+	SubtreeHash string `json:"subtreeHash"`
+	DataHubURL  string `json:"dataHubUrl"`
+}
+
+func (m *SubtreeWorkMessage) Encode() ([]byte, error) {
+	return json.Marshal(m)
+}
+
+func DecodeSubtreeWorkMessage(data []byte) (*SubtreeWorkMessage, error) {
+	var msg SubtreeWorkMessage
 	err := json.Unmarshal(data, &msg)
 	return &msg, err
 }

@@ -75,6 +75,38 @@ func TestBlockMessage_EncodeDecode(t *testing.T) {
 	}
 }
 
+func TestSubtreeWorkMessage_EncodeDecode(t *testing.T) {
+	msg := &SubtreeWorkMessage{
+		BlockHash:   "blockhash789",
+		BlockHeight: 850000,
+		SubtreeHash: "subtree-hash-456",
+		DataHubURL:  "https://datahub.example.com/subtree/456",
+	}
+
+	data, err := msg.Encode()
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+
+	decoded, err := DecodeSubtreeWorkMessage(data)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+
+	if decoded.BlockHash != msg.BlockHash {
+		t.Errorf("blockHash mismatch: got %s", decoded.BlockHash)
+	}
+	if decoded.BlockHeight != msg.BlockHeight {
+		t.Errorf("blockHeight mismatch: got %d", decoded.BlockHeight)
+	}
+	if decoded.SubtreeHash != msg.SubtreeHash {
+		t.Errorf("subtreeHash mismatch: got %s", decoded.SubtreeHash)
+	}
+	if decoded.DataHubURL != msg.DataHubURL {
+		t.Errorf("dataHubUrl mismatch: got %s", decoded.DataHubURL)
+	}
+}
+
 func TestStumpsMessage_EncodeDecode(t *testing.T) {
 	msg := &StumpsMessage{
 		CallbackURL: "https://example.com/cb",

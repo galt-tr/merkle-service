@@ -70,7 +70,7 @@ func main() {
 	)
 
 	// Create, init, and start the block processor.
-	processor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, stumpsProducer, regStore, subtreeStore, urlRegistry, logger)
+	processor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, stumpsProducer, regStore, subtreeStore, urlRegistry, nil, logger)
 
 	if err := processor.Init(nil); err != nil {
 		log.Fatal("failed to init block processor: ", err)

@@ -82,21 +82,27 @@ func loadManifest(path string) (*Manifest, error) {
 	return &m, nil
 }
 
-// loadAllFixtures loads the manifest, txids, and all subtree files.
-func loadAllFixtures() (*Manifest, [][]byte, map[string][]byte, error) {
-	manifest, err := loadManifest(filepath.Join(testdataDir, "manifest.json"))
+// loadAllFixtures loads the manifest, txids, and all subtree files from the given directory.
+func loadAllFixtures(dir string) (*Manifest, [][]byte, map[string][]byte, error) {
+	manifest, err := loadManifest(filepath.Join(dir, "manifest.json"))
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	txids, err := loadTxids(filepath.Join(testdataDir, "txids.bin"))
+	txids, err := loadTxids(filepath.Join(dir, "txids.bin"))
 	if err != nil {
 		return nil, nil, nil, err
+	}
+
+	// Use 3-digit format for subtree filenames when there are more than 99 subtrees.
+	fmtStr := "%02d.bin"
+	if len(manifest.Subtrees) > 99 {
+		fmtStr = "%03d.bin"
 	}
 
 	subtreeData := make(map[string][]byte, len(manifest.Subtrees))
 	for _, st := range manifest.Subtrees {
-		path := filepath.Join(testdataDir, "subtrees", fmt.Sprintf("%02d.bin", st.Index))
+		path := filepath.Join(dir, "subtrees", fmt.Sprintf(fmtStr, st.Index))
 		data, err := loadSubtree(path)
 		if err != nil {
 			return nil, nil, nil, err

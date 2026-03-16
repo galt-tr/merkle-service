@@ -69,7 +69,7 @@ func findNamespace() string {
 
 // TestFixturesLoadable validates that all fixture files exist and have correct counts.
 func TestFixturesLoadable(t *testing.T) {
-	manifest, txids, subtreeData, err := loadAllFixtures()
+	manifest, txids, subtreeData, err := loadAllFixtures(testdataDir)
 	if err != nil {
 		t.Fatalf("failed to load fixtures: %v", err)
 	}
@@ -147,7 +147,7 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 	}
 
 	// Load fixtures.
-	manifest, txids, subtreeData, err := loadAllFixtures()
+	manifest, txids, subtreeData, err := loadAllFixtures(fixtureDir)
 	if err != nil {
 		t.Fatalf("failed to load fixtures: %v", err)
 	}
@@ -211,6 +211,7 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 	blockTopic := fmt.Sprintf("scale-block-%d", time.Now().UnixNano())
 	stumpsTopic := fmt.Sprintf("scale-stumps-%d", time.Now().UnixNano())
 	stumpsDLQTopic := stumpsTopic + "-dlq"
+	subtreeWorkTopic := fmt.Sprintf("scale-subtree-work-%d", time.Now().UnixNano())
 
 	blockProducer, err := kafka.NewProducer([]string{kafkaBroker}, blockTopic, logger)
 	if err != nil {
@@ -224,13 +225,22 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 	}
 	t.Cleanup(func() { stumpsProducer.Close() })
 
+	// Create shared STUMP cache and subtree counter.
+	stumpCache := store.NewMemoryStumpCache(300)
+	stumpCache.Start()
+	t.Cleanup(func() { stumpCache.Close() })
+
+	counterSetName := fmt.Sprintf("scale_counter_%d", time.Now().UnixNano())
+	subtreeCounter := store.NewSubtreeCounterStore(asClient, counterSetName, 600, 3, 100, logger)
+
 	// Start block processor.
 	kafkaCfg := config.KafkaConfig{
-		Brokers:        []string{kafkaBroker},
-		BlockTopic:     blockTopic,
-		StumpsTopic:    stumpsTopic,
-		StumpsDLQTopic: stumpsDLQTopic,
-		ConsumerGroup:  fmt.Sprintf("scale-test-%d", time.Now().UnixNano()),
+		Brokers:          []string{kafkaBroker},
+		BlockTopic:       blockTopic,
+		StumpsTopic:      stumpsTopic,
+		StumpsDLQTopic:   stumpsDLQTopic,
+		SubtreeWorkTopic: subtreeWorkTopic,
+		ConsumerGroup:    fmt.Sprintf("scale-test-%d", time.Now().UnixNano()),
 	}
 	blockCfg := config.BlockConfig{
 		WorkerPoolSize: 10,
@@ -242,7 +252,7 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 		MaxRetries: 2,
 	}
 
-	processor := block.NewProcessor(kafkaCfg, blockCfg, datahubCfg, stumpsProducer, regStore, subtreeStore, urlRegistry, logger)
+	processor := block.NewProcessor(kafkaCfg, blockCfg, datahubCfg, stumpsProducer, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
 	if err := processor.Init(nil); err != nil {
 		t.Fatalf("failed to init block processor: %v", err)
 	}
@@ -253,16 +263,30 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 	}
 	t.Cleanup(func() { processor.Stop() })
 
+	// Start subtree worker service.
+	subtreeWorker := block.NewSubtreeWorkerService(kafkaCfg, blockCfg, datahubCfg, regStore, subtreeStore, urlRegistry, subtreeCounter, stumpCache, logger)
+	if err := subtreeWorker.Init(nil); err != nil {
+		t.Fatalf("failed to init subtree worker: %v", err)
+	}
+	if err := subtreeWorker.Start(ctx); err != nil {
+		t.Fatalf("failed to start subtree worker: %v", err)
+	}
+	t.Cleanup(func() { subtreeWorker.Stop() })
+
 	// Start callback delivery service.
 	deliveryCfg := &config.Config{
 		Kafka: kafkaCfg,
 		Callback: config.CallbackConfig{
-			MaxRetries:     5,
-			BackoffBaseSec: 1,
-			TimeoutSec:     10,
+			MaxRetries:          5,
+			BackoffBaseSec:      1,
+			TimeoutSec:          10,
+			DeliveryWorkers:     256,
+			MaxConnsPerHost:     64,
+			MaxIdleConnsPerHost: 32,
+			StumpCacheTTLSec:    300,
 		},
 	}
-	deliveryService := callback.NewDeliveryService(deliveryCfg, nil)
+	deliveryService := callback.NewDeliveryService(deliveryCfg, nil, stumpCache)
 	if err := deliveryService.Init(nil); err != nil {
 		t.Fatalf("failed to init delivery service: %v", err)
 	}
@@ -322,4 +346,9 @@ func TestScaleSmoke(t *testing.T) {
 // TestScaleEndToEnd runs the full-scale test (50 instances, 50000 txids).
 func TestScaleEndToEnd(t *testing.T) {
 	runScaleTest(t, testdataDir, 50, 5*time.Minute)
+}
+
+// TestScaleMega runs the mega-scale test (100 instances, 1000000 block txids, 244 subtrees).
+func TestScaleMega(t *testing.T) {
+	runScaleTest(t, "testdata-mega", 100, 10*time.Minute)
 }

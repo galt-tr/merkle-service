@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: merkle-service-config
+  namespace: merkle-service
+  labels:
+    app.kubernetes.io/part-of: merkle-service
+data:
+  config.yaml: |
+    mode: microservice
+
+    api:
+      port: 8080
+
+    aerospike:
+      host: aerospike.merkle-service.svc.cluster.local
+      port: 3000
+      namespace: merkle
+      setName: registrations
+      seenSet: seen_counters
+      callbackDedupSet: callback_dedup
+      subtreeCounterSet: subtree_counters
+      stumpCacheSet: stump_cache
+      subtreeCounterTTLSec: 600
+      maxRetries: 3
+      retryBaseMs: 100
+
+    kafka:
+      brokers:
+        - kafka-0.kafka.merkle-service.svc.cluster.local:9092
+      subtreeTopic: subtree
+      blockTopic: block
+      stumpsTopic: stumps
+      stumpsDlqTopic: stumps-dlq
+      subtreeWorkTopic: subtree-work
+      consumerGroup: merkle-service
+
+    p2p:
+      network: main
+      storagePath: /data/p2p
+
+    subtree:
+      storageMode: realtime
+      dahOffset: 1
+      cacheMaxMB: 64
+      dedupCacheSize: 100000
+
+    block:
+      workerPoolSize: 16
+      postMineTTLSec: 1800
+      dedupCacheSize: 10000
+
+    callback:
+      maxRetries: 5
+      backoffBaseSec: 30
+      timeoutSec: 10
+      seenThreshold: 3
+      dedupTTLSec: 86400
+      deliveryWorkers: 64
+      maxConnsPerHost: 32
+      maxIdleConnsPerHost: 16
+      stumpCacheTTLSec: 300
+      stumpCacheMode: aerospike
+      stumpCacheLRUSize: 1024
+
+    blobStore:
+      url: file:///data/subtrees
+
+    datahub:
+      timeoutSec: 30
+      maxRetries: 3

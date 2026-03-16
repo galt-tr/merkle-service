@@ -31,6 +31,7 @@ func ProcessBlockSubtree(
 	stumpsProducer *kafka.Producer,
 	postMineTTLSec int,
 	logger *slog.Logger,
+	stumpCache ...store.StumpCache,
 ) (bool, error) {
 	// 6.2: Retrieve subtree data from blob store, falling back to DataHub.
 	rawData, err := subtreeStore.GetSubtree(subtreeHash)
@@ -117,6 +118,15 @@ func ProcessBlockSubtree(
 	// 6.8: Encode STUMP to BRC-0074 binary.
 	stumpData := s.Encode()
 
+	// If a stump cache is provided, store the STUMP and use StumpRef in messages.
+	var useStumpRef bool
+	if len(stumpCache) > 0 && stumpCache[0] != nil {
+		if err := stumpCache[0].Put(subtreeHash, blockHash, stumpData); err != nil {
+			logger.Warn("failed to write STUMP to cache", "subtreeHash", subtreeHash, "error", err)
+		}
+		useStumpRef = true
+	}
+
 	// 6.9: Group txids by callback URL.
 	callbackGroups := stump.GroupByCallback(registrations)
 
@@ -125,10 +135,14 @@ func ProcessBlockSubtree(
 		stumpsMsg := &kafka.StumpsMessage{
 			CallbackURL: callbackURL,
 			TxIDs:       groupTxids,
-			StumpData:   stumpData,
 			StatusType:  kafka.StatusMined,
 			BlockHash:   blockHash,
 			SubtreeID:   subtreeHash,
+		}
+		if useStumpRef {
+			stumpsMsg.StumpRef = subtreeHash
+		} else {
+			stumpsMsg.StumpData = stumpData
 		}
 		data, err := stumpsMsg.Encode()
 		if err != nil {

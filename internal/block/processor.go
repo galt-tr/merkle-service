@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sync"
 
 	"github.com/IBM/sarama"
 	"github.com/bsv-blockchain/merkle-service/internal/cache"
@@ -18,16 +17,18 @@ import (
 // Processor implements the block processor service.
 type Processor struct {
 	service.BaseService
-	kafkaCfg       config.KafkaConfig
-	blockCfg       config.BlockConfig
-	datahubCfg     config.DataHubConfig
-	consumer       *kafka.Consumer
-	stumpsProducer *kafka.Producer
-	regStore       *store.RegistrationStore
-	subtreeStore   *store.SubtreeStore
-	urlRegistry    *store.CallbackURLRegistry
-	dataHubClient  *datahub.Client
-	dedupCache     *cache.DedupCache
+	kafkaCfg             config.KafkaConfig
+	blockCfg             config.BlockConfig
+	datahubCfg           config.DataHubConfig
+	consumer             *kafka.Consumer
+	stumpsProducer       *kafka.Producer
+	subtreeWorkProducer  *kafka.Producer
+	regStore             *store.RegistrationStore
+	subtreeStore         *store.SubtreeStore
+	urlRegistry          *store.CallbackURLRegistry
+	subtreeCounter       *store.SubtreeCounterStore
+	dataHubClient        *datahub.Client
+	dedupCache           *cache.DedupCache
 }
 
 func NewProcessor(
@@ -38,6 +39,7 @@ func NewProcessor(
 	regStore *store.RegistrationStore,
 	subtreeStore *store.SubtreeStore,
 	urlRegistry *store.CallbackURLRegistry,
+	subtreeCounter *store.SubtreeCounterStore,
 	logger *slog.Logger,
 ) *Processor {
 	p := &Processor{
@@ -48,6 +50,7 @@ func NewProcessor(
 		regStore:       regStore,
 		subtreeStore:   subtreeStore,
 		urlRegistry:    urlRegistry,
+		subtreeCounter: subtreeCounter,
 	}
 	p.InitBase("block-processor")
 	if logger != nil {
@@ -63,6 +66,17 @@ func (p *Processor) Init(cfg interface{}) error {
 	if p.blockCfg.DedupCacheSize > 0 {
 		p.dedupCache = cache.NewDedupCache(p.blockCfg.DedupCacheSize)
 	}
+
+	// Create producer for dispatching subtree work items.
+	subtreeWorkProducer, err := kafka.NewProducer(
+		p.kafkaCfg.Brokers,
+		p.kafkaCfg.SubtreeWorkTopic,
+		p.Logger,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create subtree-work producer: %w", err)
+	}
+	p.subtreeWorkProducer = subtreeWorkProducer
 
 	consumer, err := kafka.NewConsumer(
 		p.kafkaCfg.Brokers,
@@ -87,7 +101,16 @@ func (p *Processor) Start(ctx context.Context) error {
 func (p *Processor) Stop() error {
 	p.Logger.Info("stopping block processor")
 	p.SetStarted(false)
-	return p.consumer.Stop()
+	var firstErr error
+	if err := p.consumer.Stop(); err != nil {
+		firstErr = err
+	}
+	if p.subtreeWorkProducer != nil {
+		if err := p.subtreeWorkProducer.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (p *Processor) Health() service.HealthStatus {
@@ -139,73 +162,51 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 		return nil
 	}
 
-	// 7.1-7.3: Dispatch subtree processing to a bounded worker pool.
-	poolSize := p.blockCfg.WorkerPoolSize
-	if poolSize > len(subtreeHashes) {
-		poolSize = len(subtreeHashes)
-	}
-
-	sem := make(chan struct{}, poolSize)
-	var wg sync.WaitGroup
-	var errCount int64
-	var hadRegistrations int64
-	var mu sync.Mutex
-
-	for _, stHash := range subtreeHashes {
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func(subtreeHash string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			hadRegs, err := ProcessBlockSubtree(
-				ctx,
-				subtreeHash,
-				uint64(meta.Height),
-				blockMsg.Hash,
-				blockMsg.DataHubURL,
-				p.dataHubClient,
-				p.subtreeStore,
-				p.regStore,
-				p.stumpsProducer,
-				p.blockCfg.PostMineTTLSec,
-				p.Logger,
+	// Initialize the subtree counter BEFORE publishing work messages to avoid
+	// a race where workers decrement a counter that doesn't exist yet.
+	if p.subtreeCounter != nil {
+		if err := p.subtreeCounter.Init(blockMsg.Hash, len(subtreeHashes)); err != nil {
+			p.Logger.Error("failed to init subtree counter",
+				"blockHash", blockMsg.Hash,
+				"count", len(subtreeHashes),
+				"error", err,
 			)
-			if err != nil {
-				p.Logger.Error("failed to process block subtree",
-					"subtreeHash", subtreeHash,
-					"blockHash", blockMsg.Hash,
-					"error", err,
-				)
-				mu.Lock()
-				errCount++
-				mu.Unlock()
-			}
-			if hadRegs {
-				mu.Lock()
-				hadRegistrations++
-				mu.Unlock()
-			}
-		}(stHash)
+			return fmt.Errorf("failed to init subtree counter for block %s: %w", blockMsg.Hash, err)
+		}
 	}
 
-	wg.Wait()
-
-	if errCount > 0 {
-		p.Logger.Warn("block processing completed with errors",
-			"blockHash", blockMsg.Hash,
-			"subtreeErrors", errCount,
-			"totalSubtrees", len(subtreeHashes),
-		)
+	// Publish one SubtreeWorkMessage per subtree to the subtree-work topic.
+	for _, stHash := range subtreeHashes {
+		workMsg := &kafka.SubtreeWorkMessage{
+			BlockHash:   blockMsg.Hash,
+			BlockHeight: meta.Height,
+			SubtreeHash: stHash,
+			DataHubURL:  blockMsg.DataHubURL,
+		}
+		data, err := workMsg.Encode()
+		if err != nil {
+			p.Logger.Error("failed to encode subtree work message",
+				"subtreeHash", stHash,
+				"blockHash", blockMsg.Hash,
+				"error", err,
+			)
+			continue
+		}
+		if err := p.subtreeWorkProducer.PublishWithHashKey(stHash, data); err != nil {
+			p.Logger.Error("failed to publish subtree work message",
+				"subtreeHash", stHash,
+				"blockHash", blockMsg.Hash,
+				"error", err,
+			)
+		}
 	}
 
-	// Emit BLOCK_PROCESSED if any subtree had registered txids.
-	if hadRegistrations > 0 {
-		p.emitBlockProcessed(blockMsg.Hash)
-	}
+	p.Logger.Info("dispatched subtree work items",
+		"blockHash", blockMsg.Hash,
+		"subtreeCount", len(subtreeHashes),
+	)
 
-	// 7.4: Update subtree store block height for DAH pruning.
+	// Update subtree store block height for DAH pruning.
 	p.subtreeStore.SetCurrentBlockHeight(uint64(meta.Height))
 
 	// Mark block as successfully processed for dedup.
@@ -214,47 +215,4 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 	}
 
 	return nil
-}
-
-// emitBlockProcessed publishes a BLOCK_PROCESSED message to every registered callback URL.
-func (p *Processor) emitBlockProcessed(blockHash string) {
-	if p.urlRegistry == nil {
-		return
-	}
-
-	urls, err := p.urlRegistry.GetAll()
-	if err != nil {
-		p.Logger.Error("failed to get callback URLs for BLOCK_PROCESSED", "error", err)
-		return
-	}
-	if len(urls) == 0 {
-		return
-	}
-
-	for _, callbackURL := range urls {
-		msg := &kafka.StumpsMessage{
-			CallbackURL: callbackURL,
-			StatusType:  kafka.StatusBlockProcessed,
-			BlockHash:   blockHash,
-		}
-		data, err := msg.Encode()
-		if err != nil {
-			p.Logger.Error("failed to encode BLOCK_PROCESSED message",
-				"callbackURL", callbackURL,
-				"error", err,
-			)
-			continue
-		}
-		if err := p.stumpsProducer.PublishWithHashKey(callbackURL, data); err != nil {
-			p.Logger.Error("failed to publish BLOCK_PROCESSED callback",
-				"callbackURL", callbackURL,
-				"error", err,
-			)
-		}
-	}
-
-	p.Logger.Info("emitted BLOCK_PROCESSED callbacks",
-		"blockHash", blockHash,
-		"callbackURLs", len(urls),
-	)
 }

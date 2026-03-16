@@ -5,6 +5,7 @@ package scale
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 
@@ -12,23 +13,57 @@ import (
 )
 
 // preloadRegistrations loads all txid→callbackURL registrations into Aerospike.
+// Uses parallel workers for large datasets.
 func preloadRegistrations(manifest *Manifest, txids [][]byte, regStore *store.RegistrationStore, logger *slog.Logger) error {
-	for _, arcade := range manifest.ArcadeInstances {
-		for j := arcade.TxidStart; j < arcade.TxidEnd; j++ {
-			// Convert raw hash to Bitcoin display order (reversed hex) matching chainhash.Hash.String().
-			var h chainhash.Hash
-			copy(h[:], txids[j])
-			txidStr := h.String()
-
-			if err := regStore.Add(txidStr, arcade.CallbackURL); err != nil {
-				return fmt.Errorf("adding registration for txid index %d: %w", j, err)
-			}
-		}
-		if (arcade.Index+1)%10 == 0 {
-			logger.Info("pre-loaded registrations", "arcadeInstances", arcade.Index+1, "txids", (arcade.Index+1)*(arcade.TxidEnd-arcade.TxidStart))
-		}
+	workers := 10
+	if len(manifest.ArcadeInstances) < workers {
+		workers = len(manifest.ArcadeInstances)
 	}
-	return nil
+
+	var mu sync.Mutex
+	var firstErr error
+	var wg sync.WaitGroup
+	var completed int
+
+	ch := make(chan ArcadeInstance, len(manifest.ArcadeInstances))
+	for _, arcade := range manifest.ArcadeInstances {
+		ch <- arcade
+	}
+	close(ch)
+
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for arcade := range ch {
+				for j := arcade.TxidStart; j < arcade.TxidEnd; j++ {
+					var h chainhash.Hash
+					copy(h[:], txids[j])
+					txidStr := h.String()
+
+					if err := regStore.Add(txidStr, arcade.CallbackURL); err != nil {
+						mu.Lock()
+						if firstErr == nil {
+							firstErr = fmt.Errorf("adding registration for txid index %d: %w", j, err)
+						}
+						mu.Unlock()
+						return
+					}
+				}
+
+				mu.Lock()
+				completed++
+				if completed%10 == 0 {
+					txidsPerInstance := arcade.TxidEnd - arcade.TxidStart
+					logger.Info("pre-loaded registrations", "arcadeInstances", completed, "txids", completed*txidsPerInstance)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	return firstErr
 }
 
 // preloadCallbackURLRegistry adds all callback URLs to the broadcast registry.

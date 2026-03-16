@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
+	"github.com/bsv-blockchain/merkle-service/internal/store"
 )
 
 // mockSyncProducer implements sarama.SyncProducer for testing.
@@ -80,6 +82,7 @@ func decodePublishedStumpsMessage(t *testing.T, pm *sarama.ProducerMessage) *kaf
 }
 
 // newTestDeliveryService creates a DeliveryService wired with mock producers and a custom HTTP client.
+// It initializes the worker pool with 4 workers for testing concurrent delivery.
 func newTestDeliveryService(t *testing.T, cfg *config.Config, httpClient *http.Client) (*DeliveryService, *mockSyncProducer, *mockSyncProducer) {
 	t.Helper()
 
@@ -93,12 +96,37 @@ func newTestDeliveryService(t *testing.T, cfg *config.Config, httpClient *http.C
 		httpClient: httpClient,
 		producer:   kafka.NewTestProducer(mockRetryProducer, cfg.Kafka.StumpsTopic, logger),
 		dlqProducer: kafka.NewTestProducer(mockDLQProducer, cfg.Kafka.StumpsDLQTopic, logger),
+		workCh:     make(chan *kafka.StumpsMessage, 64),
 	}
 	ds.InitBase("callback-delivery-test")
-	// Suppress log output in tests.
 	ds.Logger = logger
 
+	// Start workers for handleMessage dispatch.
+	workers := 4
+	ds.workerWg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go ds.deliveryWorker()
+	}
+
+	t.Cleanup(func() {
+		close(ds.workCh)
+		ds.workerWg.Wait()
+	})
+
 	return ds, mockRetryProducer, mockDLQProducer
+}
+
+// waitForCondition polls until condition returns true or timeout expires.
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for condition")
 }
 
 // defaultTestConfig returns a config suitable for testing.
@@ -144,7 +172,7 @@ func TestDeliverCallback_Success(t *testing.T) {
 		StumpData:   stumpData,
 	}
 
-	err := ds.deliverCallback(context.Background(), msg)
+	err := ds.deliverCallback(context.Background(), msg, msg.StumpData)
 	if err != nil {
 		t.Fatalf("expected successful delivery, got error: %v", err)
 	}
@@ -201,7 +229,7 @@ func TestDeliverCallback_NoStumpData(t *testing.T) {
 		StatusType:  kafka.StatusSeenOnNetwork,
 	}
 
-	err := ds.deliverCallback(context.Background(), msg)
+	err := ds.deliverCallback(context.Background(), msg, msg.StumpData)
 	if err != nil {
 		t.Fatalf("expected successful delivery, got error: %v", err)
 	}
@@ -244,7 +272,7 @@ func TestDeliverCallback_Non2xxReturnsError(t *testing.T) {
 				StatusType:  kafka.StatusMined,
 			}
 
-			err := ds.deliverCallback(context.Background(), msg)
+			err := ds.deliverCallback(context.Background(), msg, msg.StumpData)
 			if err == nil {
 				t.Fatalf("expected error for status code %d, got nil", code)
 			}
@@ -272,7 +300,7 @@ func TestDeliverCallback_2xxStatusesSucceed(t *testing.T) {
 				StatusType:  kafka.StatusMined,
 			}
 
-			err := ds.deliverCallback(context.Background(), msg)
+			err := ds.deliverCallback(context.Background(), msg, msg.StumpData)
 			if err != nil {
 				t.Fatalf("expected success for status %d, got error: %v", code, err)
 			}
@@ -314,6 +342,10 @@ func TestHandleMessage_SuccessfulDelivery(t *testing.T) {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesProcessed.Load() == 1
+	})
+
 	if !called {
 		t.Error("expected HTTP callback to be called")
 	}
@@ -323,9 +355,6 @@ func TestHandleMessage_SuccessfulDelivery(t *testing.T) {
 	}
 	if len(dlqProducer.getMessages()) != 0 {
 		t.Error("expected no DLQ messages")
-	}
-	if ds.messagesProcessed.Load() != 1 {
-		t.Errorf("expected messagesProcessed=1, got %d", ds.messagesProcessed.Load())
 	}
 }
 
@@ -363,6 +392,10 @@ func TestHandleMessage_RetryOnFailure(t *testing.T) {
 		t.Fatalf("expected no error (message re-enqueued), got: %v", err)
 	}
 
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesRetried.Load() == 1
+	})
+
 	// Should have re-enqueued to retry producer.
 	retryMsgs := retryProducer.getMessages()
 	if len(retryMsgs) != 1 {
@@ -388,10 +421,6 @@ func TestHandleMessage_RetryOnFailure(t *testing.T) {
 	// Should NOT have published to DLQ.
 	if len(dlqProducer.getMessages()) != 0 {
 		t.Error("expected no DLQ messages for retriable failure")
-	}
-
-	if ds.messagesRetried.Load() != 1 {
-		t.Errorf("expected messagesRetried=1, got %d", ds.messagesRetried.Load())
 	}
 }
 
@@ -496,6 +525,10 @@ func TestHandleMessage_DeadLetterAfterMaxRetries(t *testing.T) {
 		t.Fatalf("expected no error (message sent to DLQ), got: %v", err)
 	}
 
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesFailed.Load() == 1
+	})
+
 	// Should NOT have re-enqueued to retry.
 	if len(retryProducer.getMessages()) != 0 {
 		t.Error("expected no retry messages when max retries exceeded")
@@ -516,9 +549,6 @@ func TestHandleMessage_DeadLetterAfterMaxRetries(t *testing.T) {
 		t.Errorf("expected DLQ message retry count 3, got %d", dlqMsg.RetryCount)
 	}
 
-	if ds.messagesFailed.Load() != 1 {
-		t.Errorf("expected messagesFailed=1, got %d", ds.messagesFailed.Load())
-	}
 	if ds.messagesRetried.Load() != 0 {
 		t.Errorf("expected messagesRetried=0, got %d", ds.messagesRetried.Load())
 	}
@@ -558,15 +588,15 @@ func TestHandleMessage_DeadLetterExceedsMaxRetries(t *testing.T) {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesFailed.Load() == 1
+	})
+
 	if len(retryProducer.getMessages()) != 0 {
 		t.Error("expected no retry messages")
 	}
 	if len(dlqProducer.getMessages()) != 1 {
 		t.Fatalf("expected 1 DLQ message, got %d", len(dlqProducer.getMessages()))
-	}
-
-	if ds.messagesFailed.Load() != 1 {
-		t.Errorf("expected messagesFailed=1, got %d", ds.messagesFailed.Load())
 	}
 }
 
@@ -606,14 +636,15 @@ func TestHandleMessage_PastDelayDelivers(t *testing.T) {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesProcessed.Load() == 1
+	})
+
 	if !httpCalled {
 		t.Error("expected HTTP callback to be called for message with elapsed delay")
 	}
 	if len(retryProducer.getMessages()) != 0 {
 		t.Error("expected no retry messages for successful delivery")
-	}
-	if ds.messagesProcessed.Load() != 1 {
-		t.Errorf("expected messagesProcessed=1, got %d", ds.messagesProcessed.Load())
 	}
 }
 
@@ -653,7 +684,7 @@ func TestDeliverCallback_ContextCancelled(t *testing.T) {
 		StatusType:  kafka.StatusMined,
 	}
 
-	err := ds.deliverCallback(ctx, msg)
+	err := ds.deliverCallback(ctx, msg, msg.StumpData)
 	if err == nil {
 		t.Fatal("expected error for cancelled context, got nil")
 	}
@@ -711,7 +742,7 @@ func TestDeliverCallback_IdempotencyKeyHeader(t *testing.T) {
 		StatusType:  kafka.StatusSeenOnNetwork,
 	}
 
-	err := ds.deliverCallback(context.Background(), msg)
+	err := ds.deliverCallback(context.Background(), msg, msg.StumpData)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -778,11 +809,12 @@ func TestHandleMessage_DedupFirstDeliveryProceeds(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesProcessed.Load() == 1
+	})
+
 	if !httpCalled {
 		t.Error("expected HTTP callback to be called on first delivery")
-	}
-	if ds.messagesProcessed.Load() != 1 {
-		t.Errorf("expected messagesProcessed=1, got %d", ds.messagesProcessed.Load())
 	}
 	// Verify dedup was recorded.
 	exists, _ := dedup.Exists("tx-first", server.URL+"/callback", "SEEN_ON_NETWORK")
@@ -817,20 +849,21 @@ func TestHandleMessage_DedupDuplicateSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first delivery error: %v", err)
 	}
-	if httpCallCount != 1 {
-		t.Fatalf("expected 1 HTTP call after first delivery, got %d", httpCallCount)
-	}
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesProcessed.Load() == 1
+	})
 
 	// Duplicate delivery — should be skipped.
 	err = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 2})
 	if err != nil {
 		t.Fatalf("duplicate delivery error: %v", err)
 	}
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesDedupe.Load() == 1
+	})
+
 	if httpCallCount != 1 {
 		t.Errorf("expected HTTP not called again for duplicate, got %d calls", httpCallCount)
-	}
-	if ds.messagesDedupe.Load() != 1 {
-		t.Errorf("expected messagesDedupe=1, got %d", ds.messagesDedupe.Load())
 	}
 }
 
@@ -859,6 +892,10 @@ func TestHandleMessage_DedupFailedDeliveryDoesNotRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesRetried.Load() == 1
+	})
 
 	// Verify dedup was NOT recorded (delivery failed).
 	exists, _ := dedup.Exists("tx-fail-dedup", server.URL+"/callback", "MINED")
@@ -890,6 +927,10 @@ func TestHandleMessage_DedupDifferentStatusTypesNotDeduplicated(t *testing.T) {
 	data1, _ := msg1.Encode()
 	_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data1, Offset: 1})
 
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesProcessed.Load() == 1
+	})
+
 	// Deliver MINED for same txid — should NOT be deduplicated.
 	msg2 := &kafka.StumpsMessage{
 		CallbackURL: server.URL + "/callback",
@@ -898,6 +939,10 @@ func TestHandleMessage_DedupDifferentStatusTypesNotDeduplicated(t *testing.T) {
 	}
 	data2, _ := msg2.Encode()
 	_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data2, Offset: 2})
+
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesProcessed.Load() == 2
+	})
 
 	if httpCallCount != 2 {
 		t.Errorf("expected 2 HTTP calls (different status types), got %d", httpCallCount)
@@ -941,7 +986,7 @@ func TestEndToEnd_ExactlyOneCallbackPerStatusType(t *testing.T) {
 	}
 
 	// Deliver each status type twice — first should succeed, second should be deduped.
-	for _, st := range statusTypes {
+	for i, st := range statusTypes {
 		msg := &kafka.StumpsMessage{
 			CallbackURL: callbackURL,
 			TxID:        txid,
@@ -949,17 +994,27 @@ func TestEndToEnd_ExactlyOneCallbackPerStatusType(t *testing.T) {
 		}
 		data, _ := msg.Encode()
 
+		expectedProcessed := int64(i + 1)
+
 		// First delivery.
 		err := ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 1})
 		if err != nil {
 			t.Fatalf("first %s delivery error: %v", st, err)
 		}
+		waitForCondition(t, 5*time.Second, func() bool {
+			return ds.messagesProcessed.Load() == expectedProcessed
+		})
+
+		expectedDeduped := int64(i + 1)
 
 		// Duplicate delivery.
 		err = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 2})
 		if err != nil {
 			t.Fatalf("duplicate %s delivery error: %v", st, err)
 		}
+		waitForCondition(t, 5*time.Second, func() bool {
+			return ds.messagesDedupe.Load() == expectedDeduped
+		})
 	}
 
 	// Verify: exactly 1 delivery per status type, 3 total.
@@ -1008,7 +1063,7 @@ func TestDeliverCallback_BlockProcessed(t *testing.T) {
 		BlockHash:   "000000abc123",
 	}
 
-	err := ds.deliverCallback(context.Background(), msg)
+	err := ds.deliverCallback(context.Background(), msg, msg.StumpData)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1054,17 +1109,18 @@ func TestHandleMessage_BlockProcessedDedupOnBlockHash(t *testing.T) {
 
 	// First delivery.
 	_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 1})
-	if httpCallCount != 1 {
-		t.Fatalf("expected 1 HTTP call, got %d", httpCallCount)
-	}
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesProcessed.Load() == 1
+	})
 
 	// Duplicate — should be deduped on blockHash.
 	_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 2})
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesDedupe.Load() == 1
+	})
+
 	if httpCallCount != 1 {
 		t.Errorf("expected duplicate BLOCK_PROCESSED to be skipped, got %d calls", httpCallCount)
-	}
-	if ds.messagesDedupe.Load() != 1 {
-		t.Errorf("expected messagesDedupe=1, got %d", ds.messagesDedupe.Load())
 	}
 }
 
@@ -1136,6 +1192,10 @@ func TestEndToEnd_MinedAndBlockProcessedCallbacks(t *testing.T) {
 	data, _ = bpMsg2.Encode()
 	_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 3})
 
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesProcessed.Load() == 3
+	})
+
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -1199,6 +1259,10 @@ func TestEndToEnd_BlockProcessedRetryOnFailure(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesRetried.Load() == 1
+	})
+
 	retryMsgs := retryProducer.getMessages()
 	if len(retryMsgs) != 1 {
 		t.Fatalf("expected 1 retry, got %d", len(retryMsgs))
@@ -1223,6 +1287,10 @@ func TestEndToEnd_BlockProcessedRetryOnFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesFailed.Load() == 1
+	})
 
 	dlqMsgs := dlqProducer.getMessages()
 	if len(dlqMsgs) != 1 {
@@ -1271,6 +1339,10 @@ func TestHandleMessage_LinearBackoffCalculation(t *testing.T) {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesRetried.Load() == 1
+	})
+
 	retryMsgs := retryProducer.getMessages()
 	if len(retryMsgs) != 1 {
 		t.Fatalf("expected 1 retry message, got %d", len(retryMsgs))
@@ -1288,5 +1360,413 @@ func TestHandleMessage_LinearBackoffCalculation(t *testing.T) {
 		requeued.NextRetryAt.After(expectedNextRetry.Add(tolerance)) {
 		t.Errorf("NextRetryAt %v not within expected range around %v",
 			requeued.NextRetryAt, expectedNextRetry)
+	}
+}
+
+// TestHandleMessage_StumpRefResolvesFromCache verifies that when a message has StumpRef
+// instead of inline StumpData, the delivery resolves the STUMP from the cache.
+func TestHandleMessage_StumpRefResolvesFromCache(t *testing.T) {
+	var receivedBody []byte
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		receivedBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("failed to read body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+
+	// Set up stump cache with test data.
+	cache := store.NewMemoryStumpCache(300)
+	stumpData := []byte{0xCA, 0xFE, 0xBA, 0xBE}
+	cache.Put("subtreeABC", "block123", stumpData)
+	ds.stumpCache = cache
+
+	stumpsMsg := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		TxID:        "tx-stumpref",
+		StatusType:  kafka.StatusMined,
+		StumpRef:    "subtreeABC",
+		BlockHash:   "block123",
+	}
+	data, err := stumpsMsg.Encode()
+	if err != nil {
+		t.Fatalf("failed to encode: %v", err)
+	}
+
+	err = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 1, Partition: 0})
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesProcessed.Load() == 1
+	})
+
+	// Verify the STUMP data was resolved and included in the callback payload.
+	var payload callbackPayload
+	if err := json.Unmarshal(receivedBody, &payload); err != nil {
+		t.Fatalf("failed to unmarshal payload: %v", err)
+	}
+	expectedStump := base64.StdEncoding.EncodeToString(stumpData)
+	if payload.StumpData != expectedStump {
+		t.Errorf("expected stumpData %q, got %q", expectedStump, payload.StumpData)
+	}
+}
+
+// TestHandleMessage_InlineStumpDataStillWorks verifies that messages with inline StumpData
+// (no StumpRef) continue to work correctly.
+func TestHandleMessage_InlineStumpDataStillWorks(t *testing.T) {
+	var receivedBody []byte
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		receivedBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("failed to read body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+
+	stumpData := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	stumpsMsg := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		TxID:        "tx-inline",
+		StatusType:  kafka.StatusMined,
+		StumpData:   stumpData,
+	}
+	data, err := stumpsMsg.Encode()
+	if err != nil {
+		t.Fatalf("failed to encode: %v", err)
+	}
+
+	err = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 1, Partition: 0})
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesProcessed.Load() == 1
+	})
+
+	var payload callbackPayload
+	if err := json.Unmarshal(receivedBody, &payload); err != nil {
+		t.Fatalf("failed to unmarshal payload: %v", err)
+	}
+	expectedStump := base64.StdEncoding.EncodeToString(stumpData)
+	if payload.StumpData != expectedStump {
+		t.Errorf("expected stumpData %q, got %q", expectedStump, payload.StumpData)
+	}
+}
+
+// TestHandleMessage_StumpRefCacheMissTriggersRetry verifies that when StumpRef is set
+// but the cache misses, the message is re-enqueued for retry.
+func TestHandleMessage_StumpRefCacheMissTriggersRetry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("HTTP callback should not have been called on cache miss")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	cfg.Callback.BackoffBaseSec = 5
+	ds, retryProducer, _ := newTestDeliveryService(t, cfg, server.Client())
+
+	// Set up empty stump cache (no data for the ref).
+	ds.stumpCache = store.NewMemoryStumpCache(300)
+
+	stumpsMsg := &kafka.StumpsMessage{
+		CallbackURL: server.URL + "/callback",
+		TxID:        "tx-cachemiss",
+		StatusType:  kafka.StatusMined,
+		StumpRef:    "missingSubtree",
+		BlockHash:   "block456",
+		RetryCount:  0,
+	}
+	data, err := stumpsMsg.Encode()
+	if err != nil {
+		t.Fatalf("failed to encode: %v", err)
+	}
+
+	err = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 1, Partition: 0})
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesRetried.Load() == 1
+	})
+
+	// Verify message was re-enqueued.
+	retryMsgs := retryProducer.getMessages()
+	if len(retryMsgs) != 1 {
+		t.Fatalf("expected 1 retry message, got %d", len(retryMsgs))
+	}
+
+	// Verify retry count was incremented.
+	requeued := decodePublishedStumpsMessage(t, retryMsgs[0])
+	if requeued.RetryCount != 1 {
+		t.Errorf("expected retryCount 1, got %d", requeued.RetryCount)
+	}
+
+	// Verify no successful deliveries.
+	if ds.messagesProcessed.Load() != 0 {
+		t.Error("expected no successful deliveries")
+	}
+}
+
+// TestDeliveryService_ConcurrentWorkers verifies that N workers process messages
+// in parallel by using a slow HTTP handler and checking N messages are in-flight simultaneously.
+func TestDeliveryService_ConcurrentWorkers(t *testing.T) {
+	const numWorkers = 8
+	const numMessages = numWorkers
+
+	var inFlight atomic.Int64
+	var maxInFlight atomic.Int64
+	done := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := inFlight.Add(1)
+		// Track max concurrency.
+		for {
+			old := maxInFlight.Load()
+			if current <= old || maxInFlight.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		// Hold the request open to allow concurrency to build up.
+		<-done
+		inFlight.Add(-1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	cfg.Callback.DeliveryWorkers = numWorkers
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mockRetryProducer := &mockSyncProducer{}
+	mockDLQProducer := &mockSyncProducer{}
+
+	ds := &DeliveryService{
+		cfg:         cfg,
+		httpClient:  server.Client(),
+		producer:    kafka.NewTestProducer(mockRetryProducer, cfg.Kafka.StumpsTopic, logger),
+		dlqProducer: kafka.NewTestProducer(mockDLQProducer, cfg.Kafka.StumpsDLQTopic, logger),
+		workCh:      make(chan *kafka.StumpsMessage, numWorkers*2),
+	}
+	ds.InitBase("callback-delivery-concurrent-test")
+	ds.Logger = logger
+
+	ds.workerWg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go ds.deliveryWorker()
+	}
+
+	// Dispatch all messages.
+	for i := 0; i < numMessages; i++ {
+		msg := &kafka.StumpsMessage{
+			CallbackURL: server.URL + "/callback",
+			TxID:        fmt.Sprintf("tx-concurrent-%d", i),
+			StatusType:  kafka.StatusMined,
+		}
+		data, _ := msg.Encode()
+		err := ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: int64(i)})
+		if err != nil {
+			t.Fatalf("handleMessage error: %v", err)
+		}
+	}
+
+	// Wait until all workers are in-flight.
+	waitForCondition(t, 5*time.Second, func() bool {
+		return inFlight.Load() == int64(numMessages)
+	})
+
+	// Release all handlers.
+	close(done)
+
+	// Wait for all to complete.
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesProcessed.Load() == int64(numMessages)
+	})
+
+	// Clean up workers.
+	close(ds.workCh)
+	ds.workerWg.Wait()
+
+	if maxInFlight.Load() < int64(numWorkers) {
+		t.Errorf("expected at least %d concurrent in-flight requests, got %d", numWorkers, maxInFlight.Load())
+	}
+}
+
+// TestDeliveryService_Backpressure verifies that when all workers are busy,
+// the dispatch channel blocks the consumer.
+func TestDeliveryService_Backpressure(t *testing.T) {
+	const numWorkers = 2
+	const chanBuffer = 2
+
+	holdRequests := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-holdRequests
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mockRetryProducer := &mockSyncProducer{}
+	mockDLQProducer := &mockSyncProducer{}
+
+	ds := &DeliveryService{
+		cfg:         cfg,
+		httpClient:  server.Client(),
+		producer:    kafka.NewTestProducer(mockRetryProducer, cfg.Kafka.StumpsTopic, logger),
+		dlqProducer: kafka.NewTestProducer(mockDLQProducer, cfg.Kafka.StumpsDLQTopic, logger),
+		workCh:      make(chan *kafka.StumpsMessage, chanBuffer),
+	}
+	ds.InitBase("callback-delivery-backpressure-test")
+	ds.Logger = logger
+
+	ds.workerWg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go ds.deliveryWorker()
+	}
+
+	// Fill workers (2 workers blocked in HTTP handler) + fill channel buffer (2 more).
+	// That's 4 messages. The 5th should block.
+	for i := 0; i < numWorkers+chanBuffer; i++ {
+		msg := &kafka.StumpsMessage{
+			CallbackURL: server.URL + "/callback",
+			TxID:        fmt.Sprintf("tx-bp-%d", i),
+			StatusType:  kafka.StatusMined,
+		}
+		data, _ := msg.Encode()
+		err := ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: int64(i)})
+		if err != nil {
+			t.Fatalf("handleMessage error: %v", err)
+		}
+	}
+
+	// Wait for workers to pick up messages from channel (filling HTTP handlers).
+	waitForCondition(t, 5*time.Second, func() bool {
+		return len(ds.workCh) == chanBuffer
+	})
+
+	// The next dispatch should block since channel is full.
+	blocked := make(chan struct{})
+	go func() {
+		msg := &kafka.StumpsMessage{
+			CallbackURL: server.URL + "/callback",
+			TxID:        "tx-bp-blocked",
+			StatusType:  kafka.StatusMined,
+		}
+		data, _ := msg.Encode()
+		_ = ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data, Offset: 99})
+		close(blocked)
+	}()
+
+	// Verify the goroutine is blocked (doesn't complete within 100ms).
+	select {
+	case <-blocked:
+		t.Fatal("expected handleMessage to block when workers and channel are full")
+	case <-time.After(100 * time.Millisecond):
+		// Good — backpressure is working.
+	}
+
+	// Release all HTTP handlers to unblock.
+	close(holdRequests)
+
+	// The blocked goroutine should eventually complete.
+	select {
+	case <-blocked:
+		// Good.
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleMessage did not unblock after releasing workers")
+	}
+
+	// Clean up.
+	waitForCondition(t, 5*time.Second, func() bool {
+		return ds.messagesProcessed.Load() == int64(numWorkers+chanBuffer+1)
+	})
+	close(ds.workCh)
+	ds.workerWg.Wait()
+}
+
+// TestDeliveryService_GracefulShutdown verifies that in-flight deliveries complete
+// before Stop() returns.
+func TestDeliveryService_GracefulShutdown(t *testing.T) {
+	const numWorkers = 4
+	const numMessages = numWorkers
+
+	var completedDeliveries atomic.Int64
+	holdRequests := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-holdRequests
+		completedDeliveries.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mockRetryProducer := &mockSyncProducer{}
+	mockDLQProducer := &mockSyncProducer{}
+
+	ds := &DeliveryService{
+		cfg:         cfg,
+		httpClient:  server.Client(),
+		producer:    kafka.NewTestProducer(mockRetryProducer, cfg.Kafka.StumpsTopic, logger),
+		dlqProducer: kafka.NewTestProducer(mockDLQProducer, cfg.Kafka.StumpsDLQTopic, logger),
+		workCh:      make(chan *kafka.StumpsMessage, numWorkers*2),
+	}
+	ds.InitBase("callback-delivery-shutdown-test")
+	ds.Logger = logger
+
+	ds.workerWg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go ds.deliveryWorker()
+	}
+
+	// Dispatch messages that will be held in HTTP handler.
+	for i := 0; i < numMessages; i++ {
+		msg := &kafka.StumpsMessage{
+			CallbackURL: server.URL + "/callback",
+			TxID:        fmt.Sprintf("tx-shutdown-%d", i),
+			StatusType:  kafka.StatusMined,
+		}
+		ds.workCh <- msg
+	}
+
+	// Wait for all workers to be in the HTTP handler.
+	time.Sleep(50 * time.Millisecond)
+
+	// Close the work channel (simulating Stop behavior).
+	close(ds.workCh)
+
+	// Release HTTP handlers so in-flight work can complete.
+	close(holdRequests)
+
+	// Wait for workers to drain.
+	ds.workerWg.Wait()
+
+	// All in-flight deliveries should have completed.
+	if completedDeliveries.Load() != int64(numMessages) {
+		t.Errorf("expected %d completed deliveries after shutdown, got %d",
+			numMessages, completedDeliveries.Load())
+	}
+	if ds.messagesProcessed.Load() != int64(numMessages) {
+		t.Errorf("expected messagesProcessed=%d, got %d",
+			numMessages, ds.messagesProcessed.Load())
 	}
 }
