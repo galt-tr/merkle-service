@@ -1,4 +1,4 @@
-.PHONY: build test lint docker-up docker-down run debug-dashboard
+.PHONY: build test lint docker-up docker-down run debug-dashboard scale-test
 
 build:
 	go build ./...
@@ -20,3 +20,6 @@ run:
 
 debug-dashboard:
 	go run ./tools/debug-dashboard
+
+scale-test:
+	go test -tags scale -v -count=1 -timeout 10m ./test/scale/
