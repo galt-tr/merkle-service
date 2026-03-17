@@ -132,7 +132,7 @@ func main() {
 	// Create services.
 	apiServer := api.NewServer(cfg.API, regStore, urlRegistry, asClient, logger)
 	p2pClient := p2p.NewClient(cfg.P2P, subtreeProducer, blockProducer, logger)
-	subtreeProcessor := subtree.NewProcessor(cfg, regStore, seenStore, subtreeStore)
+	subtreeFetcher := subtree.NewProcessor(cfg, regStore, seenStore, subtreeStore)
 	blockProcessor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, stumpsProducer, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
 	subtreeWorker := block.NewSubtreeWorkerService(cfg.Kafka, cfg.Block, cfg.DataHub, regStore, subtreeStore, urlRegistry, subtreeCounter, stumpCache, callbackAccumulator, logger)
 	callbackDedupStore := store.NewCallbackDedupStore(
@@ -145,7 +145,7 @@ func main() {
 	callbackDelivery := callback.NewDeliveryService(cfg, callbackDedupStore, stumpCache)
 
 	// Initialize all services.
-	services := []service.Service{apiServer, p2pClient, subtreeProcessor, blockProcessor, subtreeWorker, callbackDelivery}
+	services := []service.Service{apiServer, p2pClient, subtreeFetcher, blockProcessor, subtreeWorker, callbackDelivery}
 	for _, svc := range services {
 		if err := svc.Init(nil); err != nil {
 			log.Fatal("failed to init service: ", err)

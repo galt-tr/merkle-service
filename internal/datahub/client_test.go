@@ -2,7 +2,7 @@ package datahub
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/binary"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,6 +13,18 @@ import (
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// buildBinaryBlockBytes creates a DataHub-format binary block payload.
+// height is the block height, hashes is a slice of 32-byte subtree hashes.
+func buildBinaryBlockBytes(height uint32, hashes [][]byte) []byte {
+	data := make([]byte, 8+len(hashes)*32)
+	binary.LittleEndian.PutUint32(data[0:4], height)
+	binary.LittleEndian.PutUint32(data[4:8], uint32(len(hashes)))
+	for i, h := range hashes {
+		copy(data[8+i*32:], h)
+	}
+	return data
 }
 
 // buildRawSubtreeBytes creates DataHub-format raw subtree data (concatenated 32-byte hashes).
@@ -72,11 +84,13 @@ func TestFetchSubtreeRaw_NotFound(t *testing.T) {
 }
 
 func TestFetchBlockMetadata_Success(t *testing.T) {
-	meta := BlockMetadata{
-		Height:           100,
-		Subtrees:         []string{"aaa", "bbb", "ccc"},
-		TransactionCount: 5000,
+	// Build binary payload: height=100, 3 subtree hashes.
+	hashes := [][]byte{
+		append([]byte{0x01}, make([]byte, 31)...),
+		append([]byte{0x02}, make([]byte, 31)...),
+		append([]byte{0x03}, make([]byte, 31)...),
 	}
+	payload := buildBinaryBlockBytes(100, hashes)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.URL.Path, "/block/") {
@@ -84,8 +98,14 @@ func TestFetchBlockMetadata_Success(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(meta)
+		// Ensure the path does NOT end in /json.
+		if strings.HasSuffix(r.URL.Path, "/json") {
+			t.Errorf("expected binary endpoint, got JSON path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(payload)
 	}))
 	defer server.Close()
 
@@ -99,6 +119,66 @@ func TestFetchBlockMetadata_Success(t *testing.T) {
 	}
 	if len(result.Subtrees) != 3 {
 		t.Errorf("expected 3 subtrees, got %d", len(result.Subtrees))
+	}
+}
+
+func TestParseBinaryBlockMetadata_Success(t *testing.T) {
+	hashes := [][]byte{
+		append([]byte{0xAA}, make([]byte, 31)...),
+		append([]byte{0xBB}, make([]byte, 31)...),
+		append([]byte{0xCC}, make([]byte, 31)...),
+	}
+	payload := buildBinaryBlockBytes(12345, hashes)
+
+	meta, err := ParseBinaryBlockMetadata(payload)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if meta.Height != 12345 {
+		t.Errorf("expected height 12345, got %d", meta.Height)
+	}
+	if len(meta.Subtrees) != 3 {
+		t.Fatalf("expected 3 subtrees, got %d", len(meta.Subtrees))
+	}
+	// Each subtree should be a 64-char hex string.
+	for i, s := range meta.Subtrees {
+		if len(s) != 64 {
+			t.Errorf("subtree %d: expected 64-char hex, got %d chars", i, len(s))
+		}
+	}
+}
+
+func TestParseBinaryBlockMetadata_EmptySubtrees(t *testing.T) {
+	payload := buildBinaryBlockBytes(42, nil)
+
+	meta, err := ParseBinaryBlockMetadata(payload)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if meta.Height != 42 {
+		t.Errorf("expected height 42, got %d", meta.Height)
+	}
+	if len(meta.Subtrees) != 0 {
+		t.Errorf("expected empty subtrees, got %d", len(meta.Subtrees))
+	}
+}
+
+func TestParseBinaryBlockMetadata_TooShort(t *testing.T) {
+	_, err := ParseBinaryBlockMetadata([]byte{0x01, 0x02, 0x03})
+	if err == nil {
+		t.Fatal("expected error for payload shorter than 8 bytes")
+	}
+}
+
+func TestParseBinaryBlockMetadata_LengthMismatch(t *testing.T) {
+	// Declare 3 subtrees but only provide 2 hashes worth of data.
+	data := make([]byte, 8+2*32)
+	binary.LittleEndian.PutUint32(data[0:4], 100)  // height
+	binary.LittleEndian.PutUint32(data[4:8], 3)    // claims 3 subtrees
+	// Only 2×32 bytes follow — mismatch detected by length check.
+	_, err := ParseBinaryBlockMetadata(data)
+	if err == nil {
+		t.Fatal("expected error for subtree count mismatch")
 	}
 }
 

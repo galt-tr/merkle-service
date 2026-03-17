@@ -2,7 +2,7 @@ package block
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/binary"
 	"io"
 	"log/slog"
 	"net/http"
@@ -245,15 +245,19 @@ func TestGroupByCallback(t *testing.T) {
 
 // TestBlockMetadataFetch verifies DataHub block metadata fetching with multiple subtrees.
 func TestBlockMetadataFetch(t *testing.T) {
+	// Build binary block payload: height=200, 3 subtree hashes.
+	subtreeHashes := []string{"st-aaa", "st-bbb", "st-ccc"}
+	payload := make([]byte, 8+len(subtreeHashes)*32)
+	binary.LittleEndian.PutUint32(payload[0:4], 200)
+	binary.LittleEndian.PutUint32(payload[4:8], uint32(len(subtreeHashes)))
+	for i, h := range subtreeHashes {
+		copy(payload[8+i*32:], []byte(h))
+	}
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/block/") && strings.HasSuffix(r.URL.Path, "/json") {
-			meta := datahub.BlockMetadata{
-				Height:           200,
-				Subtrees:         []string{"st-aaa", "st-bbb", "st-ccc"},
-				TransactionCount: 15000,
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(meta)
+		if strings.Contains(r.URL.Path, "/block/") && !strings.HasSuffix(r.URL.Path, "/json") {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Write(payload)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -271,9 +275,6 @@ func TestBlockMetadataFetch(t *testing.T) {
 	}
 	if len(meta.Subtrees) != 3 {
 		t.Errorf("expected 3 subtrees, got %d", len(meta.Subtrees))
-	}
-	if meta.TransactionCount != 15000 {
-		t.Errorf("expected 15000 txs, got %d", meta.TransactionCount)
 	}
 }
 

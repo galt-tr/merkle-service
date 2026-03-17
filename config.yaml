@@ -122,7 +122,7 @@ p2p:
   # configures topics, bootstrap peers, and protocol version based on this value.
   # Valid values: main, test, stn, teratestnet
   # Env: P2P_NETWORK
-  network: main
+  network: teratestnet
 
   # Directory for persisting the P2P identity key and peer cache.
   # The library manages key generation and peer persistence automatically.

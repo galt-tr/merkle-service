@@ -2,7 +2,7 @@ package datahub
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -108,20 +108,51 @@ func ParseRawNodes(data []byte) ([]subtreepkg.Node, error) {
 	return nodes, nil
 }
 
-// FetchBlockMetadata fetches block metadata (JSON) from a DataHub endpoint.
+// ParseBinaryBlockMetadata decodes the Teranode DataHub binary block response.
+// Format: 4-byte uint32 LE height, 4-byte uint32 LE subtree count, N×32-byte subtree hashes.
+func ParseBinaryBlockMetadata(data []byte) (*BlockMetadata, error) {
+	if len(data) < 8 {
+		return nil, fmt.Errorf("binary block metadata too short: %d bytes (need at least 8)", len(data))
+	}
+	if (len(data)-8)%chainhash.HashSize != 0 {
+		return nil, fmt.Errorf("binary block metadata has invalid subtree data length: %d bytes after header is not a multiple of %d", len(data)-8, chainhash.HashSize)
+	}
+
+	height := binary.LittleEndian.Uint32(data[0:4])
+	subtreeCount := binary.LittleEndian.Uint32(data[4:8])
+	actualCount := uint32((len(data) - 8) / chainhash.HashSize)
+	if actualCount != subtreeCount {
+		return nil, fmt.Errorf("binary block metadata subtree count mismatch: header declares %d but data contains %d", subtreeCount, actualCount)
+	}
+
+	subtrees := make([]string, subtreeCount)
+	for i := uint32(0); i < subtreeCount; i++ {
+		offset := 8 + int(i)*chainhash.HashSize
+		var h chainhash.Hash
+		copy(h[:], data[offset:offset+chainhash.HashSize])
+		subtrees[i] = h.String()
+	}
+
+	return &BlockMetadata{
+		Height:   height,
+		Subtrees: subtrees,
+	}, nil
+}
+
+// FetchBlockMetadata fetches block metadata (binary) from a DataHub endpoint.
 func (c *Client) FetchBlockMetadata(ctx context.Context, dataHubURL string, hash string) (*BlockMetadata, error) {
-	url := fmt.Sprintf("%s/block/%s/json", dataHubURL, hash)
+	url := fmt.Sprintf("%s/block/%s", dataHubURL, hash)
 	data, err := c.doGetWithRetry(ctx, url)
 	if err != nil {
 		return nil, fmt.Errorf("fetching block metadata %s: %w", hash, err)
 	}
 
-	var meta BlockMetadata
-	if err := json.Unmarshal(data, &meta); err != nil {
+	meta, err := ParseBinaryBlockMetadata(data)
+	if err != nil {
 		return nil, fmt.Errorf("parsing block metadata %s: %w", hash, err)
 	}
 
-	return &meta, nil
+	return meta, nil
 }
 
 // doGetWithRetry performs an HTTP GET with exponential backoff retry.

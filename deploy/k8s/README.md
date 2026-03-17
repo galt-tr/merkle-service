@@ -7,7 +7,7 @@ Deploy merkle-service as independent microservices on Kubernetes.
 - **Kafka** cluster accessible within the cluster (default: `kafka-0.kafka.merkle-service.svc.cluster.local:9092`)
 - **Aerospike** cluster accessible within the cluster (default: `aerospike.merkle-service.svc.cluster.local:3000`)
 - **Kafka topics** created with appropriate partition counts:
-  - `subtree` — P2P subtree announcements
+  - `subtree` — P2P subtree announcements (**partition count determines max subtree-fetcher replicas**)
   - `block` — block announcements
   - `stumps` — STUMP/callback status messages
   - `stumps-dlq` — dead-letter queue for failed callbacks
@@ -23,6 +23,7 @@ kubectl apply -f configmap.yaml
 # Deploy services
 kubectl apply -f p2p-client.yaml
 kubectl apply -f block-processor.yaml
+kubectl apply -f subtree-fetcher.yaml
 kubectl apply -f subtree-worker.yaml
 kubectl apply -f callback-delivery.yaml
 kubectl apply -f api-server.yaml
@@ -31,17 +32,21 @@ kubectl apply -f api-server.yaml
 ## Architecture
 
 ```
-P2P Client (1 pod) → Kafka → Block Processor (1 pod) → subtree-work topic
-                                                              ↓
-                                              Subtree Workers (16-256 pods)
-                                                       ↓              ↓
-                                            Aerospike STUMP cache   Aerospike callback_accum
-                                                       ↓              ↓
-                                                    stumps topic (batched per callback URL)
-                                                              ↓
-                                              Callback Delivery (4+ pods, consumer group)
-                                                              ↓
-                                                        HTTP callbacks
+P2P Client (1 pod) ──→ subtree topic ──→ Subtree Fetchers (4+ pods)
+                    │                          ↓              ↓
+                    │                     blob store    SEEN callbacks (stumps topic)
+                    │
+                    └──→ block topic ──→ Block Processor (1 pod) → subtree-work topic
+                                                                          ↓
+                                                          Subtree Workers (16-256 pods)
+                                                               ↓              ↓
+                                                     blob store (read)   Aerospike callback_accum
+                                                     DataHub (fallback)        ↓
+                                                               ↓    stumps topic (batched)
+                                                          STUMP cache          ↓
+                                                                     Callback Delivery (4+ pods)
+                                                                               ↓
+                                                                         HTTP callbacks
 ```
 
 ## Services
@@ -50,7 +55,8 @@ P2P Client (1 pod) → Kafka → Block Processor (1 pod) → subtree-work topic
 |---------|-----------------|---------------|-------|
 | `p2p-client` | 1 | 1 (singleton) | Maintains BSV P2P connection. Running >1 causes duplicate messages. |
 | `block-processor` | 1 | block topic partitions | Blocks arrive ~1/10min. Extra replicas are standby. |
-| `subtree-worker` | 16 | subtree-work topic partitions | Main scaling lever. Set topic partitions >= max replicas. |
+| `subtree-fetcher` | 4 | subtree topic partitions | Fetches subtrees from P2P announcements, stores to blob store, emits SEEN callbacks. |
+| `subtree-worker` | 16 | subtree-work topic partitions | Builds STUMPs from block subtrees and emits MINED callbacks. |
 | `callback-delivery` | 4 | stumps topic partitions | Scale based on callback throughput needs. |
 | `api-server` | 2 | unlimited (stateless) | Handles `/watch` registrations and `/health`. |
 
@@ -81,6 +87,23 @@ kubectl scale deployment callback-delivery -n merkle-service --replicas=16
 - Batching reduces MINED Kafka messages from ~24,400 to ~100 per block
 - Delivery throughput: ~92,000 txids/sec with 2 delivery instances
 - All callbacks delivered correctly with no loss or unexpected duplicates
+
+## Scaling Subtree Fetchers
+
+The subtree-fetcher pods form a Kafka consumer group on the `subtree` topic. Each pod processes a distinct subset of P2P subtree announcements. The maximum useful replica count equals the topic's partition count.
+
+```bash
+# Check current partition count
+kafka-topics.sh --describe --topic subtree --bootstrap-server kafka:9092
+
+# Increase partitions (cannot decrease)
+kafka-topics.sh --alter --topic subtree --partitions 16 --bootstrap-server kafka:9092
+
+# Scale fetchers to match
+kubectl scale deployment subtree-fetcher -n merkle-service --replicas=16
+```
+
+**Blob store sharing:** With multiple fetcher replicas, each pod writes to its own local blob store by default (`file:///data/subtrees`). For shared caching, configure `blobStore.url` with an S3 or GCS URL in the configmap. Without shared storage the system remains correct — subtree workers fall back to DataHub when the blob store entry is absent.
 
 ## Scaling Subtree Workers
 

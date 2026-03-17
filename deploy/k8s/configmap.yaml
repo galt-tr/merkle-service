@@ -65,6 +65,11 @@ data:
       stumpCacheMode: aerospike
       stumpCacheLRUSize: 1024
 
+    # blobStore.url: Use file:// for single-node / all-in-one only.
+    # For multi-replica subtree-fetcher deployments, use a shared object store:
+    #   s3://bucket/subtrees   (AWS S3 or S3-compatible)
+    #   gs://bucket/subtrees   (Google Cloud Storage)
+    # Without shared storage, subtree workers fall back to DataHub (correct but slower).
     blobStore:
       url: file:///data/subtrees
 

@@ -68,7 +68,7 @@ func NewProcessor(
 
 // Init initializes the subtree processor, setting up the Kafka consumer, producer, and registration cache.
 func (p *Processor) Init(_ interface{}) error {
-	p.InitBase("subtree-processor")
+	p.InitBase("subtree-fetcher")
 
 	// Initialize DataHub client.
 	p.dataHubClient = datahub.NewClient(p.cfg.DataHub.TimeoutSec, p.cfg.DataHub.MaxRetries, p.Logger)
@@ -108,7 +108,7 @@ func (p *Processor) Init(_ interface{}) error {
 	}
 	p.consumer = consumer
 
-	p.Logger.Info("subtree processor initialized",
+	p.Logger.Info("subtree-fetcher initialized",
 		"storageMode", p.cfg.Subtree.StorageMode,
 		"subtreeTopic", p.cfg.Kafka.SubtreeTopic,
 		"stumpsTopic", p.cfg.Kafka.StumpsTopic,
@@ -120,20 +120,20 @@ func (p *Processor) Init(_ interface{}) error {
 
 // Start begins consuming subtree messages from Kafka.
 func (p *Processor) Start(ctx context.Context) error {
-	p.Logger.Info("starting subtree processor")
+	p.Logger.Info("starting subtree-fetcher")
 
 	if err := p.consumer.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start subtree consumer: %w", err)
 	}
 
 	p.SetStarted(true)
-	p.Logger.Info("subtree processor started")
+	p.Logger.Info("subtree-fetcher started")
 	return nil
 }
 
 // Stop gracefully shuts down the subtree processor.
 func (p *Processor) Stop() error {
-	p.Logger.Info("stopping subtree processor")
+	p.Logger.Info("stopping subtree-fetcher")
 
 	var firstErr error
 
@@ -155,7 +155,7 @@ func (p *Processor) Stop() error {
 
 	p.SetStarted(false)
 	p.Cancel()
-	p.Logger.Info("subtree processor stopped", "messagesProcessed", p.messagesProcessed.Load())
+	p.Logger.Info("subtree-fetcher stopped", "messagesProcessed", p.messagesProcessed.Load())
 	return firstErr
 }
 
