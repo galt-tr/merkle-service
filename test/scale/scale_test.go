@@ -225,13 +225,22 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 	}
 	t.Cleanup(func() { stumpsProducer.Close() })
 
-	// Create shared STUMP cache and subtree counter.
+	// Create shared STUMP cache, subtree counter, and callback accumulator.
 	stumpCache := store.NewMemoryStumpCache(300)
 	stumpCache.Start()
 	t.Cleanup(func() { stumpCache.Close() })
 
 	counterSetName := fmt.Sprintf("scale_counter_%d", time.Now().UnixNano())
 	subtreeCounter := store.NewSubtreeCounterStore(asClient, counterSetName, 600, 3, 100, logger)
+
+	// Use callback accumulator for cross-subtree batching only for smaller tests.
+	// For mega-scale (100+ instances), the per-block accumulator record grows too large
+	// for a single Aerospike record. Per-subtree individual publishing still uses StumpRef.
+	var callbackAccumulator *store.CallbackAccumulatorStore
+	if instanceCount <= 50 {
+		accumSetName := fmt.Sprintf("scale_accum_%d", time.Now().UnixNano())
+		callbackAccumulator = store.NewCallbackAccumulatorStore(asClient, accumSetName, 600, 3, 100, logger)
+	}
 
 	// Start block processor.
 	kafkaCfg := config.KafkaConfig{
@@ -263,8 +272,8 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 	}
 	t.Cleanup(func() { processor.Stop() })
 
-	// Start subtree worker service.
-	subtreeWorker := block.NewSubtreeWorkerService(kafkaCfg, blockCfg, datahubCfg, regStore, subtreeStore, urlRegistry, subtreeCounter, stumpCache, logger)
+	// Start subtree worker service with callback accumulator for batched publishing.
+	subtreeWorker := block.NewSubtreeWorkerService(kafkaCfg, blockCfg, datahubCfg, regStore, subtreeStore, urlRegistry, subtreeCounter, stumpCache, callbackAccumulator, logger)
 	if err := subtreeWorker.Init(nil); err != nil {
 		t.Fatalf("failed to init subtree worker: %v", err)
 	}
@@ -286,14 +295,24 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 			StumpCacheTTLSec:    300,
 		},
 	}
-	deliveryService := callback.NewDeliveryService(deliveryCfg, nil, stumpCache)
-	if err := deliveryService.Init(nil); err != nil {
-		t.Fatalf("failed to init delivery service: %v", err)
+	deliveryService1 := callback.NewDeliveryService(deliveryCfg, nil, stumpCache)
+	if err := deliveryService1.Init(nil); err != nil {
+		t.Fatalf("failed to init delivery service 1: %v", err)
 	}
-	if err := deliveryService.Start(ctx); err != nil {
-		t.Fatalf("failed to start delivery service: %v", err)
+	if err := deliveryService1.Start(ctx); err != nil {
+		t.Fatalf("failed to start delivery service 1: %v", err)
 	}
-	t.Cleanup(func() { deliveryService.Stop() })
+	t.Cleanup(func() { deliveryService1.Stop() })
+
+	// Start second delivery service instance (same consumer group) for multi-instance validation.
+	deliveryService2 := callback.NewDeliveryService(deliveryCfg, nil, stumpCache)
+	if err := deliveryService2.Init(nil); err != nil {
+		t.Fatalf("failed to init delivery service 2: %v", err)
+	}
+	if err := deliveryService2.Start(ctx); err != nil {
+		t.Fatalf("failed to start delivery service 2: %v", err)
+	}
+	t.Cleanup(func() { deliveryService2.Stop() })
 
 	// Allow consumers to settle.
 	time.Sleep(2 * time.Second)

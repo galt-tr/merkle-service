@@ -41,6 +41,7 @@ type StumpsMessage struct {
 	TxIDs       []string   `json:"txids,omitempty"`
 	StumpData   []byte     `json:"stumpData,omitempty"`
 	StumpRef    string     `json:"stumpRef,omitempty"`
+	StumpRefs   []string   `json:"stumpRefs,omitempty"`
 	StatusType  StatusType `json:"statusType"`
 	BlockHash   string     `json:"blockHash,omitempty"`
 	SubtreeID   string     `json:"subtreeId,omitempty"`

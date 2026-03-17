@@ -172,7 +172,7 @@ func TestDeliverCallback_Success(t *testing.T) {
 		StumpData:   stumpData,
 	}
 
-	err := ds.deliverCallback(context.Background(), msg, msg.StumpData)
+	err := ds.deliverCallback(context.Background(), msg, [][]byte{msg.StumpData})
 	if err != nil {
 		t.Fatalf("expected successful delivery, got error: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestDeliverCallback_NoStumpData(t *testing.T) {
 		StatusType:  kafka.StatusSeenOnNetwork,
 	}
 
-	err := ds.deliverCallback(context.Background(), msg, msg.StumpData)
+	err := ds.deliverCallback(context.Background(), msg, [][]byte{msg.StumpData})
 	if err != nil {
 		t.Fatalf("expected successful delivery, got error: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestDeliverCallback_Non2xxReturnsError(t *testing.T) {
 				StatusType:  kafka.StatusMined,
 			}
 
-			err := ds.deliverCallback(context.Background(), msg, msg.StumpData)
+			err := ds.deliverCallback(context.Background(), msg, [][]byte{msg.StumpData})
 			if err == nil {
 				t.Fatalf("expected error for status code %d, got nil", code)
 			}
@@ -300,7 +300,7 @@ func TestDeliverCallback_2xxStatusesSucceed(t *testing.T) {
 				StatusType:  kafka.StatusMined,
 			}
 
-			err := ds.deliverCallback(context.Background(), msg, msg.StumpData)
+			err := ds.deliverCallback(context.Background(), msg, [][]byte{msg.StumpData})
 			if err != nil {
 				t.Fatalf("expected success for status %d, got error: %v", code, err)
 			}
@@ -684,7 +684,7 @@ func TestDeliverCallback_ContextCancelled(t *testing.T) {
 		StatusType:  kafka.StatusMined,
 	}
 
-	err := ds.deliverCallback(ctx, msg, msg.StumpData)
+	err := ds.deliverCallback(ctx, msg, [][]byte{msg.StumpData})
 	if err == nil {
 		t.Fatal("expected error for cancelled context, got nil")
 	}
@@ -742,7 +742,7 @@ func TestDeliverCallback_IdempotencyKeyHeader(t *testing.T) {
 		StatusType:  kafka.StatusSeenOnNetwork,
 	}
 
-	err := ds.deliverCallback(context.Background(), msg, msg.StumpData)
+	err := ds.deliverCallback(context.Background(), msg, [][]byte{msg.StumpData})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1063,7 +1063,7 @@ func TestDeliverCallback_BlockProcessed(t *testing.T) {
 		BlockHash:   "000000abc123",
 	}
 
-	err := ds.deliverCallback(context.Background(), msg, msg.StumpData)
+	err := ds.deliverCallback(context.Background(), msg, [][]byte{msg.StumpData})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

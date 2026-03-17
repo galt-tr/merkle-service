@@ -86,10 +86,20 @@ func main() {
 	defer stumpCache.Close()
 
 	// Create, init, and start the subtree worker service.
+	// Create callback accumulator for cross-subtree batching.
+	callbackAccumulator := store.NewCallbackAccumulatorStore(
+		asClient,
+		cfg.Aerospike.CallbackAccumulatorSet,
+		cfg.Aerospike.CallbackAccumulatorTTLSec,
+		cfg.Aerospike.MaxRetries,
+		cfg.Aerospike.RetryBaseMs,
+		logger,
+	)
+
 	worker := block.NewSubtreeWorkerService(
 		cfg.Kafka, cfg.Block, cfg.DataHub,
 		regStore, subtreeStore, urlRegistry, subtreeCounter, stumpCache,
-		logger,
+		callbackAccumulator, logger,
 	)
 
 	if err := worker.Init(nil); err != nil {

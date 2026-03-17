@@ -119,12 +119,22 @@ func main() {
 		logger,
 	)
 
+	// Create callback accumulator for cross-subtree batching.
+	callbackAccumulator := store.NewCallbackAccumulatorStore(
+		asClient,
+		cfg.Aerospike.CallbackAccumulatorSet,
+		cfg.Aerospike.CallbackAccumulatorTTLSec,
+		cfg.Aerospike.MaxRetries,
+		cfg.Aerospike.RetryBaseMs,
+		logger,
+	)
+
 	// Create services.
 	apiServer := api.NewServer(cfg.API, regStore, urlRegistry, asClient, logger)
 	p2pClient := p2p.NewClient(cfg.P2P, subtreeProducer, blockProducer, logger)
 	subtreeProcessor := subtree.NewProcessor(cfg, regStore, seenStore, subtreeStore)
 	blockProcessor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, stumpsProducer, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
-	subtreeWorker := block.NewSubtreeWorkerService(cfg.Kafka, cfg.Block, cfg.DataHub, regStore, subtreeStore, urlRegistry, subtreeCounter, stumpCache, logger)
+	subtreeWorker := block.NewSubtreeWorkerService(cfg.Kafka, cfg.Block, cfg.DataHub, regStore, subtreeStore, urlRegistry, subtreeCounter, stumpCache, callbackAccumulator, logger)
 	callbackDedupStore := store.NewCallbackDedupStore(
 		asClient,
 		cfg.Aerospike.CallbackDedupSet,

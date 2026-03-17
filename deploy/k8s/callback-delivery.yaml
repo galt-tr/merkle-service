@@ -5,6 +5,18 @@
 # on callback delivery throughput needs — more replicas = more concurrent
 # HTTP callbacks. The local LRU cache reduces Aerospike reads when multiple
 # workers resolve the same StumpRef.
+#
+# IMPORTANT: Ensure the stumps topic has at least as many partitions as
+# desired replicas. With N partitions, only N replicas will be active.
+# Extra replicas sit idle as standby.
+#
+# Messages are hash-partitioned by callback URL, so each delivery pod
+# handles a consistent subset of callback endpoints, enabling efficient
+# HTTP connection reuse.
+#
+# The delivery service supports batched StumpsMessages with multiple
+# StumpRefs (from cross-subtree accumulation). It resolves all referenced
+# STUMPs from the Aerospike cache before HTTP delivery.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

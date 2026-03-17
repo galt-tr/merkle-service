@@ -34,10 +34,12 @@ kubectl apply -f api-server.yaml
 P2P Client (1 pod) → Kafka → Block Processor (1 pod) → subtree-work topic
                                                               ↓
                                               Subtree Workers (16-256 pods)
+                                                       ↓              ↓
+                                            Aerospike STUMP cache   Aerospike callback_accum
+                                                       ↓              ↓
+                                                    stumps topic (batched per callback URL)
                                                               ↓
-                                                   Aerospike STUMP cache
-                                                              ↓
-                                              stumps topic → Callback Delivery (4+ pods)
+                                              Callback Delivery (4+ pods, consumer group)
                                                               ↓
                                                         HTTP callbacks
 ```
@@ -51,6 +53,34 @@ P2P Client (1 pod) → Kafka → Block Processor (1 pod) → subtree-work topic
 | `subtree-worker` | 16 | subtree-work topic partitions | Main scaling lever. Set topic partitions >= max replicas. |
 | `callback-delivery` | 4 | stumps topic partitions | Scale based on callback throughput needs. |
 | `api-server` | 2 | unlimited (stateless) | Handles `/watch` registrations and `/health`. |
+
+## Callback Batching and Horizontal Scaling
+
+Subtree workers accumulate callback data across subtrees in Aerospike
+(`callback_accum` set). When all subtrees for a block are processed, the last
+worker flushes one batched `StumpsMessage` per callback URL to the `stumps`
+topic. This reduces Kafka message volume from `subtrees × callbacks` down to
+just `callbacks`.
+
+The delivery service instances form a Kafka consumer group on the `stumps`
+topic. Messages are hash-partitioned by callback URL, so each delivery pod
+handles a consistent subset of endpoints for efficient HTTP connection reuse.
+
+**Scaling delivery pods:** increase the `stumps` topic partition count to match
+the desired replica count:
+
+```bash
+# Increase stumps topic partitions
+kafka-topics.sh --alter --topic stumps --partitions 16 --bootstrap-server kafka:9092
+
+# Scale delivery pods to match
+kubectl scale deployment callback-delivery -n merkle-service --replicas=16
+```
+
+**Validated performance** (scale test with 1M block txids, 100 callback URLs):
+- Batching reduces MINED Kafka messages from ~24,400 to ~100 per block
+- Delivery throughput: ~92,000 txids/sec with 2 delivery instances
+- All callbacks delivered correctly with no loss or unexpected duplicates
 
 ## Scaling Subtree Workers
 
@@ -81,6 +111,8 @@ Override any config value via environment variables. Key settings for K8s:
 | `AEROSPIKE_PORT` | `3000` | Aerospike client port |
 | `AEROSPIKE_NAMESPACE` | `merkle` | Aerospike namespace |
 | `AEROSPIKE_STUMP_CACHE_SET` | `stump_cache` | Aerospike set for distributed STUMP cache |
+| `AEROSPIKE_CALLBACK_ACCUMULATOR_SET` | `callback_accum` | Aerospike set for cross-subtree callback batching |
+| `AEROSPIKE_CALLBACK_ACCUMULATOR_TTL_SEC` | `600` | TTL for accumulator records (match subtree counter TTL) |
 | `KAFKA_BROKERS` | `localhost:9092` | Comma-separated Kafka broker list |
 | `KAFKA_SUBTREE_WORK_TOPIC` | `subtree-work` | Topic for subtree work fan-out |
 | `KAFKA_CONSUMER_GROUP` | `merkle-service` | Kafka consumer group ID |

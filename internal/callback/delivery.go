@@ -288,16 +288,17 @@ func (d *DeliveryService) processDelivery(stumpsMsg *kafka.StumpsMessage) {
 		"retryCount", stumpsMsg.RetryCount,
 	)
 
-	// Resolve STUMP data: inline StumpData takes priority, then StumpRef via cache.
-	var resolvedStumpData []byte
+	// Resolve STUMP data: inline StumpData takes priority, then StumpRefs (plural), then StumpRef (singular).
+	var resolvedStumpDataList [][]byte
 	if len(stumpsMsg.StumpData) > 0 {
-		resolvedStumpData = stumpsMsg.StumpData
-	} else if stumpsMsg.StumpRef != "" {
-		if d.stumpCache != nil {
-			data, ok, _ := d.stumpCache.Get(stumpsMsg.StumpRef, stumpsMsg.BlockHash)
+		resolvedStumpDataList = [][]byte{stumpsMsg.StumpData}
+	} else if len(stumpsMsg.StumpRefs) > 0 && d.stumpCache != nil {
+		// Batched message — resolve all StumpRefs.
+		for _, ref := range stumpsMsg.StumpRefs {
+			data, ok, _ := d.stumpCache.Get(ref, stumpsMsg.BlockHash)
 			if !ok {
-				d.Logger.Warn("stump cache miss for StumpRef, re-enqueuing for retry",
-					"stumpRef", stumpsMsg.StumpRef,
+				d.Logger.Warn("stump cache miss for StumpRef in batch, re-enqueuing for retry",
+					"stumpRef", ref,
 					"blockHash", stumpsMsg.BlockHash,
 					"callbackUrl", stumpsMsg.CallbackURL,
 				)
@@ -310,8 +311,27 @@ func (d *DeliveryService) processDelivery(stumpsMsg *kafka.StumpsMessage) {
 				}
 				return
 			}
-			resolvedStumpData = data
+			resolvedStumpDataList = append(resolvedStumpDataList, data)
 		}
+	} else if stumpsMsg.StumpRef != "" && d.stumpCache != nil {
+		// Single StumpRef — backward compatible.
+		data, ok, _ := d.stumpCache.Get(stumpsMsg.StumpRef, stumpsMsg.BlockHash)
+		if !ok {
+			d.Logger.Warn("stump cache miss for StumpRef, re-enqueuing for retry",
+				"stumpRef", stumpsMsg.StumpRef,
+				"blockHash", stumpsMsg.BlockHash,
+				"callbackUrl", stumpsMsg.CallbackURL,
+			)
+			stumpsMsg.RetryCount++
+			backoffSec := d.cfg.Callback.BackoffBaseSec * stumpsMsg.RetryCount
+			stumpsMsg.NextRetryAt = time.Now().Add(time.Duration(backoffSec) * time.Second)
+			d.messagesRetried.Add(1)
+			if err := d.reenqueue(stumpsMsg); err != nil {
+				d.Logger.Error("failed to reenqueue after cache miss", "error", err)
+			}
+			return
+		}
+		resolvedStumpDataList = [][]byte{data}
 	}
 
 	// Check callback dedup — skip if already delivered.
@@ -334,7 +354,7 @@ func (d *DeliveryService) processDelivery(stumpsMsg *kafka.StumpsMessage) {
 	}
 
 	// Attempt HTTP POST delivery.
-	err := d.deliverCallback(context.Background(), stumpsMsg, resolvedStumpData)
+	err := d.deliverCallback(context.Background(), stumpsMsg, resolvedStumpDataList)
 	if err == nil {
 		// Record successful delivery for dedup.
 		if d.dedupStore != nil {
@@ -398,7 +418,7 @@ func (d *DeliveryService) processDelivery(stumpsMsg *kafka.StumpsMessage) {
 }
 
 // deliverCallback makes an HTTP POST to the callback URL with the appropriate payload.
-func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.StumpsMessage, stumpData []byte) error {
+func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.StumpsMessage, stumpDataList [][]byte) error {
 	payload := callbackPayload{
 		TxID:      msg.TxID,
 		TxIDs:     msg.TxIDs,
@@ -406,9 +426,21 @@ func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.Stumps
 		BlockHash: msg.BlockHash,
 	}
 
-	// Encode stump data as base64 if present.
-	if len(stumpData) > 0 {
-		payload.StumpData = base64.StdEncoding.EncodeToString(stumpData)
+	// Encode stump data as base64. For batched messages with multiple STUMPs,
+	// concatenate all STUMP binaries before encoding (the BRC-0074 format is
+	// self-delimiting, so concatenation is safe for receivers that parse sequentially).
+	if len(stumpDataList) == 1 {
+		payload.StumpData = base64.StdEncoding.EncodeToString(stumpDataList[0])
+	} else if len(stumpDataList) > 1 {
+		totalSize := 0
+		for _, d := range stumpDataList {
+			totalSize += len(d)
+		}
+		combined := make([]byte, 0, totalSize)
+		for _, d := range stumpDataList {
+			combined = append(combined, d...)
+		}
+		payload.StumpData = base64.StdEncoding.EncodeToString(combined)
 	}
 
 	body, err := json.Marshal(payload)

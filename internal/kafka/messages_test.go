@@ -137,6 +137,66 @@ func TestStumpsMessage_EncodeDecode(t *testing.T) {
 	}
 }
 
+func TestStumpsMessage_StumpRefs_EncodeDecode(t *testing.T) {
+	msg := &StumpsMessage{
+		CallbackURL: "https://example.com/cb",
+		TxIDs:       []string{"txid1", "txid2", "txid3"},
+		StumpRefs:   []string{"subtree-hash-a", "subtree-hash-b"},
+		StatusType:  StatusMined,
+		BlockHash:   "blockhash123",
+	}
+
+	data, err := msg.Encode()
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+
+	decoded, err := DecodeStumpsMessage(data)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+
+	if len(decoded.StumpRefs) != 2 {
+		t.Fatalf("expected 2 StumpRefs, got %d", len(decoded.StumpRefs))
+	}
+	if decoded.StumpRefs[0] != "subtree-hash-a" || decoded.StumpRefs[1] != "subtree-hash-b" {
+		t.Errorf("StumpRefs mismatch: got %v", decoded.StumpRefs)
+	}
+	if len(decoded.TxIDs) != 3 {
+		t.Errorf("expected 3 TxIDs, got %d", len(decoded.TxIDs))
+	}
+	if decoded.StumpRef != "" {
+		t.Errorf("expected empty singular StumpRef, got %s", decoded.StumpRef)
+	}
+}
+
+func TestStumpsMessage_SingularStumpRef_EncodeDecode(t *testing.T) {
+	msg := &StumpsMessage{
+		CallbackURL: "https://example.com/cb",
+		TxIDs:       []string{"txid1"},
+		StumpRef:    "subtree-hash-single",
+		StatusType:  StatusMined,
+		BlockHash:   "blockhash456",
+	}
+
+	data, err := msg.Encode()
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+
+	decoded, err := DecodeStumpsMessage(data)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+
+	if decoded.StumpRef != "subtree-hash-single" {
+		t.Errorf("StumpRef mismatch: got %s", decoded.StumpRef)
+	}
+	if len(decoded.StumpRefs) != 0 {
+		t.Errorf("expected empty StumpRefs, got %v", decoded.StumpRefs)
+	}
+}
+
 func TestBlockProcessedMessage_EncodeDecode(t *testing.T) {
 	msg := &StumpsMessage{
 		CallbackURL: "https://arcade.example.com/callback",

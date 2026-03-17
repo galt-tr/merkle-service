@@ -37,8 +37,10 @@ type AerospikeConfig struct {
 	CallbackURLRegistry   string `yaml:"callbackUrlRegistry"   mapstructure:"callbackurlregistry"`
 	SubtreeCounterSet     string `yaml:"subtreeCounterSet"     mapstructure:"subtreecounterset"`
 	SubtreeCounterTTLSec  int    `yaml:"subtreeCounterTTLSec"  mapstructure:"subtreecounterttlsec"`
-	StumpCacheSet         string `yaml:"stumpCacheSet"         mapstructure:"stumpcacheset"`
-	MaxRetries            int    `yaml:"maxRetries"            mapstructure:"maxretries"`
+	StumpCacheSet             string `yaml:"stumpCacheSet"             mapstructure:"stumpcacheset"`
+	CallbackAccumulatorSet    string `yaml:"callbackAccumulatorSet"    mapstructure:"callbackaccumulatorset"`
+	CallbackAccumulatorTTLSec int    `yaml:"callbackAccumulatorTTLSec" mapstructure:"callbackaccumulatorttlsec"`
+	MaxRetries                int    `yaml:"maxRetries"                mapstructure:"maxretries"`
 	RetryBaseMs           int    `yaml:"retryBaseMs"           mapstructure:"retrybasems"`
 }
 
@@ -119,6 +121,8 @@ func registerDefaults(v *viper.Viper) {
 	v.SetDefault("aerospike.subtreecounterset", "subtree_counters")
 	v.SetDefault("aerospike.subtreecounterttlsec", 600)
 	v.SetDefault("aerospike.stumpcacheset", "stump_cache")
+	v.SetDefault("aerospike.callbackaccumulatorset", "callback_accum")
+	v.SetDefault("aerospike.callbackaccumulatorttlsec", 600)
 	v.SetDefault("aerospike.maxretries", 3)
 	v.SetDefault("aerospike.retrybasems", 100)
 
@@ -192,7 +196,9 @@ func bindEnvVars(v *viper.Viper) {
 		"aerospike.callbackurlregistry": "AEROSPIKE_CALLBACK_URL_REGISTRY",
 		"aerospike.subtreecounterset":    "AEROSPIKE_SUBTREE_COUNTER_SET",
 		"aerospike.subtreecounterttlsec": "AEROSPIKE_SUBTREE_COUNTER_TTL_SEC",
-		"aerospike.stumpcacheset":        "AEROSPIKE_STUMP_CACHE_SET",
+		"aerospike.stumpcacheset":             "AEROSPIKE_STUMP_CACHE_SET",
+		"aerospike.callbackaccumulatorset":    "AEROSPIKE_CALLBACK_ACCUMULATOR_SET",
+		"aerospike.callbackaccumulatorttlsec": "AEROSPIKE_CALLBACK_ACCUMULATOR_TTL_SEC",
 		"aerospike.maxretries":           "AEROSPIKE_MAX_RETRIES",
 		"aerospike.retrybasems":          "AEROSPIKE_RETRY_BASE_MS",
 

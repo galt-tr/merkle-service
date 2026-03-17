@@ -29,9 +29,10 @@ type SubtreeWorkerService struct {
 	regStore       *store.RegistrationStore
 	subtreeStore   *store.SubtreeStore
 	urlRegistry    *store.CallbackURLRegistry
-	subtreeCounter *store.SubtreeCounterStore
-	stumpCache     store.StumpCache
-	dataHubClient  *datahub.Client
+	subtreeCounter      *store.SubtreeCounterStore
+	stumpCache          store.StumpCache
+	callbackAccumulator *store.CallbackAccumulatorStore
+	dataHubClient       *datahub.Client
 }
 
 func NewSubtreeWorkerService(
@@ -43,17 +44,19 @@ func NewSubtreeWorkerService(
 	urlRegistry *store.CallbackURLRegistry,
 	subtreeCounter *store.SubtreeCounterStore,
 	stumpCache store.StumpCache,
+	callbackAccumulator *store.CallbackAccumulatorStore,
 	logger *slog.Logger,
 ) *SubtreeWorkerService {
 	s := &SubtreeWorkerService{
-		kafkaCfg:       kafkaCfg,
-		blockCfg:       blockCfg,
-		datahubCfg:     datahubCfg,
-		regStore:       regStore,
-		subtreeStore:   subtreeStore,
-		urlRegistry:    urlRegistry,
-		subtreeCounter: subtreeCounter,
-		stumpCache:     stumpCache,
+		kafkaCfg:            kafkaCfg,
+		blockCfg:            blockCfg,
+		datahubCfg:          datahubCfg,
+		regStore:            regStore,
+		subtreeStore:        subtreeStore,
+		urlRegistry:         urlRegistry,
+		subtreeCounter:      subtreeCounter,
+		stumpCache:          stumpCache,
+		callbackAccumulator: callbackAccumulator,
 	}
 	s.InitBase("subtree-worker")
 	if logger != nil {
@@ -143,7 +146,7 @@ func (s *SubtreeWorkerService) handleMessage(ctx context.Context, msg *sarama.Co
 	)
 
 	// Process the subtree using the existing logic, with STUMP cache for StumpRef.
-	_, err = ProcessBlockSubtree(
+	result, err := ProcessBlockSubtree(
 		ctx,
 		workMsg.SubtreeHash,
 		uint64(workMsg.BlockHeight),
@@ -152,7 +155,6 @@ func (s *SubtreeWorkerService) handleMessage(ctx context.Context, msg *sarama.Co
 		s.dataHubClient,
 		s.subtreeStore,
 		s.regStore,
-		s.stumpsProducer,
 		s.blockCfg.PostMineTTLSec,
 		s.Logger,
 		s.stumpCache,
@@ -167,7 +169,24 @@ func (s *SubtreeWorkerService) handleMessage(ctx context.Context, msg *sarama.Co
 		// can still fire. The subtree processing failure is logged.
 	}
 
-	// Decrement the subtree counter. If it reaches zero, emit BLOCK_PROCESSED.
+	// Accumulate callback data for batched publishing (or publish individually if no accumulator).
+	if result != nil && len(result.CallbackGroups) > 0 {
+		if s.callbackAccumulator != nil {
+			for callbackURL, txids := range result.CallbackGroups {
+				if err := s.callbackAccumulator.Append(workMsg.BlockHash, callbackURL, txids, result.SubtreeHash); err != nil {
+					s.Logger.Error("failed to append to callback accumulator",
+						"blockHash", workMsg.BlockHash,
+						"callbackURL", callbackURL,
+						"error", err,
+					)
+				}
+			}
+		} else {
+			s.publishIndividualCallbacks(workMsg, result)
+		}
+	}
+
+	// Decrement the subtree counter. If it reaches zero, flush batched callbacks and emit BLOCK_PROCESSED.
 	if s.subtreeCounter != nil {
 		remaining, err := s.subtreeCounter.Decrement(workMsg.BlockHash)
 		if err != nil {
@@ -176,11 +195,76 @@ func (s *SubtreeWorkerService) handleMessage(ctx context.Context, msg *sarama.Co
 				"error", err,
 			)
 		} else if remaining == 0 {
+			s.flushBatchedCallbacks(workMsg.BlockHash)
 			s.emitBlockProcessed(workMsg.BlockHash)
 		}
 	}
 
 	return nil
+}
+
+// publishIndividualCallbacks publishes one StumpsMessage per callback URL (non-batched fallback).
+func (s *SubtreeWorkerService) publishIndividualCallbacks(workMsg *kafka.SubtreeWorkMessage, result *SubtreeResult) {
+	for callbackURL, txids := range result.CallbackGroups {
+		msg := &kafka.StumpsMessage{
+			CallbackURL: callbackURL,
+			TxIDs:       txids,
+			StatusType:  kafka.StatusMined,
+			BlockHash:   workMsg.BlockHash,
+			SubtreeID:   result.SubtreeHash,
+			StumpRef:    result.SubtreeHash,
+		}
+		data, err := msg.Encode()
+		if err != nil {
+			s.Logger.Error("failed to encode MINED stumps message",
+				"callbackURL", callbackURL, "error", err)
+			continue
+		}
+		if err := s.stumpsProducer.PublishWithHashKey(callbackURL, data); err != nil {
+			s.Logger.Error("failed to publish MINED callback",
+				"callbackURL", callbackURL, "error", err)
+		}
+	}
+}
+
+// flushBatchedCallbacks reads all accumulated callback data for a block and publishes
+// one batched StumpsMessage per callback URL.
+func (s *SubtreeWorkerService) flushBatchedCallbacks(blockHash string) {
+	if s.callbackAccumulator == nil {
+		return
+	}
+
+	accumulated, err := s.callbackAccumulator.ReadAndDelete(blockHash)
+	if err != nil {
+		s.Logger.Error("failed to read callback accumulator",
+			"blockHash", blockHash, "error", err)
+		return
+	}
+
+	for callbackURL, acc := range accumulated {
+		msg := &kafka.StumpsMessage{
+			CallbackURL: callbackURL,
+			TxIDs:       acc.TxIDs,
+			StumpRefs:   acc.StumpRefs,
+			StatusType:  kafka.StatusMined,
+			BlockHash:   blockHash,
+		}
+		data, err := msg.Encode()
+		if err != nil {
+			s.Logger.Error("failed to encode batched MINED message",
+				"callbackURL", callbackURL, "error", err)
+			continue
+		}
+		if err := s.stumpsProducer.PublishWithHashKey(callbackURL, data); err != nil {
+			s.Logger.Error("failed to publish batched MINED callback",
+				"callbackURL", callbackURL, "error", err)
+		}
+	}
+
+	s.Logger.Info("flushed batched callbacks",
+		"blockHash", blockHash,
+		"callbackURLs", len(accumulated),
+	)
 }
 
 // emitBlockProcessed publishes a BLOCK_PROCESSED message to every registered callback URL.

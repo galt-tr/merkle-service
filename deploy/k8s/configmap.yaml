@@ -21,7 +21,9 @@ data:
       callbackDedupSet: callback_dedup
       subtreeCounterSet: subtree_counters
       stumpCacheSet: stump_cache
+      callbackAccumulatorSet: callback_accum
       subtreeCounterTTLSec: 600
+      callbackAccumulatorTTLSec: 600
       maxRetries: 3
       retryBaseMs: 100
 
