@@ -2,7 +2,6 @@ package datahub
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/model"
 )
 
 // Client fetches subtree and block data from Teranode DataHub endpoints.
@@ -108,34 +108,23 @@ func ParseRawNodes(data []byte) ([]subtreepkg.Node, error) {
 	return nodes, nil
 }
 
-// ParseBinaryBlockMetadata decodes the Teranode DataHub binary block response.
-// Format: 4-byte uint32 LE height, 4-byte uint32 LE subtree count, N×32-byte subtree hashes.
+// ParseBinaryBlockMetadata decodes the Teranode DataHub binary block response
+// using the full model.Block binary format.
 func ParseBinaryBlockMetadata(data []byte) (*BlockMetadata, error) {
-	if len(data) < 8 {
-		return nil, fmt.Errorf("binary block metadata too short: %d bytes (need at least 8)", len(data))
-	}
-	if (len(data)-8)%chainhash.HashSize != 0 {
-		return nil, fmt.Errorf("binary block metadata has invalid subtree data length: %d bytes after header is not a multiple of %d", len(data)-8, chainhash.HashSize)
+	block, err := model.NewBlockFromBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf("parsing block binary: %w", err)
 	}
 
-	height := binary.LittleEndian.Uint32(data[0:4])
-	subtreeCount := binary.LittleEndian.Uint32(data[4:8])
-	actualCount := uint32((len(data) - 8) / chainhash.HashSize)
-	if actualCount != subtreeCount {
-		return nil, fmt.Errorf("binary block metadata subtree count mismatch: header declares %d but data contains %d", subtreeCount, actualCount)
-	}
-
-	subtrees := make([]string, subtreeCount)
-	for i := uint32(0); i < subtreeCount; i++ {
-		offset := 8 + int(i)*chainhash.HashSize
-		var h chainhash.Hash
-		copy(h[:], data[offset:offset+chainhash.HashSize])
+	subtrees := make([]string, len(block.Subtrees))
+	for i, h := range block.Subtrees {
 		subtrees[i] = h.String()
 	}
 
 	return &BlockMetadata{
-		Height:   height,
-		Subtrees: subtrees,
+		Height:           block.Height,
+		Subtrees:         subtrees,
+		TransactionCount: block.TransactionCount,
 	}, nil
 }
 

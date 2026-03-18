@@ -2,28 +2,46 @@ package datahub
 
 import (
 	"context"
-	"encoding/binary"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
 )
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// buildBinaryBlockBytes creates a DataHub-format binary block payload.
+// buildBinaryBlockBytes creates a teranode model.Block binary payload.
 // height is the block height, hashes is a slice of 32-byte subtree hashes.
 func buildBinaryBlockBytes(height uint32, hashes [][]byte) []byte {
-	data := make([]byte, 8+len(hashes)*32)
-	binary.LittleEndian.PutUint32(data[0:4], height)
-	binary.LittleEndian.PutUint32(data[4:8], uint32(len(hashes)))
-	for i, h := range hashes {
-		copy(data[8+i*32:], h)
+	header := &model.BlockHeader{
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
 	}
+
+	subtrees := make([]*chainhash.Hash, len(hashes))
+	for i, h := range hashes {
+		hash := &chainhash.Hash{}
+		copy(hash[:], h)
+		subtrees[i] = hash
+	}
+
+	block, err := model.NewBlock(header, nil, subtrees, 0, 0, height, 0)
+	if err != nil {
+		panic("buildBinaryBlockBytes NewBlock: " + err.Error())
+	}
+
+	data, err := block.Bytes()
+	if err != nil {
+		panic("buildBinaryBlockBytes Bytes: " + err.Error())
+	}
+
 	return data
 }
 
@@ -166,19 +184,16 @@ func TestParseBinaryBlockMetadata_EmptySubtrees(t *testing.T) {
 func TestParseBinaryBlockMetadata_TooShort(t *testing.T) {
 	_, err := ParseBinaryBlockMetadata([]byte{0x01, 0x02, 0x03})
 	if err == nil {
-		t.Fatal("expected error for payload shorter than 8 bytes")
+		t.Fatal("expected error for payload too small to be a block")
 	}
 }
 
-func TestParseBinaryBlockMetadata_LengthMismatch(t *testing.T) {
-	// Declare 3 subtrees but only provide 2 hashes worth of data.
-	data := make([]byte, 8+2*32)
-	binary.LittleEndian.PutUint32(data[0:4], 100)  // height
-	binary.LittleEndian.PutUint32(data[4:8], 3)    // claims 3 subtrees
-	// Only 2×32 bytes follow — mismatch detected by length check.
-	_, err := ParseBinaryBlockMetadata(data)
+func TestParseBinaryBlockMetadata_Truncated(t *testing.T) {
+	// Build a valid block binary and truncate by one byte to trigger a parse error.
+	full := buildBinaryBlockBytes(100, [][]byte{make([]byte, 32)})
+	_, err := ParseBinaryBlockMetadata(full[:len(full)-1])
 	if err == nil {
-		t.Fatal("expected error for subtree count mismatch")
+		t.Fatal("expected error for truncated block data")
 	}
 }
 
