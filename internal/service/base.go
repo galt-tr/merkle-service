@@ -17,12 +17,20 @@ type BaseService struct {
 	started bool
 }
 
+// NewLogger creates a JSON slog.Logger at the given level writing to stdout.
+func NewLogger(level slog.Level) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+	}))
+}
+
 // InitBase sets up the logger and context for the service.
+// If a logger has already been set (e.g. by the entrypoint), it is preserved.
 func (b *BaseService) InitBase(name string) {
 	b.Name = name
-	b.Logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	})).With("service", name)
+	if b.Logger == nil {
+		b.Logger = NewLogger(slog.LevelInfo).With("service", name)
+	}
 	b.ctx, b.cancel = context.WithCancel(context.Background())
 	b.started = false
 }

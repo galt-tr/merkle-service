@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log"
-	"log/slog"
 
 	"github.com/bsv-blockchain/merkle-service/internal/block"
 	"github.com/bsv-blockchain/merkle-service/internal/config"
@@ -12,13 +11,13 @@ import (
 )
 
 func main() {
-	logger := slog.Default()
-
 	// Load configuration.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal("failed to load config: ", err)
 	}
+
+	logger := service.NewLogger(config.ParseLogLevel(cfg.LogLevel))
 
 	// Create Aerospike client.
 	asClient, err := store.NewAerospikeClient(

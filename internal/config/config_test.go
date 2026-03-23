@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"testing"
 )
@@ -11,7 +12,7 @@ func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	envVars := []string{
 		"CONFIG_FILE",
-		"MODE",
+		"MODE", "LOG_LEVEL",
 		"API_PORT",
 		"AEROSPIKE_HOST", "AEROSPIKE_PORT", "AEROSPIKE_NAMESPACE",
 		"AEROSPIKE_SET", "AEROSPIKE_SEEN_SET",
@@ -332,5 +333,67 @@ func TestLoad_P2PDHTModeEnvOverride(t *testing.T) {
 
 	if cfg.P2P.MsgBus.DHTMode != "server" {
 		t.Errorf("P2P.MsgBus.DHTMode: expected %q via env, got %q", "server", cfg.P2P.MsgBus.DHTMode)
+	}
+}
+
+func TestLoad_LogLevelDefault(t *testing.T) {
+	clearConfigEnv(t)
+	os.Setenv("CONFIG_FILE", "/tmp/nonexistent-config-file.yaml")
+	defer os.Unsetenv("CONFIG_FILE")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+
+	if cfg.LogLevel != "info" {
+		t.Errorf("LogLevel: expected %q, got %q", "info", cfg.LogLevel)
+	}
+}
+
+func TestLoad_LogLevelEnvOverride(t *testing.T) {
+	clearConfigEnv(t)
+	os.Setenv("CONFIG_FILE", "/tmp/nonexistent-config-file.yaml")
+	os.Setenv("LOG_LEVEL", "debug")
+	defer func() {
+		os.Unsetenv("CONFIG_FILE")
+		os.Unsetenv("LOG_LEVEL")
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+
+	if cfg.LogLevel != "debug" {
+		t.Errorf("LogLevel: expected %q, got %q", "debug", cfg.LogLevel)
+	}
+}
+
+func TestParseLogLevel(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected slog.Level
+	}{
+		{"debug", slog.LevelDebug},
+		{"DEBUG", slog.LevelDebug},
+		{"info", slog.LevelInfo},
+		{"INFO", slog.LevelInfo},
+		{"warn", slog.LevelWarn},
+		{"warning", slog.LevelWarn},
+		{"error", slog.LevelError},
+		{"ERROR", slog.LevelError},
+		{"", slog.LevelInfo},
+		{"invalid", slog.LevelInfo},
+		{"  debug  ", slog.LevelDebug},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := ParseLogLevel(tt.input)
+			if got != tt.expected {
+				t.Errorf("ParseLogLevel(%q): expected %v, got %v", tt.input, tt.expected, got)
+			}
+		})
 	}
 }

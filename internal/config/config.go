@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -10,6 +12,7 @@ import (
 // Config holds all configuration for the merkle-service.
 type Config struct {
 	Mode      string          `yaml:"mode"      mapstructure:"mode"`
+	LogLevel  string          `yaml:"logLevel"  mapstructure:"loglevel"`
 	API       APIConfig       `yaml:"api"       mapstructure:"api"`
 	Aerospike AerospikeConfig `yaml:"aerospike" mapstructure:"aerospike"`
 	Kafka     KafkaConfig     `yaml:"kafka"     mapstructure:"kafka"`
@@ -115,6 +118,7 @@ type DataHubConfig struct {
 func registerDefaults(v *viper.Viper) {
 	// General
 	v.SetDefault("mode", "all-in-one")
+	v.SetDefault("loglevel", "info")
 
 	// API
 	v.SetDefault("api.port", 8080)
@@ -190,7 +194,8 @@ func bindEnvVars(v *viper.Viper) {
 
 	bindings := map[string]string{
 		// General
-		"mode": "MODE",
+		"mode":     "MODE",
+		"loglevel": "LOG_LEVEL",
 
 		// API
 		"api.port": "API_PORT",
@@ -305,4 +310,22 @@ func Load() (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// ParseLogLevel converts a log level string to slog.Level.
+// Supports "debug", "info", "warn", "error" (case-insensitive).
+// Returns slog.LevelInfo for unrecognized values.
+func ParseLogLevel(level string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }

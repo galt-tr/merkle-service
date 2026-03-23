@@ -17,6 +17,11 @@
 # Env: MODE
 mode: all-in-one
 
+# Log level. Controls minimum severity for all service loggers.
+# Valid values: debug, info, warn, error
+# Env: LOG_LEVEL
+logLevel: info
+
 # ---------------------------------------------------------------------------
 # API Server
 # ---------------------------------------------------------------------------

@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"log"
-	"log/slog"
-
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
 	"github.com/bsv-blockchain/merkle-service/internal/p2p"
@@ -12,13 +10,13 @@ import (
 )
 
 func main() {
-	logger := slog.Default()
-
 	// Load configuration.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal("failed to load config: ", err)
 	}
+
+	logger := service.NewLogger(config.ParseLogLevel(cfg.LogLevel))
 
 	// Create Kafka producers for subtree and block topics.
 	subtreeProducer, err := kafka.NewProducer(cfg.Kafka.Brokers, cfg.Kafka.SubtreeTopic, logger)

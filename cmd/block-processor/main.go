@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log"
-	"log/slog"
 
 	"github.com/bsv-blockchain/merkle-service/internal/block"
 	"github.com/bsv-blockchain/merkle-service/internal/config"
@@ -12,13 +11,13 @@ import (
 )
 
 func main() {
-	logger := slog.Default()
-
 	// Load configuration.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal("failed to load config: ", err)
 	}
+
+	logger := service.NewLogger(config.ParseLogLevel(cfg.LogLevel))
 
 	// Create Aerospike client.
 	asClient, err := store.NewAerospikeClient(
@@ -61,8 +60,17 @@ func main() {
 		logger,
 	)
 
+	subtreeCounter := store.NewSubtreeCounterStore(
+		asClient,
+		cfg.Aerospike.SubtreeCounterSet,
+		cfg.Aerospike.SubtreeCounterTTLSec,
+		cfg.Aerospike.MaxRetries,
+		cfg.Aerospike.RetryBaseMs,
+		logger,
+	)
+
 	// Create, init, and start the block processor.
-	processor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, regStore, subtreeStore, urlRegistry, nil, logger)
+	processor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
 
 	if err := processor.Init(nil); err != nil {
 		log.Fatal("failed to init block processor: ", err)
