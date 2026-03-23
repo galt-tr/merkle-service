@@ -15,12 +15,14 @@ import (
 )
 
 // SubtreeResult holds the callback groups produced by processing a subtree.
-// The caller uses this to publish MINED messages (either individually or batched).
+// The caller uses this to publish STUMP callback messages.
 type SubtreeResult struct {
 	// CallbackGroups maps callbackURL → list of matched txids.
 	CallbackGroups map[string][]string
 	// SubtreeHash is the hash of the processed subtree.
 	SubtreeHash string
+	// StumpData is the serialized STUMP binary (BRC-0074 format).
+	StumpData []byte
 }
 
 // ProcessBlockSubtree processes a single subtree within a block: retrieves the
@@ -37,7 +39,6 @@ func ProcessBlockSubtree(
 	regStore *store.RegistrationStore,
 	postMineTTLSec int,
 	logger *slog.Logger,
-	stumpCache ...store.StumpCache,
 ) (*SubtreeResult, error) {
 	// 6.2: Retrieve subtree data from blob store, falling back to DataHub.
 	rawData, err := subtreeStore.GetSubtree(subtreeHash)
@@ -124,13 +125,6 @@ func ProcessBlockSubtree(
 	// 6.8: Encode STUMP to BRC-0074 binary.
 	stumpData := s.Encode()
 
-	// If a stump cache is provided, store the STUMP for later resolution via StumpRef.
-	if len(stumpCache) > 0 && stumpCache[0] != nil {
-		if err := stumpCache[0].Put(subtreeHash, blockHash, stumpData); err != nil {
-			logger.Warn("failed to write STUMP to cache", "subtreeHash", subtreeHash, "error", err)
-		}
-	}
-
 	// 6.9: Group txids by callback URL.
 	callbackGroups := stump.GroupByCallback(registrations)
 
@@ -155,5 +149,6 @@ func ProcessBlockSubtree(
 	return &SubtreeResult{
 		CallbackGroups: callbackGroups,
 		SubtreeHash:    subtreeHash,
+		StumpData:      stumpData,
 	}, nil
 }

@@ -302,6 +302,60 @@ func TestInit_Success(t *testing.T) {
 	}
 }
 
+// --- MsgBus config forwarding tests ---
+
+func TestInit_ZeroValueMsgBusSucceeds(t *testing.T) {
+	// Task 4.1: Init succeeds when MsgBus fields are zero-value (relying on config defaults).
+	// The existing TestInit_Success covers this, but this test makes the intent explicit.
+	client, _, _ := newTestClient(t)
+
+	err := client.Init(nil)
+	if err != nil {
+		t.Fatalf("expected no error with zero-value MsgBus config, got: %v", err)
+	}
+}
+
+func TestNewClient_MsgBusFieldsStored(t *testing.T) {
+	// Task 4.2: Verify P2PMsgBusConfig fields are stored on the client cfg so they will
+	// be forwarded into p2p.Config.MsgBus when Start() constructs the library config.
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mockSubtree := &mockSyncProducer{}
+	mockBlock := &mockSyncProducer{}
+
+	cfg := config.P2PConfig{
+		Network:     "test",
+		StoragePath: t.TempDir(),
+		MsgBus: config.P2PMsgBusConfig{
+			DHTMode:        "server",
+			Port:           9000,
+			MaxConnections: 50,
+			MinConnections: 40,
+			EnableNAT:      true,
+			EnableMDNS:     false,
+		},
+	}
+
+	client := NewClient(
+		cfg,
+		kafka.NewTestProducer(mockSubtree, "subtree", logger),
+		kafka.NewTestProducer(mockBlock, "block", logger),
+		logger,
+	)
+
+	if client.cfg.MsgBus.DHTMode != "server" {
+		t.Errorf("expected DHTMode %q, got %q", "server", client.cfg.MsgBus.DHTMode)
+	}
+	if client.cfg.MsgBus.Port != 9000 {
+		t.Errorf("expected Port 9000, got %d", client.cfg.MsgBus.Port)
+	}
+	if client.cfg.MsgBus.MaxConnections != 50 {
+		t.Errorf("expected MaxConnections 50, got %d", client.cfg.MsgBus.MaxConnections)
+	}
+	if !client.cfg.MsgBus.EnableNAT {
+		t.Error("expected EnableNAT true")
+	}
+}
+
 // --- Multiple messages test ---
 
 func TestHandleSubtreeMessage_MultipleMessages(t *testing.T) {

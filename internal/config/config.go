@@ -37,7 +37,6 @@ type AerospikeConfig struct {
 	CallbackURLRegistry   string `yaml:"callbackUrlRegistry"   mapstructure:"callbackurlregistry"`
 	SubtreeCounterSet     string `yaml:"subtreeCounterSet"     mapstructure:"subtreecounterset"`
 	SubtreeCounterTTLSec  int    `yaml:"subtreeCounterTTLSec"  mapstructure:"subtreecounterttlsec"`
-	StumpCacheSet             string `yaml:"stumpCacheSet"             mapstructure:"stumpcacheset"`
 	CallbackAccumulatorSet    string `yaml:"callbackAccumulatorSet"    mapstructure:"callbackaccumulatorset"`
 	CallbackAccumulatorTTLSec int    `yaml:"callbackAccumulatorTTLSec" mapstructure:"callbackaccumulatorttlsec"`
 	MaxRetries                int    `yaml:"maxRetries"                mapstructure:"maxretries"`
@@ -49,16 +48,29 @@ type KafkaConfig struct {
 	Brokers          []string `yaml:"brokers"          mapstructure:"brokers"`
 	SubtreeTopic     string   `yaml:"subtreeTopic"     mapstructure:"subtreetopic"`
 	BlockTopic       string   `yaml:"blockTopic"       mapstructure:"blocktopic"`
-	StumpsTopic      string   `yaml:"stumpsTopic"      mapstructure:"stumpstopic"`
-	StumpsDLQTopic   string   `yaml:"stumpsDlqTopic"   mapstructure:"stumpsdlqtopic"`
+	CallbackTopic    string   `yaml:"callbackTopic"    mapstructure:"callbacktopic"`
+	CallbackDLQTopic string   `yaml:"callbackDlqTopic" mapstructure:"callbackdlqtopic"`
 	SubtreeWorkTopic string   `yaml:"subtreeWorkTopic" mapstructure:"subtreeworktopic"`
 	ConsumerGroup    string   `yaml:"consumerGroup"    mapstructure:"consumergroup"`
 }
 
+// P2PMsgBusConfig holds configuration for the underlying libp2p message bus.
+type P2PMsgBusConfig struct {
+	DHTMode        string   `yaml:"dhtMode"        mapstructure:"dhtmode"`
+	Port           int      `yaml:"port"           mapstructure:"port"`
+	AnnounceAddrs  []string `yaml:"announceAddrs"  mapstructure:"announceaddrs"`
+	BootstrapPeers []string `yaml:"bootstrapPeers" mapstructure:"bootstrappeers"`
+	MaxConnections int      `yaml:"maxConnections" mapstructure:"maxconnections"`
+	MinConnections int      `yaml:"minConnections" mapstructure:"minconnections"`
+	EnableNAT      bool     `yaml:"enableNAT"      mapstructure:"enablenat"`
+	EnableMDNS     bool     `yaml:"enableMDNS"     mapstructure:"enablemdns"`
+}
+
 // P2PConfig holds peer-to-peer network configuration.
 type P2PConfig struct {
-	Network     string `yaml:"network"     mapstructure:"network"`
-	StoragePath string `yaml:"storagePath" mapstructure:"storagepath"`
+	Network     string          `yaml:"network"     mapstructure:"network"`
+	StoragePath string          `yaml:"storagePath" mapstructure:"storagepath"`
+	MsgBus      P2PMsgBusConfig `yaml:"msgbus"      mapstructure:"msgbus"`
 }
 
 // SubtreeConfig holds subtree processing configuration.
@@ -86,9 +98,6 @@ type CallbackConfig struct {
 	DeliveryWorkers     int `yaml:"deliveryWorkers"     mapstructure:"deliveryworkers"`
 	MaxConnsPerHost     int `yaml:"maxConnsPerHost"     mapstructure:"maxconnsperhost"`
 	MaxIdleConnsPerHost int `yaml:"maxIdleConnsPerHost" mapstructure:"maxidleconnsperhost"`
-	StumpCacheTTLSec    int    `yaml:"stumpCacheTTLSec"    mapstructure:"stumpcachettlsec"`
-	StumpCacheMode      string `yaml:"stumpCacheMode"      mapstructure:"stumpcachemode"`
-	StumpCacheLRUSize   int    `yaml:"stumpCacheLRUSize"   mapstructure:"stumpcachelrusize"`
 }
 
 // BlobStoreConfig holds blob store configuration.
@@ -120,7 +129,6 @@ func registerDefaults(v *viper.Viper) {
 	v.SetDefault("aerospike.callbackurlregistry", "callback_urls")
 	v.SetDefault("aerospike.subtreecounterset", "subtree_counters")
 	v.SetDefault("aerospike.subtreecounterttlsec", 600)
-	v.SetDefault("aerospike.stumpcacheset", "stump_cache")
 	v.SetDefault("aerospike.callbackaccumulatorset", "callback_accum")
 	v.SetDefault("aerospike.callbackaccumulatorttlsec", 600)
 	v.SetDefault("aerospike.maxretries", 3)
@@ -130,14 +138,18 @@ func registerDefaults(v *viper.Viper) {
 	v.SetDefault("kafka.brokers", []string{"localhost:9092"})
 	v.SetDefault("kafka.subtreetopic", "subtree")
 	v.SetDefault("kafka.blocktopic", "block")
-	v.SetDefault("kafka.stumpstopic", "stumps")
-	v.SetDefault("kafka.stumpsdlqtopic", "stumps-dlq")
+	v.SetDefault("kafka.callbacktopic", "callback")
+	v.SetDefault("kafka.callbackdlqtopic", "callback-dlq")
 	v.SetDefault("kafka.subtreeworktopic", "subtree-work")
 	v.SetDefault("kafka.consumergroup", "merkle-service")
 
 	// P2P
 	v.SetDefault("p2p.network", "main")
 	v.SetDefault("p2p.storagepath", "~/.merkle-service/p2p")
+	v.SetDefault("p2p.msgbus.dhtmode", "off")
+	v.SetDefault("p2p.msgbus.port", 9905)
+	v.SetDefault("p2p.msgbus.enablenat", false)
+	v.SetDefault("p2p.msgbus.enablemdns", false)
 
 	// Subtree
 	v.SetDefault("subtree.storagemode", "realtime")
@@ -159,9 +171,6 @@ func registerDefaults(v *viper.Viper) {
 	v.SetDefault("callback.deliveryworkers", 64)
 	v.SetDefault("callback.maxconnsperhost", 32)
 	v.SetDefault("callback.maxidleconnsperhost", 16)
-	v.SetDefault("callback.stumpcachettlsec", 300)
-	v.SetDefault("callback.stumpcachemode", "memory")
-	v.SetDefault("callback.stumpcachelrusize", 1024)
 
 	// BlobStore
 	v.SetDefault("blobstore.url", "file:///tmp/merkle-subtrees")
@@ -196,7 +205,6 @@ func bindEnvVars(v *viper.Viper) {
 		"aerospike.callbackurlregistry": "AEROSPIKE_CALLBACK_URL_REGISTRY",
 		"aerospike.subtreecounterset":    "AEROSPIKE_SUBTREE_COUNTER_SET",
 		"aerospike.subtreecounterttlsec": "AEROSPIKE_SUBTREE_COUNTER_TTL_SEC",
-		"aerospike.stumpcacheset":             "AEROSPIKE_STUMP_CACHE_SET",
 		"aerospike.callbackaccumulatorset":    "AEROSPIKE_CALLBACK_ACCUMULATOR_SET",
 		"aerospike.callbackaccumulatorttlsec": "AEROSPIKE_CALLBACK_ACCUMULATOR_TTL_SEC",
 		"aerospike.maxretries":           "AEROSPIKE_MAX_RETRIES",
@@ -206,14 +214,22 @@ func bindEnvVars(v *viper.Viper) {
 		"kafka.brokers":        "KAFKA_BROKERS",
 		"kafka.subtreetopic":   "KAFKA_SUBTREE_TOPIC",
 		"kafka.blocktopic":     "KAFKA_BLOCK_TOPIC",
-		"kafka.stumpstopic":    "KAFKA_STUMPS_TOPIC",
-		"kafka.stumpsdlqtopic":   "KAFKA_STUMPS_DLQ_TOPIC",
+		"kafka.callbacktopic":    "KAFKA_CALLBACK_TOPIC",
+		"kafka.callbackdlqtopic": "KAFKA_CALLBACK_DLQ_TOPIC",
 		"kafka.subtreeworktopic": "KAFKA_SUBTREE_WORK_TOPIC",
 		"kafka.consumergroup":    "KAFKA_CONSUMER_GROUP",
 
 		// P2P
 		"p2p.network":     "P2P_NETWORK",
 		"p2p.storagepath": "P2P_STORAGE_PATH",
+		"p2p.msgbus.dhtmode":        "P2P_DHT_MODE",
+		"p2p.msgbus.port":           "P2P_PORT",
+		"p2p.msgbus.announceaddrs":  "P2P_ANNOUNCE_ADDRS",
+		"p2p.msgbus.bootstrappeers": "P2P_BOOTSTRAP_PEERS",
+		"p2p.msgbus.maxconnections": "P2P_MAX_CONNECTIONS",
+		"p2p.msgbus.minconnections": "P2P_MIN_CONNECTIONS",
+		"p2p.msgbus.enablenat":      "P2P_ENABLE_NAT",
+		"p2p.msgbus.enablemdns":     "P2P_ENABLE_MDNS",
 
 		// Subtree
 		"subtree.storagemode": "SUBTREE_STORAGE_MODE",
@@ -235,9 +251,6 @@ func bindEnvVars(v *viper.Viper) {
 		"callback.deliveryworkers":     "CALLBACK_DELIVERY_WORKERS",
 		"callback.maxconnsperhost":     "CALLBACK_MAX_CONNS_PER_HOST",
 		"callback.maxidleconnsperhost": "CALLBACK_MAX_IDLE_CONNS_PER_HOST",
-		"callback.stumpcachettlsec":    "CALLBACK_STUMP_CACHE_TTL_SEC",
-		"callback.stumpcachemode":      "CALLBACK_STUMP_CACHE_MODE",
-		"callback.stumpcachelrusize":   "CALLBACK_STUMP_CACHE_LRU_SIZE",
 
 		// BlobStore
 		"blobstore.url": "BLOB_STORE_URL",

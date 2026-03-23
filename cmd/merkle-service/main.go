@@ -80,12 +80,6 @@ func main() {
 	}
 	defer blockProducer.Close()
 
-	stumpsProducer, err := kafka.NewProducer(cfg.Kafka.Brokers, cfg.Kafka.StumpsTopic, logger)
-	if err != nil {
-		log.Fatal("failed to create stumps producer: ", err)
-	}
-	defer stumpsProducer.Close()
-
 	urlRegistry := store.NewCallbackURLRegistry(
 		asClient,
 		cfg.Aerospike.CallbackURLRegistry,
@@ -93,21 +87,6 @@ func main() {
 		cfg.Aerospike.RetryBaseMs,
 		logger,
 	)
-
-	// Create shared STUMP cache (used by subtree worker and delivery service).
-	stumpCache, err := store.NewStumpCacheFromConfig(
-		cfg.Callback.StumpCacheMode,
-		asClient,
-		cfg.Aerospike.StumpCacheSet,
-		cfg.Callback.StumpCacheTTLSec,
-		cfg.Callback.StumpCacheLRUSize,
-		cfg.Aerospike.MaxRetries,
-		cfg.Aerospike.RetryBaseMs,
-	)
-	if err != nil {
-		log.Fatal("failed to create stump cache: ", err)
-	}
-	defer stumpCache.Close()
 
 	// Create subtree counter store for BLOCK_PROCESSED coordination.
 	subtreeCounter := store.NewSubtreeCounterStore(
@@ -119,22 +98,12 @@ func main() {
 		logger,
 	)
 
-	// Create callback accumulator for cross-subtree batching.
-	callbackAccumulator := store.NewCallbackAccumulatorStore(
-		asClient,
-		cfg.Aerospike.CallbackAccumulatorSet,
-		cfg.Aerospike.CallbackAccumulatorTTLSec,
-		cfg.Aerospike.MaxRetries,
-		cfg.Aerospike.RetryBaseMs,
-		logger,
-	)
-
 	// Create services.
 	apiServer := api.NewServer(cfg.API, regStore, urlRegistry, asClient, logger)
 	p2pClient := p2p.NewClient(cfg.P2P, subtreeProducer, blockProducer, logger)
 	subtreeFetcher := subtree.NewProcessor(cfg, regStore, seenStore, subtreeStore)
-	blockProcessor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, stumpsProducer, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
-	subtreeWorker := block.NewSubtreeWorkerService(cfg.Kafka, cfg.Block, cfg.DataHub, regStore, subtreeStore, urlRegistry, subtreeCounter, stumpCache, callbackAccumulator, logger)
+	blockProcessor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
+	subtreeWorker := block.NewSubtreeWorkerService(cfg.Kafka, cfg.Block, cfg.DataHub, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
 	callbackDedupStore := store.NewCallbackDedupStore(
 		asClient,
 		cfg.Aerospike.CallbackDedupSet,
@@ -142,7 +111,7 @@ func main() {
 		cfg.Aerospike.RetryBaseMs,
 		logger,
 	)
-	callbackDelivery := callback.NewDeliveryService(cfg, callbackDedupStore, stumpCache)
+	callbackDelivery := callback.NewDeliveryService(cfg, callbackDedupStore)
 
 	// Initialize all services.
 	services := []service.Service{apiServer, p2pClient, subtreeFetcher, blockProcessor, subtreeWorker, callbackDelivery}

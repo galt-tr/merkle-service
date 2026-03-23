@@ -39,19 +39,6 @@ func (m *mockSyncProducer) AddMessageToTxn(*sarama.ConsumerMessage, string, *str
 	return nil
 }
 
-func decodePublished(t *testing.T, pm *sarama.ProducerMessage) *kafka.StumpsMessage {
-	t.Helper()
-	val, err := pm.Value.Encode()
-	if err != nil {
-		t.Fatalf("failed to encode producer message value: %v", err)
-	}
-	msg, err := kafka.DecodeStumpsMessage(val)
-	if err != nil {
-		t.Fatalf("failed to decode stumps message: %v", err)
-	}
-	return msg
-}
-
 func decodeSubtreeWork(t *testing.T, pm *sarama.ProducerMessage) *kafka.SubtreeWorkMessage {
 	t.Helper()
 	val, err := pm.Value.Encode()
@@ -65,34 +52,31 @@ func decodeSubtreeWork(t *testing.T, pm *sarama.ProducerMessage) *kafka.SubtreeW
 	return &msg
 }
 
-func newTestProcessor(t *testing.T) (*Processor, *mockSyncProducer, *mockSyncProducer) {
+func newTestProcessor(t *testing.T) (*Processor, *mockSyncProducer) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	stumpsMock := &mockSyncProducer{}
-	stumpsProducer := kafka.NewTestProducer(stumpsMock, "stumps-test", logger)
 	workMock := &mockSyncProducer{}
 	workProducer := kafka.NewTestProducer(workMock, "subtree-work-test", logger)
 
 	p := &Processor{
-		stumpsProducer:      stumpsProducer,
 		subtreeWorkProducer: workProducer,
 	}
 	p.InitBase("block-processor-test")
 	p.Logger = logger
-	return p, stumpsMock, workMock
+	return p, workMock
 }
 
-// TestBlockProcessedMessage_CorrectFields verifies BLOCK_PROCESSED StumpsMessage
-// is constructed with the right fields (no TxID, no StumpData, correct StatusType).
+// TestBlockProcessedMessage_CorrectFields verifies BLOCK_PROCESSED CallbackTopicMessage
+// is constructed with the right fields (no TxID, no Stump, correct Type).
 func TestBlockProcessedMessage_CorrectFields(t *testing.T) {
-	msg := &kafka.StumpsMessage{
+	msg := &kafka.CallbackTopicMessage{
 		CallbackURL: "http://example.com/cb",
-		StatusType:  kafka.StatusBlockProcessed,
+		Type:        kafka.CallbackBlockProcessed,
 		BlockHash:   "blockhash-field-test",
 	}
 
-	if msg.StatusType != kafka.StatusBlockProcessed {
-		t.Errorf("expected StatusBlockProcessed, got %s", msg.StatusType)
+	if msg.Type != kafka.CallbackBlockProcessed {
+		t.Errorf("expected CallbackBlockProcessed, got %s", msg.Type)
 	}
 	if msg.BlockHash != "blockhash-field-test" {
 		t.Errorf("expected blockhash-field-test, got %s", msg.BlockHash)
@@ -100,11 +84,8 @@ func TestBlockProcessedMessage_CorrectFields(t *testing.T) {
 	if msg.TxID != "" {
 		t.Errorf("expected empty TxID for BLOCK_PROCESSED, got %s", msg.TxID)
 	}
-	if len(msg.TxIDs) != 0 {
-		t.Errorf("expected empty TxIDs for BLOCK_PROCESSED, got %v", msg.TxIDs)
-	}
-	if len(msg.StumpData) != 0 {
-		t.Errorf("expected empty StumpData for BLOCK_PROCESSED, got %v", msg.StumpData)
+	if len(msg.Stump) != 0 {
+		t.Errorf("expected empty Stump for BLOCK_PROCESSED, got %v", msg.Stump)
 	}
 
 	// Verify encode/decode round-trip preserves fields.
@@ -112,12 +93,12 @@ func TestBlockProcessedMessage_CorrectFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode failed: %v", err)
 	}
-	decoded, err := kafka.DecodeStumpsMessage(data)
+	decoded, err := kafka.DecodeCallbackTopicMessage(data)
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
-	if decoded.StatusType != kafka.StatusBlockProcessed {
-		t.Errorf("decoded status: expected BLOCK_PROCESSED, got %s", decoded.StatusType)
+	if decoded.Type != kafka.CallbackBlockProcessed {
+		t.Errorf("decoded type: expected BLOCK_PROCESSED, got %s", decoded.Type)
 	}
 	if decoded.BlockHash != "blockhash-field-test" {
 		t.Errorf("decoded blockHash: expected blockhash-field-test, got %s", decoded.BlockHash)
@@ -130,18 +111,19 @@ func TestBlockProcessedMessage_CorrectFields(t *testing.T) {
 // TestSubtreeWorkMessage_Published verifies that SubtreeWorkMessages are published
 // to the subtree-work producer for each subtree hash.
 func TestSubtreeWorkMessage_Published(t *testing.T) {
-	_, _, workMock := newTestProcessor(t)
+	_, workMock := newTestProcessor(t)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	workProducer := kafka.NewTestProducer(workMock, "subtree-work-test", logger)
 
 	subtreeHashes := []string{"subtree-a", "subtree-b", "subtree-c"}
-	for _, stHash := range subtreeHashes {
+	for i, stHash := range subtreeHashes {
 		workMsg := &kafka.SubtreeWorkMessage{
-			BlockHash:   "block-123",
-			BlockHeight: 850000,
-			SubtreeHash: stHash,
-			DataHubURL:  "http://datahub/subtree",
+			BlockHash:    "block-123",
+			BlockHeight:  850000,
+			SubtreeHash:  stHash,
+			SubtreeIndex: i,
+			DataHubURL:   "http://datahub/subtree",
 		}
 		data, err := workMsg.Encode()
 		if err != nil {
@@ -163,6 +145,9 @@ func TestSubtreeWorkMessage_Published(t *testing.T) {
 		}
 		if msg.SubtreeHash != subtreeHashes[i] {
 			t.Errorf("message %d: expected subtreeHash %s, got %s", i, subtreeHashes[i], msg.SubtreeHash)
+		}
+		if msg.SubtreeIndex != i {
+			t.Errorf("message %d: expected subtreeIndex %d, got %d", i, i, msg.SubtreeIndex)
 		}
 	}
 }

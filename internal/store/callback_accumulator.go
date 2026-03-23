@@ -11,25 +11,24 @@ import (
 
 const accumEntriesBin = "entries"
 
-// AccumulatedCallback holds the aggregated txids and stump references for a
-// single callback URL across multiple subtrees within a block.
-type AccumulatedCallback struct {
-	TxIDs     []string
-	StumpRefs []string
+// AccumulatedCallbackEntry holds data for one subtree's contribution to a callback URL.
+// All txids in the entry share the same STUMP data and subtree index.
+type AccumulatedCallbackEntry struct {
+	TxIDs        []string
+	SubtreeIndex int
+	StumpData    []byte
 }
 
-// accumEntry is the per-subtree entry stored in the Aerospike list.
-// Each Append() call adds one entry per callback URL.
-type accumEntry struct {
-	URL      string   `json:"u"`
-	TxIDs    []string `json:"t"`
-	StumpRef string   `json:"r"`
+// AccumulatedCallback holds the aggregated callback entries for a
+// single callback URL across multiple subtrees within a block.
+type AccumulatedCallback struct {
+	Entries []AccumulatedCallbackEntry
 }
 
 // CallbackAccumulatorStore manages per-block callback accumulation in Aerospike.
 // Subtree workers append entries as they process subtrees. When all subtrees for
 // a block are done, the last worker reads and deletes the accumulated data, then
-// publishes batched StumpsMessages.
+// publishes individual CallbackTopicMessages.
 type CallbackAccumulatorStore struct {
 	client      *AerospikeClient
 	setName     string
@@ -50,18 +49,21 @@ func NewCallbackAccumulatorStore(client *AerospikeClient, setName string, ttlSec
 	}
 }
 
-// Append atomically appends callback data for a single subtree to the
-// accumulation record for the given block. Thread-safe across pods.
-func (s *CallbackAccumulatorStore) Append(blockHash, callbackURL string, txids []string, stumpRef string) error {
+// Append atomically appends callback data for a set of txids from a single subtree
+// to the accumulation record for the given block. One entry per subtree per callback URL,
+// keeping STUMP data stored only once per subtree (not duplicated per txid).
+func (s *CallbackAccumulatorStore) Append(blockHash, callbackURL string, txids []string, subtreeIndex int, stumpData []byte) error {
 	key, err := as.NewKey(s.client.Namespace(), s.setName, blockHash)
 	if err != nil {
 		return fmt.Errorf("failed to create key: %w", err)
 	}
 
+	// Store one entry per subtree: txid list + subtree index + STUMP data.
 	entry := map[string]interface{}{
 		"u": callbackURL,
 		"t": txids,
-		"r": stumpRef,
+		"i": subtreeIndex,
+		"s": stumpData,
 	}
 
 	wp := s.client.WritePolicy(s.maxRetries, s.retryBaseMs)
@@ -135,17 +137,25 @@ func (s *CallbackAccumulatorStore) ReadAndDelete(blockHash string) (map[string]*
 			result[url] = acc
 		}
 
+		entry := AccumulatedCallbackEntry{}
+
+		// Parse txid list.
 		if txidList, ok := entryMap["t"].([]interface{}); ok {
 			for _, v := range txidList {
 				if s, ok := v.(string); ok {
-					acc.TxIDs = append(acc.TxIDs, s)
+					entry.TxIDs = append(entry.TxIDs, s)
 				}
 			}
 		}
 
-		if ref, ok := entryMap["r"].(string); ok && ref != "" {
-			acc.StumpRefs = append(acc.StumpRefs, ref)
+		if idx, ok := entryMap["i"].(int); ok {
+			entry.SubtreeIndex = idx
 		}
+		if data, ok := entryMap["s"].([]byte); ok {
+			entry.StumpData = data
+		}
+
+		acc.Entries = append(acc.Entries, entry)
 	}
 
 	return result, nil

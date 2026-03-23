@@ -40,7 +40,7 @@ type Processor struct {
 
 	cfg               *config.Config
 	consumer          *kafka.Consumer
-	stumpsProducer    *kafka.Producer
+	callbackProducer    *kafka.Producer
 	registrationStore RegistrationGetter
 	seenCounterStore  SeenCounter
 	subtreeStore      *store.SubtreeStore
@@ -86,15 +86,15 @@ func (p *Processor) Init(_ interface{}) error {
 		p.regCache = regCache
 	}
 
-	stumpsProducer, err := kafka.NewProducer(
+	callbackProducer, err := kafka.NewProducer(
 		p.cfg.Kafka.Brokers,
-		p.cfg.Kafka.StumpsTopic,
+		p.cfg.Kafka.CallbackTopic,
 		p.Logger,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to create stumps producer: %w", err)
+		return fmt.Errorf("failed to create callback producer: %w", err)
 	}
-	p.stumpsProducer = stumpsProducer
+	p.callbackProducer = callbackProducer
 
 	consumer, err := kafka.NewConsumer(
 		p.cfg.Kafka.Brokers,
@@ -111,7 +111,7 @@ func (p *Processor) Init(_ interface{}) error {
 	p.Logger.Info("subtree-fetcher initialized",
 		"storageMode", p.cfg.Subtree.StorageMode,
 		"subtreeTopic", p.cfg.Kafka.SubtreeTopic,
-		"stumpsTopic", p.cfg.Kafka.StumpsTopic,
+		"callbackTopic", p.cfg.Kafka.CallbackTopic,
 		"cacheEnabled", p.regCache != nil,
 	)
 
@@ -144,9 +144,9 @@ func (p *Processor) Stop() error {
 		}
 	}
 
-	if p.stumpsProducer != nil {
-		if err := p.stumpsProducer.Close(); err != nil {
-			p.Logger.Error("failed to close stumps producer", "error", err)
+	if p.callbackProducer != nil {
+		if err := p.callbackProducer.Close(); err != nil {
+			p.Logger.Error("failed to close callback producer", "error", err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -315,18 +315,17 @@ func (p *Processor) emitSeenCallbacks(txid string, subtreeID string) error {
 
 	// 4.5: Emit SEEN_ON_NETWORK for each callback URL.
 	for _, callbackURL := range callbacks {
-		stumpsMsg := &kafka.StumpsMessage{
+		msg := &kafka.CallbackTopicMessage{
 			CallbackURL: callbackURL,
+			Type:        kafka.CallbackSeenOnNetwork,
 			TxID:        txid,
-			StatusType:  kafka.StatusSeenOnNetwork,
-			SubtreeID:   subtreeID,
 		}
-		data, err := stumpsMsg.Encode()
+		data, err := msg.Encode()
 		if err != nil {
-			p.Logger.Error("failed to encode stumps message", "txid", txid, "error", err)
+			p.Logger.Error("failed to encode callback message", "txid", txid, "error", err)
 			continue
 		}
-		if err := p.stumpsProducer.Publish(txid, data); err != nil {
+		if err := p.callbackProducer.Publish(txid, data); err != nil {
 			p.Logger.Error("failed to publish SEEN_ON_NETWORK", "txid", txid, "error", err)
 		}
 	}
@@ -340,18 +339,17 @@ func (p *Processor) emitSeenCallbacks(txid string, subtreeID string) error {
 
 	if result.ThresholdReached {
 		for _, callbackURL := range callbacks {
-			stumpsMsg := &kafka.StumpsMessage{
+			msg := &kafka.CallbackTopicMessage{
 				CallbackURL: callbackURL,
+				Type:        kafka.CallbackSeenMultipleNodes,
 				TxID:        txid,
-				StatusType:  kafka.StatusSeenMultiNodes,
-				SubtreeID:   subtreeID,
 			}
-			data, err := stumpsMsg.Encode()
+			data, err := msg.Encode()
 			if err != nil {
-				p.Logger.Error("failed to encode stumps message", "txid", txid, "error", err)
+				p.Logger.Error("failed to encode callback message", "txid", txid, "error", err)
 				continue
 			}
-			if err := p.stumpsProducer.Publish(txid, data); err != nil {
+			if err := p.callbackProducer.Publish(txid, data); err != nil {
 				p.Logger.Error("failed to publish SEEN_MULTIPLE_NODES", "txid", txid, "error", err)
 			}
 		}

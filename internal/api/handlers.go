@@ -5,9 +5,16 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+
+	"github.com/go-chi/chi/v5"
 )
 
 var txidRegex = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
+
+func handleDashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(dashboardHTML)
+}
 
 // WatchRequest represents the POST /watch request body.
 type WatchRequest struct {
@@ -91,6 +98,42 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, statusCode, HealthResponse{
 		Status:  health.Status,
 		Details: health.Details,
+	})
+}
+
+// LookupResponse represents the GET /api/lookup/{txid} response body.
+type LookupResponse struct {
+	TxID         string   `json:"txid"`
+	CallbackUrls []string `json:"callbackUrls"`
+}
+
+func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
+	txid := chi.URLParam(r, "txid")
+
+	if !txidRegex.MatchString(txid) {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid txid format: must be a 64-character hex string"})
+		return
+	}
+
+	if s.regStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{Error: "registration store not available"})
+		return
+	}
+
+	urls, err := s.regStore.Get(txid)
+	if err != nil {
+		s.Logger.Error("failed to lookup registration", "txid", txid, "error", err)
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "internal server error"})
+		return
+	}
+
+	if urls == nil {
+		urls = []string{}
+	}
+
+	writeJSON(w, http.StatusOK, LookupResponse{
+		TxID:         txid,
+		CallbackUrls: urls,
 	})
 }
 

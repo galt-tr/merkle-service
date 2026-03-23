@@ -20,8 +20,8 @@ import (
 
 const (
 	aerospikeHost = "localhost"
-	aerospikePort = 3000
-	kafkaBroker   = "localhost:9092"
+	aerospikePort = 3100
+	kafkaBroker   = "localhost:9192"
 )
 
 func testLogger() *slog.Logger {
@@ -219,35 +219,15 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 	}
 	t.Cleanup(func() { blockProducer.Close() })
 
-	stumpsProducer, err := kafka.NewProducer([]string{kafkaBroker}, stumpsTopic, logger)
-	if err != nil {
-		t.Fatalf("failed to create stumps producer: %v", err)
-	}
-	t.Cleanup(func() { stumpsProducer.Close() })
-
-	// Create shared STUMP cache, subtree counter, and callback accumulator.
-	stumpCache := store.NewMemoryStumpCache(300)
-	stumpCache.Start()
-	t.Cleanup(func() { stumpCache.Close() })
-
 	counterSetName := fmt.Sprintf("scale_counter_%d", time.Now().UnixNano())
 	subtreeCounter := store.NewSubtreeCounterStore(asClient, counterSetName, 600, 3, 100, logger)
-
-	// Use callback accumulator for cross-subtree batching only for smaller tests.
-	// For mega-scale (100+ instances), the per-block accumulator record grows too large
-	// for a single Aerospike record. Per-subtree individual publishing still uses StumpRef.
-	var callbackAccumulator *store.CallbackAccumulatorStore
-	if instanceCount <= 50 {
-		accumSetName := fmt.Sprintf("scale_accum_%d", time.Now().UnixNano())
-		callbackAccumulator = store.NewCallbackAccumulatorStore(asClient, accumSetName, 600, 3, 100, logger)
-	}
 
 	// Start block processor.
 	kafkaCfg := config.KafkaConfig{
 		Brokers:          []string{kafkaBroker},
 		BlockTopic:       blockTopic,
-		StumpsTopic:      stumpsTopic,
-		StumpsDLQTopic:   stumpsDLQTopic,
+		CallbackTopic:    stumpsTopic,
+		CallbackDLQTopic: stumpsDLQTopic,
 		SubtreeWorkTopic: subtreeWorkTopic,
 		ConsumerGroup:    fmt.Sprintf("scale-test-%d", time.Now().UnixNano()),
 	}
@@ -261,7 +241,7 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 		MaxRetries: 2,
 	}
 
-	processor := block.NewProcessor(kafkaCfg, blockCfg, datahubCfg, stumpsProducer, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
+	processor := block.NewProcessor(kafkaCfg, blockCfg, datahubCfg, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
 	if err := processor.Init(nil); err != nil {
 		t.Fatalf("failed to init block processor: %v", err)
 	}
@@ -272,8 +252,8 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 	}
 	t.Cleanup(func() { processor.Stop() })
 
-	// Start subtree worker service with callback accumulator for batched publishing.
-	subtreeWorker := block.NewSubtreeWorkerService(kafkaCfg, blockCfg, datahubCfg, regStore, subtreeStore, urlRegistry, subtreeCounter, stumpCache, callbackAccumulator, logger)
+	// Start subtree worker service.
+	subtreeWorker := block.NewSubtreeWorkerService(kafkaCfg, blockCfg, datahubCfg, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
 	if err := subtreeWorker.Init(nil); err != nil {
 		t.Fatalf("failed to init subtree worker: %v", err)
 	}
@@ -292,10 +272,9 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 			DeliveryWorkers:     256,
 			MaxConnsPerHost:     64,
 			MaxIdleConnsPerHost: 32,
-			StumpCacheTTLSec:    300,
 		},
 	}
-	deliveryService1 := callback.NewDeliveryService(deliveryCfg, nil, stumpCache)
+	deliveryService1 := callback.NewDeliveryService(deliveryCfg, nil)
 	if err := deliveryService1.Init(nil); err != nil {
 		t.Fatalf("failed to init delivery service 1: %v", err)
 	}
@@ -305,7 +284,7 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 	t.Cleanup(func() { deliveryService1.Stop() })
 
 	// Start second delivery service instance (same consumer group) for multi-instance validation.
-	deliveryService2 := callback.NewDeliveryService(deliveryCfg, nil, stumpCache)
+	deliveryService2 := callback.NewDeliveryService(deliveryCfg, nil)
 	if err := deliveryService2.Init(nil); err != nil {
 		t.Fatalf("failed to init delivery service 2: %v", err)
 	}

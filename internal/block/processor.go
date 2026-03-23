@@ -21,7 +21,6 @@ type Processor struct {
 	blockCfg             config.BlockConfig
 	datahubCfg           config.DataHubConfig
 	consumer             *kafka.Consumer
-	stumpsProducer       *kafka.Producer
 	subtreeWorkProducer  *kafka.Producer
 	regStore             *store.RegistrationStore
 	subtreeStore         *store.SubtreeStore
@@ -35,7 +34,6 @@ func NewProcessor(
 	kafkaCfg config.KafkaConfig,
 	blockCfg config.BlockConfig,
 	datahubCfg config.DataHubConfig,
-	stumpsProducer *kafka.Producer,
 	regStore *store.RegistrationStore,
 	subtreeStore *store.SubtreeStore,
 	urlRegistry *store.CallbackURLRegistry,
@@ -46,7 +44,6 @@ func NewProcessor(
 		kafkaCfg:       kafkaCfg,
 		blockCfg:       blockCfg,
 		datahubCfg:     datahubCfg,
-		stumpsProducer: stumpsProducer,
 		regStore:       regStore,
 		subtreeStore:   subtreeStore,
 		urlRegistry:    urlRegistry,
@@ -176,12 +173,13 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 	}
 
 	// Publish one SubtreeWorkMessage per subtree to the subtree-work topic.
-	for _, stHash := range subtreeHashes {
+	for i, stHash := range subtreeHashes {
 		workMsg := &kafka.SubtreeWorkMessage{
-			BlockHash:   blockMsg.Hash,
-			BlockHeight: meta.Height,
-			SubtreeHash: stHash,
-			DataHubURL:  blockMsg.DataHubURL,
+			BlockHash:    blockMsg.Hash,
+			BlockHeight:  meta.Height,
+			SubtreeHash:  stHash,
+			SubtreeIndex: i,
+			DataHubURL:   blockMsg.DataHubURL,
 		}
 		data, err := workMsg.Encode()
 		if err != nil {

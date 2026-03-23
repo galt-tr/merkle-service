@@ -4,6 +4,22 @@
 # persistent connection to the BSV network and publishes subtree/block
 # messages to Kafka. Running multiple replicas would cause duplicate messages.
 # Use a second replica only for failover (with leader election or standby).
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: p2p-data
+  namespace: merkle-service
+  labels:
+    app.kubernetes.io/name: p2p-client
+    app.kubernetes.io/part-of: merkle-service
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Mi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,6 +43,10 @@ spec:
         - name: p2p-client
           image: merkle-service:latest
           command: ["p2p-client"]
+          ports:
+            - name: p2p
+              containerPort: 9905
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: merkle-service-env
@@ -50,4 +70,5 @@ spec:
           configMap:
             name: merkle-service-config
         - name: p2p-data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: p2p-data

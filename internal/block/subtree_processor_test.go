@@ -2,7 +2,6 @@ package block
 
 import (
 	"context"
-	"encoding/binary"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,7 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/model"
 
 	"github.com/bsv-blockchain/merkle-service/internal/cache"
 	"github.com/bsv-blockchain/merkle-service/internal/datahub"
@@ -243,16 +244,32 @@ func TestGroupByCallback(t *testing.T) {
 	}
 }
 
+// buildBlockPayload creates a valid model.Block binary payload for testing.
+func buildBlockPayload(height uint32, hashCount int) []byte {
+	header := &model.BlockHeader{
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+	}
+	subtrees := make([]*chainhash.Hash, hashCount)
+	for i := range subtrees {
+		h := &chainhash.Hash{}
+		h[0] = byte(i + 1)
+		subtrees[i] = h
+	}
+	block, err := model.NewBlock(header, nil, subtrees, 0, 0, height, 0)
+	if err != nil {
+		panic("buildBlockPayload: " + err.Error())
+	}
+	data, err := block.Bytes()
+	if err != nil {
+		panic("buildBlockPayload Bytes: " + err.Error())
+	}
+	return data
+}
+
 // TestBlockMetadataFetch verifies DataHub block metadata fetching with multiple subtrees.
 func TestBlockMetadataFetch(t *testing.T) {
-	// Build binary block payload: height=200, 3 subtree hashes.
-	subtreeHashes := []string{"st-aaa", "st-bbb", "st-ccc"}
-	payload := make([]byte, 8+len(subtreeHashes)*32)
-	binary.LittleEndian.PutUint32(payload[0:4], 200)
-	binary.LittleEndian.PutUint32(payload[4:8], uint32(len(subtreeHashes)))
-	for i, h := range subtreeHashes {
-		copy(payload[8+i*32:], []byte(h))
-	}
+	payload := buildBlockPayload(200, 3)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/block/") && !strings.HasSuffix(r.URL.Path, "/json") {
@@ -278,15 +295,15 @@ func TestBlockMetadataFetch(t *testing.T) {
 	}
 }
 
-// TestMinedStumpsMessageEncoding verifies MINED messages are properly encoded/decoded.
-func TestMinedStumpsMessageEncoding(t *testing.T) {
-	msg := &kafka.StumpsMessage{
-		CallbackURL: "http://example.com/callback",
-		TxIDs:       []string{"txid1", "txid2"},
-		StumpData:   []byte{0x01, 0x02, 0x03},
-		StatusType:  kafka.StatusMined,
-		BlockHash:   "blockhash123",
-		SubtreeID:   "subtree456",
+// TestStumpCallbackMessageEncoding verifies STUMP callback messages are properly encoded/decoded.
+func TestStumpCallbackMessageEncoding(t *testing.T) {
+	msg := &kafka.CallbackTopicMessage{
+		CallbackURL:  "http://example.com/callback",
+		Type:         kafka.CallbackStump,
+		TxID:         "txid1",
+		BlockHash:    "blockhash123",
+		SubtreeIndex: 3,
+		Stump:        []byte{0x01, 0x02, 0x03},
 	}
 
 	data, err := msg.Encode()
@@ -294,22 +311,25 @@ func TestMinedStumpsMessageEncoding(t *testing.T) {
 		t.Fatalf("encode failed: %v", err)
 	}
 
-	decoded, err := kafka.DecodeStumpsMessage(data)
+	decoded, err := kafka.DecodeCallbackTopicMessage(data)
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
 
-	if decoded.StatusType != kafka.StatusMined {
-		t.Errorf("expected MINED, got %s", decoded.StatusType)
+	if decoded.Type != kafka.CallbackStump {
+		t.Errorf("expected STUMP, got %s", decoded.Type)
 	}
 	if decoded.CallbackURL != "http://example.com/callback" {
 		t.Errorf("unexpected callback URL: %s", decoded.CallbackURL)
 	}
-	if len(decoded.TxIDs) != 2 {
-		t.Errorf("expected 2 txids, got %d", len(decoded.TxIDs))
+	if decoded.TxID != "txid1" {
+		t.Errorf("expected txid1, got %s", decoded.TxID)
 	}
 	if decoded.BlockHash != "blockhash123" {
 		t.Errorf("unexpected block hash: %s", decoded.BlockHash)
+	}
+	if decoded.SubtreeIndex != 3 {
+		t.Errorf("expected subtreeIndex 3, got %d", decoded.SubtreeIndex)
 	}
 }
 
@@ -377,13 +397,12 @@ func TestBlockDedupCache_MultipleBlocksIndependent(t *testing.T) {
 	}
 }
 
-// TestSeenOnNetworkStumpsMessage verifies SEEN_ON_NETWORK message encoding.
-func TestSeenOnNetworkStumpsMessage(t *testing.T) {
-	msg := &kafka.StumpsMessage{
+// TestSeenOnNetworkCallbackMessage verifies SEEN_ON_NETWORK message encoding.
+func TestSeenOnNetworkCallbackMessage(t *testing.T) {
+	msg := &kafka.CallbackTopicMessage{
 		CallbackURL: "http://example.com/cb",
+		Type:        kafka.CallbackSeenOnNetwork,
 		TxID:        "abc123",
-		StatusType:  kafka.StatusSeenOnNetwork,
-		SubtreeID:   "st-xyz",
 	}
 
 	data, err := msg.Encode()
@@ -391,13 +410,13 @@ func TestSeenOnNetworkStumpsMessage(t *testing.T) {
 		t.Fatalf("encode failed: %v", err)
 	}
 
-	decoded, err := kafka.DecodeStumpsMessage(data)
+	decoded, err := kafka.DecodeCallbackTopicMessage(data)
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
 
-	if decoded.StatusType != kafka.StatusSeenOnNetwork {
-		t.Errorf("expected SEEN_ON_NETWORK, got %s", decoded.StatusType)
+	if decoded.Type != kafka.CallbackSeenOnNetwork {
+		t.Errorf("expected SEEN_ON_NETWORK, got %s", decoded.Type)
 	}
 	if decoded.TxID != "abc123" {
 		t.Errorf("unexpected txid: %s", decoded.TxID)

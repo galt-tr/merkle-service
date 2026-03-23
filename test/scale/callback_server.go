@@ -14,13 +14,13 @@ import (
 	"time"
 )
 
-// callbackPayload mirrors the JSON body delivered by the callback service.
+// callbackPayload mirrors the JSON body delivered by the callback service (Arcade's CallbackMessage).
 type callbackPayload struct {
-	TxID      string   `json:"txid,omitempty"`
-	TxIDs     []string `json:"txids,omitempty"`
-	Status    string   `json:"status"`
-	StumpData string   `json:"stumpData,omitempty"`
-	BlockHash string   `json:"blockHash,omitempty"`
+	Type         string `json:"type"`
+	TxID         string `json:"txid,omitempty"`
+	BlockHash    string `json:"blockHash,omitempty"`
+	SubtreeIndex int    `json:"subtreeIndex,omitempty"`
+	Stump        string `json:"stump,omitempty"`
 }
 
 // CallbackServer is an HTTP server that collects callback payloads for one Arcade instance.
@@ -67,8 +67,8 @@ func (cs *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request)
 	cs.lastCallback = now
 	cs.rawBytes += int64(len(body))
 
-	switch p.Status {
-	case "MINED":
+	switch p.Type {
+	case "STUMP":
 		cs.minedPayloads = append(cs.minedPayloads, p)
 	case "BLOCK_PROCESSED":
 		cs.blockProcessed = append(cs.blockProcessed, p)
@@ -119,10 +119,7 @@ func (cs *CallbackServer) BlockProcessedPayloads() []callbackPayload {
 func (cs *CallbackServer) Stats() ServerStats {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	totalTxids := 0
-	for _, p := range cs.minedPayloads {
-		totalTxids += len(p.TxIDs)
-	}
+	totalTxids := len(cs.minedPayloads) // one txid per STUMP callback
 	return ServerStats{
 		Port:            cs.port,
 		MinedCallbacks:  len(cs.minedPayloads),

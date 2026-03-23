@@ -3,7 +3,7 @@ package callback
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -17,7 +17,6 @@ import (
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
 	"github.com/bsv-blockchain/merkle-service/internal/service"
-	"github.com/bsv-blockchain/merkle-service/internal/store"
 )
 
 // CallbackDeduper abstracts callback deduplication for testability.
@@ -26,16 +25,16 @@ type CallbackDeduper interface {
 	Record(txid, callbackURL, statusType string, ttl time.Duration) error
 }
 
-// callbackPayload is the JSON body sent to the callback URL.
+// callbackPayload is the JSON body sent to the callback URL, matching Arcade's CallbackMessage.
 type callbackPayload struct {
-	TxID      string   `json:"txid,omitempty"`
-	TxIDs     []string `json:"txids,omitempty"`
-	Status    string   `json:"status"`
-	StumpData string   `json:"stumpData,omitempty"`
-	BlockHash string   `json:"blockHash,omitempty"`
+	Type         string `json:"type"`
+	TxID         string `json:"txid,omitempty"`
+	BlockHash    string `json:"blockHash,omitempty"`
+	SubtreeIndex int    `json:"subtreeIndex,omitempty"`
+	Stump        string `json:"stump,omitempty"`
 }
 
-// DeliveryService consumes callback messages from the stumps Kafka topic
+// DeliveryService consumes callback messages from the callback Kafka topic
 // and delivers them via HTTP POST, with linear backoff retry logic.
 type DeliveryService struct {
 	service.BaseService
@@ -46,10 +45,9 @@ type DeliveryService struct {
 	dlqProducer *kafka.Producer
 	httpClient  *http.Client
 	dedupStore  CallbackDeduper
-	stumpCache  store.StumpCache
 
 	// Worker pool for concurrent delivery.
-	workCh   chan *kafka.StumpsMessage
+	workCh   chan *kafka.CallbackTopicMessage
 	workerWg sync.WaitGroup
 
 	messagesProcessed atomic.Int64
@@ -59,11 +57,10 @@ type DeliveryService struct {
 }
 
 // NewDeliveryService creates a new callback DeliveryService.
-func NewDeliveryService(cfg *config.Config, dedupStore CallbackDeduper, stumpCache store.StumpCache) *DeliveryService {
+func NewDeliveryService(cfg *config.Config, dedupStore CallbackDeduper) *DeliveryService {
 	return &DeliveryService{
 		cfg:        cfg,
 		dedupStore: dedupStore,
-		stumpCache: stumpCache,
 	}
 }
 
@@ -98,38 +95,38 @@ func (d *DeliveryService) Init(_ interface{}) error {
 		Transport: transport,
 	}
 
-	// Create producer for re-enqueuing retries to the stumps topic.
+	// Create producer for re-enqueuing retries to the callback topic.
 	producer, err := kafka.NewProducer(
 		d.cfg.Kafka.Brokers,
-		d.cfg.Kafka.StumpsTopic,
+		d.cfg.Kafka.CallbackTopic,
 		d.Logger,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to create stumps producer: %w", err)
+		return fmt.Errorf("failed to create callback producer: %w", err)
 	}
 	d.producer = producer
 
 	// Create producer for publishing permanently failed messages to the DLQ topic.
 	dlqProducer, err := kafka.NewProducer(
 		d.cfg.Kafka.Brokers,
-		d.cfg.Kafka.StumpsDLQTopic,
+		d.cfg.Kafka.CallbackDLQTopic,
 		d.Logger,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to create stumps DLQ producer: %w", err)
+		return fmt.Errorf("failed to create callback DLQ producer: %w", err)
 	}
 	d.dlqProducer = dlqProducer
 
-	// Create consumer for the stumps topic.
+	// Create consumer for the callback topic.
 	consumer, err := kafka.NewConsumer(
 		d.cfg.Kafka.Brokers,
 		d.cfg.Kafka.ConsumerGroup+"-callback",
-		[]string{d.cfg.Kafka.StumpsTopic},
+		[]string{d.cfg.Kafka.CallbackTopic},
 		d.handleMessage,
 		d.Logger,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to create stumps consumer: %w", err)
+		return fmt.Errorf("failed to create callback consumer: %w", err)
 	}
 	d.consumer = consumer
 
@@ -138,11 +135,11 @@ func (d *DeliveryService) Init(_ interface{}) error {
 	if workers <= 0 {
 		workers = 64
 	}
-	d.workCh = make(chan *kafka.StumpsMessage, workers*2)
+	d.workCh = make(chan *kafka.CallbackTopicMessage, workers*2)
 
 	d.Logger.Info("callback delivery service initialized",
-		"stumpsTopic", d.cfg.Kafka.StumpsTopic,
-		"stumpsDlqTopic", d.cfg.Kafka.StumpsDLQTopic,
+		"callbackTopic", d.cfg.Kafka.CallbackTopic,
+		"callbackDlqTopic", d.cfg.Kafka.CallbackDLQTopic,
 		"maxRetries", d.cfg.Callback.MaxRetries,
 		"backoffBaseSec", d.cfg.Callback.BackoffBaseSec,
 		"timeoutSec", d.cfg.Callback.TimeoutSec,
@@ -169,7 +166,7 @@ func (d *DeliveryService) Start(ctx context.Context) error {
 	}
 
 	if err := d.consumer.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start stumps consumer: %w", err)
+		return fmt.Errorf("failed to start callback consumer: %w", err)
 	}
 
 	d.SetStarted(true)
@@ -178,7 +175,6 @@ func (d *DeliveryService) Start(ctx context.Context) error {
 }
 
 // Stop gracefully shuts down the delivery service.
-// Closes the work channel first to drain in-flight deliveries, then stops consumer and producers.
 func (d *DeliveryService) Stop() error {
 	d.Logger.Info("stopping callback delivery service")
 
@@ -199,7 +195,7 @@ func (d *DeliveryService) Stop() error {
 
 	if d.producer != nil {
 		if err := d.producer.Close(); err != nil {
-			d.Logger.Error("failed to close stumps producer", "error", err)
+			d.Logger.Error("failed to close callback producer", "error", err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -244,30 +240,29 @@ func (d *DeliveryService) Health() service.HealthStatus {
 }
 
 // handleMessage decodes a Kafka message and dispatches it to the worker pool.
-// The Kafka offset is marked immediately after dispatch (at-least-once with dedup).
 func (d *DeliveryService) handleMessage(_ context.Context, msg *sarama.ConsumerMessage) error {
-	stumpsMsg, err := kafka.DecodeStumpsMessage(msg.Value)
+	cbMsg, err := kafka.DecodeCallbackTopicMessage(msg.Value)
 	if err != nil {
-		d.Logger.Error("failed to decode stumps message",
+		d.Logger.Error("failed to decode callback message",
 			"offset", msg.Offset,
 			"partition", msg.Partition,
 			"error", err,
 		)
-		return fmt.Errorf("failed to decode stumps message: %w", err)
+		return fmt.Errorf("failed to decode callback message: %w", err)
 	}
 
 	// Check delay for retry messages before dispatching.
-	if !stumpsMsg.NextRetryAt.IsZero() && time.Now().Before(stumpsMsg.NextRetryAt) {
+	if !cbMsg.NextRetryAt.IsZero() && time.Now().Before(cbMsg.NextRetryAt) {
 		d.Logger.Debug("message not yet due for retry, re-enqueuing",
-			"callbackUrl", stumpsMsg.CallbackURL,
-			"txid", stumpsMsg.TxID,
-			"nextRetryAt", stumpsMsg.NextRetryAt,
+			"callbackUrl", cbMsg.CallbackURL,
+			"txid", cbMsg.TxID,
+			"nextRetryAt", cbMsg.NextRetryAt,
 		)
-		return d.reenqueue(stumpsMsg)
+		return d.reenqueue(cbMsg)
 	}
 
 	// Dispatch to worker pool (blocking send provides backpressure).
-	d.workCh <- stumpsMsg
+	d.workCh <- cbMsg
 	return nil
 }
 
@@ -280,72 +275,26 @@ func (d *DeliveryService) deliveryWorker() {
 }
 
 // processDelivery handles dedup check, HTTP delivery, dedup record, and retry/DLQ logic for a single message.
-func (d *DeliveryService) processDelivery(stumpsMsg *kafka.StumpsMessage) {
+func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
 	d.Logger.Debug("processing callback message",
-		"callbackUrl", stumpsMsg.CallbackURL,
-		"txid", stumpsMsg.TxID,
-		"statusType", stumpsMsg.StatusType,
-		"retryCount", stumpsMsg.RetryCount,
+		"callbackUrl", cbMsg.CallbackURL,
+		"txid", cbMsg.TxID,
+		"type", cbMsg.Type,
+		"retryCount", cbMsg.RetryCount,
 	)
-
-	// Resolve STUMP data: inline StumpData takes priority, then StumpRefs (plural), then StumpRef (singular).
-	var resolvedStumpDataList [][]byte
-	if len(stumpsMsg.StumpData) > 0 {
-		resolvedStumpDataList = [][]byte{stumpsMsg.StumpData}
-	} else if len(stumpsMsg.StumpRefs) > 0 && d.stumpCache != nil {
-		// Batched message — resolve all StumpRefs.
-		for _, ref := range stumpsMsg.StumpRefs {
-			data, ok, _ := d.stumpCache.Get(ref, stumpsMsg.BlockHash)
-			if !ok {
-				d.Logger.Warn("stump cache miss for StumpRef in batch, re-enqueuing for retry",
-					"stumpRef", ref,
-					"blockHash", stumpsMsg.BlockHash,
-					"callbackUrl", stumpsMsg.CallbackURL,
-				)
-				stumpsMsg.RetryCount++
-				backoffSec := d.cfg.Callback.BackoffBaseSec * stumpsMsg.RetryCount
-				stumpsMsg.NextRetryAt = time.Now().Add(time.Duration(backoffSec) * time.Second)
-				d.messagesRetried.Add(1)
-				if err := d.reenqueue(stumpsMsg); err != nil {
-					d.Logger.Error("failed to reenqueue after cache miss", "error", err)
-				}
-				return
-			}
-			resolvedStumpDataList = append(resolvedStumpDataList, data)
-		}
-	} else if stumpsMsg.StumpRef != "" && d.stumpCache != nil {
-		// Single StumpRef — backward compatible.
-		data, ok, _ := d.stumpCache.Get(stumpsMsg.StumpRef, stumpsMsg.BlockHash)
-		if !ok {
-			d.Logger.Warn("stump cache miss for StumpRef, re-enqueuing for retry",
-				"stumpRef", stumpsMsg.StumpRef,
-				"blockHash", stumpsMsg.BlockHash,
-				"callbackUrl", stumpsMsg.CallbackURL,
-			)
-			stumpsMsg.RetryCount++
-			backoffSec := d.cfg.Callback.BackoffBaseSec * stumpsMsg.RetryCount
-			stumpsMsg.NextRetryAt = time.Now().Add(time.Duration(backoffSec) * time.Second)
-			d.messagesRetried.Add(1)
-			if err := d.reenqueue(stumpsMsg); err != nil {
-				d.Logger.Error("failed to reenqueue after cache miss", "error", err)
-			}
-			return
-		}
-		resolvedStumpDataList = [][]byte{data}
-	}
 
 	// Check callback dedup — skip if already delivered.
 	if d.dedupStore != nil {
-		dedupKey := dedupKeyForMessage(stumpsMsg)
+		dedupKey := dedupKeyForMessage(cbMsg)
 		if dedupKey != "" {
-			exists, err := d.dedupStore.Exists(dedupKey, stumpsMsg.CallbackURL, string(stumpsMsg.StatusType))
+			exists, err := d.dedupStore.Exists(dedupKey, cbMsg.CallbackURL, string(cbMsg.Type))
 			if err != nil {
 				d.Logger.Warn("dedup check failed, proceeding with delivery", "error", err)
 			} else if exists {
 				d.Logger.Debug("skipping duplicate callback delivery",
 					"dedupKey", dedupKey,
-					"callbackUrl", stumpsMsg.CallbackURL,
-					"statusType", stumpsMsg.StatusType,
+					"callbackUrl", cbMsg.CallbackURL,
+					"type", cbMsg.Type,
 				)
 				d.messagesDedupe.Add(1)
 				return
@@ -354,93 +303,81 @@ func (d *DeliveryService) processDelivery(stumpsMsg *kafka.StumpsMessage) {
 	}
 
 	// Attempt HTTP POST delivery.
-	err := d.deliverCallback(context.Background(), stumpsMsg, resolvedStumpDataList)
+	err := d.deliverCallback(context.Background(), cbMsg)
 	if err == nil {
 		// Record successful delivery for dedup.
 		if d.dedupStore != nil {
-			dedupKey := dedupKeyForMessage(stumpsMsg)
+			dedupKey := dedupKeyForMessage(cbMsg)
 			if dedupKey != "" {
 				ttl := time.Duration(d.cfg.Callback.DedupTTLSec) * time.Second
-				if recErr := d.dedupStore.Record(dedupKey, stumpsMsg.CallbackURL, string(stumpsMsg.StatusType), ttl); recErr != nil {
+				if recErr := d.dedupStore.Record(dedupKey, cbMsg.CallbackURL, string(cbMsg.Type), ttl); recErr != nil {
 					d.Logger.Warn("failed to record callback dedup", "error", recErr)
 				}
 			}
 		}
 		d.messagesProcessed.Add(1)
 		d.Logger.Debug("callback delivered successfully",
-			"callbackUrl", stumpsMsg.CallbackURL,
-			"txid", stumpsMsg.TxID,
-			"statusType", stumpsMsg.StatusType,
+			"callbackUrl", cbMsg.CallbackURL,
+			"txid", cbMsg.TxID,
+			"type", cbMsg.Type,
 		)
 		return
 	}
 
 	d.Logger.Warn("callback delivery failed",
-		"callbackUrl", stumpsMsg.CallbackURL,
-		"txid", stumpsMsg.TxID,
-		"statusType", stumpsMsg.StatusType,
-		"retryCount", stumpsMsg.RetryCount,
+		"callbackUrl", cbMsg.CallbackURL,
+		"txid", cbMsg.TxID,
+		"type", cbMsg.Type,
+		"retryCount", cbMsg.RetryCount,
 		"error", err,
 	)
 
 	// Check if we've exhausted retries.
-	if stumpsMsg.RetryCount >= d.cfg.Callback.MaxRetries {
+	if cbMsg.RetryCount >= d.cfg.Callback.MaxRetries {
 		d.Logger.Error("callback permanently failed, publishing to DLQ",
-			"callbackUrl", stumpsMsg.CallbackURL,
-			"txid", stumpsMsg.TxID,
-			"statusType", stumpsMsg.StatusType,
-			"retryCount", stumpsMsg.RetryCount,
+			"callbackUrl", cbMsg.CallbackURL,
+			"txid", cbMsg.TxID,
+			"type", cbMsg.Type,
+			"retryCount", cbMsg.RetryCount,
 		)
 		d.messagesFailed.Add(1)
-		if err := d.publishToDLQ(stumpsMsg); err != nil {
+		if err := d.publishToDLQ(cbMsg); err != nil {
 			d.Logger.Error("failed to publish to DLQ", "error", err)
 		}
 		return
 	}
 
 	// Increment retry count and calculate next retry time with linear backoff.
-	stumpsMsg.RetryCount++
-	backoffSec := d.cfg.Callback.BackoffBaseSec * stumpsMsg.RetryCount
-	stumpsMsg.NextRetryAt = time.Now().Add(time.Duration(backoffSec) * time.Second)
+	cbMsg.RetryCount++
+	backoffSec := d.cfg.Callback.BackoffBaseSec * cbMsg.RetryCount
+	cbMsg.NextRetryAt = time.Now().Add(time.Duration(backoffSec) * time.Second)
 
 	d.Logger.Info("scheduling callback retry",
-		"callbackUrl", stumpsMsg.CallbackURL,
-		"txid", stumpsMsg.TxID,
-		"retryCount", stumpsMsg.RetryCount,
-		"nextRetryAt", stumpsMsg.NextRetryAt,
+		"callbackUrl", cbMsg.CallbackURL,
+		"txid", cbMsg.TxID,
+		"retryCount", cbMsg.RetryCount,
+		"nextRetryAt", cbMsg.NextRetryAt,
 		"backoffSec", backoffSec,
 	)
 
 	d.messagesRetried.Add(1)
-	if err := d.reenqueue(stumpsMsg); err != nil {
+	if err := d.reenqueue(cbMsg); err != nil {
 		d.Logger.Error("failed to reenqueue message", "error", err)
 	}
 }
 
-// deliverCallback makes an HTTP POST to the callback URL with the appropriate payload.
-func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.StumpsMessage, stumpDataList [][]byte) error {
+// deliverCallback makes an HTTP POST to the callback URL with the CallbackMessage payload.
+func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.CallbackTopicMessage) error {
 	payload := callbackPayload{
-		TxID:      msg.TxID,
-		TxIDs:     msg.TxIDs,
-		Status:    string(msg.StatusType),
-		BlockHash: msg.BlockHash,
+		Type:         string(msg.Type),
+		TxID:         msg.TxID,
+		BlockHash:    msg.BlockHash,
+		SubtreeIndex: msg.SubtreeIndex,
 	}
 
-	// Encode stump data as base64. For batched messages with multiple STUMPs,
-	// concatenate all STUMP binaries before encoding (the BRC-0074 format is
-	// self-delimiting, so concatenation is safe for receivers that parse sequentially).
-	if len(stumpDataList) == 1 {
-		payload.StumpData = base64.StdEncoding.EncodeToString(stumpDataList[0])
-	} else if len(stumpDataList) > 1 {
-		totalSize := 0
-		for _, d := range stumpDataList {
-			totalSize += len(d)
-		}
-		combined := make([]byte, 0, totalSize)
-		for _, d := range stumpDataList {
-			combined = append(combined, d...)
-		}
-		payload.StumpData = base64.StdEncoding.EncodeToString(combined)
+	// Hex-encode stump data (matching Arcade's HexBytes type).
+	if len(msg.Stump) > 0 {
+		payload.Stump = hex.EncodeToString(msg.Stump)
 	}
 
 	body, err := json.Marshal(payload)
@@ -474,53 +411,44 @@ func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.Stumps
 }
 
 // buildIdempotencyKey creates a unique key for a callback delivery.
-func buildIdempotencyKey(msg *kafka.StumpsMessage) string {
-	if msg.StatusType == kafka.StatusBlockProcessed {
-		return msg.BlockHash + ":" + string(msg.StatusType)
+func buildIdempotencyKey(msg *kafka.CallbackTopicMessage) string {
+	if msg.Type == kafka.CallbackBlockProcessed {
+		return msg.BlockHash + ":" + string(msg.Type)
 	}
 	if msg.TxID != "" {
-		return msg.TxID + ":" + string(msg.StatusType)
-	}
-	if msg.BlockHash != "" && msg.SubtreeID != "" {
-		return msg.BlockHash + ":" + msg.SubtreeID + ":" + string(msg.StatusType)
+		return msg.TxID + ":" + string(msg.Type)
 	}
 	return ""
 }
 
 // dedupKeyForMessage returns the dedup key for a message.
 // For BLOCK_PROCESSED, uses blockHash; for other types, uses txid.
-func dedupKeyForMessage(msg *kafka.StumpsMessage) string {
-	if msg.StatusType == kafka.StatusBlockProcessed {
+func dedupKeyForMessage(msg *kafka.CallbackTopicMessage) string {
+	if msg.Type == kafka.CallbackBlockProcessed {
 		return msg.BlockHash
 	}
-	if msg.TxID != "" {
-		return msg.TxID
-	}
-	if len(msg.TxIDs) > 0 {
-		return msg.TxIDs[0]
-	}
-	return ""
+	return msg.TxID
 }
 
-// reenqueue publishes the message back to the stumps topic for later processing.
-func (d *DeliveryService) reenqueue(msg *kafka.StumpsMessage) error {
+// reenqueue publishes the message back to the callback topic for later processing.
+func (d *DeliveryService) reenqueue(msg *kafka.CallbackTopicMessage) error {
 	data, err := msg.Encode()
 	if err != nil {
-		return fmt.Errorf("failed to encode stumps message for re-enqueue: %w", err)
+		return fmt.Errorf("failed to encode callback message for re-enqueue: %w", err)
 	}
 
 	if err := d.producer.PublishWithHashKey(msg.CallbackURL, data); err != nil {
-		return fmt.Errorf("failed to re-enqueue stumps message: %w", err)
+		return fmt.Errorf("failed to re-enqueue callback message: %w", err)
 	}
 
 	return nil
 }
 
 // publishToDLQ publishes a permanently failed message to the dead-letter queue topic.
-func (d *DeliveryService) publishToDLQ(msg *kafka.StumpsMessage) error {
+func (d *DeliveryService) publishToDLQ(msg *kafka.CallbackTopicMessage) error {
 	data, err := msg.Encode()
 	if err != nil {
-		return fmt.Errorf("failed to encode stumps message for DLQ: %w", err)
+		return fmt.Errorf("failed to encode callback message for DLQ: %w", err)
 	}
 
 	if err := d.dlqProducer.PublishWithHashKey(msg.CallbackURL, data); err != nil {

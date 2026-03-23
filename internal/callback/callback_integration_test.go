@@ -52,8 +52,8 @@ func TestCallbackDelivery_SuccessfulCallback(t *testing.T) {
 	cfg := &config.Config{
 		Kafka: config.KafkaConfig{
 			Brokers:        brokers,
-			StumpsTopic:    stumpsTopic,
-			StumpsDLQTopic: dlqTopic,
+			CallbackTopic:    stumpsTopic,
+			CallbackDLQTopic: dlqTopic,
 			ConsumerGroup:  fmt.Sprintf("cb-test-%d", time.Now().UnixNano()),
 		},
 		Callback: config.CallbackConfig{
@@ -63,7 +63,7 @@ func TestCallbackDelivery_SuccessfulCallback(t *testing.T) {
 		},
 	}
 
-	svc := callback.NewDeliveryService(cfg, nil, nil)
+	svc := callback.NewDeliveryService(cfg, nil)
 	if err := svc.Init(nil); err != nil {
 		t.Fatalf("DeliveryService.Init failed: %v", err)
 	}
@@ -79,23 +79,23 @@ func TestCallbackDelivery_SuccessfulCallback(t *testing.T) {
 	// Allow consumer group to fully stabilize before publishing.
 	time.Sleep(3 * time.Second)
 
-	// Now publish a StumpsMessage to Kafka.
+	// Now publish a CallbackTopicMessage to Kafka.
 	producer, err := kafka.NewProducer(brokers, stumpsTopic, slog.Default())
 	if err != nil {
 		t.Fatalf("failed to create producer: %v", err)
 	}
 	defer producer.Close()
 
-	stumpsMsg := &kafka.StumpsMessage{
+	stumpsMsg := &kafka.CallbackTopicMessage{
 		CallbackURL: mockServer.URL + "/notify",
 		TxID:        "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd",
-		StatusType:  kafka.StatusSeenOnNetwork,
+		Type:  kafka.CallbackSeenOnNetwork,
 		RetryCount:  0,
 	}
 
 	encoded, err := stumpsMsg.Encode()
 	if err != nil {
-		t.Fatalf("failed to encode StumpsMessage: %v", err)
+		t.Fatalf("failed to encode CallbackTopicMessage: %v", err)
 	}
 
 	if err := producer.PublishWithHashKey(stumpsMsg.CallbackURL, encoded); err != nil {
@@ -118,8 +118,8 @@ func TestCallbackDelivery_SuccessfulCallback(t *testing.T) {
 	if receivedBody["txid"] != stumpsMsg.TxID {
 		t.Errorf("expected txid=%q, got %q", stumpsMsg.TxID, receivedBody["txid"])
 	}
-	if receivedBody["status"] != string(kafka.StatusSeenOnNetwork) {
-		t.Errorf("expected status=%q, got %q", kafka.StatusSeenOnNetwork, receivedBody["status"])
+	if receivedBody["type"] != string(kafka.CallbackSeenOnNetwork) {
+		t.Errorf("expected type=%q, got %q", kafka.CallbackSeenOnNetwork, receivedBody["type"])
 	}
 }
 
@@ -156,8 +156,8 @@ func TestCallbackDelivery_RetryOnFailure(t *testing.T) {
 	cfg := &config.Config{
 		Kafka: config.KafkaConfig{
 			Brokers:        brokers,
-			StumpsTopic:    stumpsTopic,
-			StumpsDLQTopic: dlqTopic,
+			CallbackTopic:    stumpsTopic,
+			CallbackDLQTopic: dlqTopic,
 			ConsumerGroup:  fmt.Sprintf("cb-retry-test-%d", time.Now().UnixNano()),
 		},
 		Callback: config.CallbackConfig{
@@ -167,7 +167,7 @@ func TestCallbackDelivery_RetryOnFailure(t *testing.T) {
 		},
 	}
 
-	svc := callback.NewDeliveryService(cfg, nil, nil)
+	svc := callback.NewDeliveryService(cfg, nil)
 	if err := svc.Init(nil); err != nil {
 		t.Fatalf("DeliveryService.Init failed: %v", err)
 	}
@@ -183,24 +183,24 @@ func TestCallbackDelivery_RetryOnFailure(t *testing.T) {
 	// Allow consumer group to fully stabilize before publishing.
 	time.Sleep(3 * time.Second)
 
-	// Now publish the StumpsMessage.
+	// Now publish the CallbackTopicMessage.
 	producer, err := kafka.NewProducer(brokers, stumpsTopic, slog.Default())
 	if err != nil {
 		t.Fatalf("failed to create producer: %v", err)
 	}
 	defer producer.Close()
 
-	stumpsMsg := &kafka.StumpsMessage{
+	stumpsMsg := &kafka.CallbackTopicMessage{
 		CallbackURL: mockServer.URL + "/retry-test",
 		TxID:        "1122334411223344112233441122334411223344112233441122334411223344",
-		StatusType:  kafka.StatusMined,
+		Type:  kafka.CallbackStump,
 		BlockHash:   "00000000000000000000000000000000000000000000000000000000deadbeef",
 		RetryCount:  0,
 	}
 
 	encoded, err := stumpsMsg.Encode()
 	if err != nil {
-		t.Fatalf("failed to encode StumpsMessage: %v", err)
+		t.Fatalf("failed to encode CallbackTopicMessage: %v", err)
 	}
 
 	if err := producer.PublishWithHashKey(stumpsMsg.CallbackURL, encoded); err != nil {

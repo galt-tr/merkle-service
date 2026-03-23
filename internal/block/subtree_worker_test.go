@@ -7,12 +7,10 @@ import (
 
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
-	"github.com/bsv-blockchain/merkle-service/internal/store"
 )
 
 func TestSubtreeWorkerService_NewAndHealth(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cache := store.NewMemoryStumpCache(300)
 
 	svc := NewSubtreeWorkerService(
 		config.KafkaConfig{SubtreeWorkTopic: "subtree-work"},
@@ -22,8 +20,6 @@ func TestSubtreeWorkerService_NewAndHealth(t *testing.T) {
 		nil, // subtreeStore
 		nil, // urlRegistry
 		nil, // subtreeCounter
-		cache,
-		nil, // callbackAccumulator
 		logger,
 	)
 
@@ -49,7 +45,7 @@ func TestSubtreeWorkerService_EmitBlockProcessed_NilRegistry(t *testing.T) {
 	}
 	svc.InitBase("subtree-worker-test")
 	svc.Logger = logger
-	svc.stumpsProducer = newTestKafkaProducer(mock, "stumps-test", logger)
+	svc.callbackProducer = newTestKafkaProducer(mock, "callback-test", logger)
 
 	// Should not panic with nil registry.
 	svc.emitBlockProcessed("blockhash-123")

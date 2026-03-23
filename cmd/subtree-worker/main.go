@@ -70,36 +70,10 @@ func main() {
 		logger,
 	)
 
-	// Create STUMP cache (aerospike mode for K8s, memory for dev).
-	stumpCache, err := store.NewStumpCacheFromConfig(
-		cfg.Callback.StumpCacheMode,
-		asClient,
-		cfg.Aerospike.StumpCacheSet,
-		cfg.Callback.StumpCacheTTLSec,
-		cfg.Callback.StumpCacheLRUSize,
-		cfg.Aerospike.MaxRetries,
-		cfg.Aerospike.RetryBaseMs,
-	)
-	if err != nil {
-		log.Fatal("failed to create stump cache: ", err)
-	}
-	defer stumpCache.Close()
-
-	// Create, init, and start the subtree worker service.
-	// Create callback accumulator for cross-subtree batching.
-	callbackAccumulator := store.NewCallbackAccumulatorStore(
-		asClient,
-		cfg.Aerospike.CallbackAccumulatorSet,
-		cfg.Aerospike.CallbackAccumulatorTTLSec,
-		cfg.Aerospike.MaxRetries,
-		cfg.Aerospike.RetryBaseMs,
-		logger,
-	)
-
 	worker := block.NewSubtreeWorkerService(
 		cfg.Kafka, cfg.Block, cfg.DataHub,
-		regStore, subtreeStore, urlRegistry, subtreeCounter, stumpCache,
-		callbackAccumulator, logger,
+		regStore, subtreeStore, urlRegistry, subtreeCounter,
+		logger,
 	)
 
 	if err := worker.Init(nil); err != nil {

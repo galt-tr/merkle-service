@@ -17,8 +17,10 @@ func clearConfigEnv(t *testing.T) {
 		"AEROSPIKE_SET", "AEROSPIKE_SEEN_SET",
 		"AEROSPIKE_MAX_RETRIES", "AEROSPIKE_RETRY_BASE_MS",
 		"KAFKA_BROKERS", "KAFKA_SUBTREE_TOPIC", "KAFKA_BLOCK_TOPIC",
-		"KAFKA_STUMPS_TOPIC", "KAFKA_STUMPS_DLQ_TOPIC", "KAFKA_CONSUMER_GROUP",
+		"KAFKA_CALLBACK_TOPIC", "KAFKA_CALLBACK_DLQ_TOPIC", "KAFKA_CONSUMER_GROUP",
 		"P2P_NETWORK", "P2P_STORAGE_PATH",
+		"P2P_DHT_MODE", "P2P_PORT", "P2P_ANNOUNCE_ADDRS", "P2P_BOOTSTRAP_PEERS",
+		"P2P_MAX_CONNECTIONS", "P2P_MIN_CONNECTIONS", "P2P_ENABLE_NAT", "P2P_ENABLE_MDNS",
 		"SUBTREE_STORAGE_MODE", "SUBTREE_DAH_OFFSET", "SUBTREE_CACHE_MAX_MB",
 		"BLOCK_WORKER_POOL_SIZE", "BLOCK_POST_MINE_TTL_SEC",
 		"CALLBACK_MAX_RETRIES", "CALLBACK_BACKOFF_BASE_SEC",
@@ -77,8 +79,8 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.Kafka.SubtreeTopic != "subtree" {
 		t.Errorf("Kafka.SubtreeTopic: expected %q, got %q", "subtree", cfg.Kafka.SubtreeTopic)
 	}
-	if cfg.Kafka.StumpsDLQTopic != "stumps-dlq" {
-		t.Errorf("Kafka.StumpsDLQTopic: expected %q, got %q", "stumps-dlq", cfg.Kafka.StumpsDLQTopic)
+	if cfg.Kafka.CallbackDLQTopic != "callback-dlq" {
+		t.Errorf("Kafka.CallbackDLQTopic: expected %q, got %q", "callback-dlq", cfg.Kafka.CallbackDLQTopic)
 	}
 	if cfg.Kafka.ConsumerGroup != "merkle-service" {
 		t.Errorf("Kafka.ConsumerGroup: expected %q, got %q", "merkle-service", cfg.Kafka.ConsumerGroup)
@@ -142,8 +144,8 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	os.Setenv("KAFKA_BROKERS", "broker1:9092,broker2:9092")
 	os.Setenv("KAFKA_SUBTREE_TOPIC", "my-subtree")
 	os.Setenv("KAFKA_BLOCK_TOPIC", "my-block")
-	os.Setenv("KAFKA_STUMPS_TOPIC", "my-stumps")
-	os.Setenv("KAFKA_STUMPS_DLQ_TOPIC", "my-stumps-dlq")
+	os.Setenv("KAFKA_CALLBACK_TOPIC", "my-callback")
+	os.Setenv("KAFKA_CALLBACK_DLQ_TOPIC", "my-callback-dlq")
 	os.Setenv("KAFKA_CONSUMER_GROUP", "my-group")
 	os.Setenv("P2P_NETWORK", "testnet")
 	os.Setenv("P2P_STORAGE_PATH", "/tmp/p2p-test")
@@ -186,8 +188,8 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	if len(cfg.Kafka.Brokers) != 2 || cfg.Kafka.Brokers[0] != "broker1:9092" {
 		t.Errorf("Kafka.Brokers: expected [broker1:9092 broker2:9092], got %v", cfg.Kafka.Brokers)
 	}
-	if cfg.Kafka.StumpsDLQTopic != "my-stumps-dlq" {
-		t.Errorf("Kafka.StumpsDLQTopic: expected %q, got %q", "my-stumps-dlq", cfg.Kafka.StumpsDLQTopic)
+	if cfg.Kafka.CallbackDLQTopic != "my-callback-dlq" {
+		t.Errorf("Kafka.CallbackDLQTopic: expected %q, got %q", "my-callback-dlq", cfg.Kafka.CallbackDLQTopic)
 	}
 	if cfg.P2P.Network != "testnet" {
 		t.Errorf("P2P.Network: expected %q, got %q", "testnet", cfg.P2P.Network)
@@ -287,5 +289,48 @@ func TestLoad_InvalidYAMLReturnsError(t *testing.T) {
 	_, err := Load()
 	if err == nil {
 		t.Fatal("expected error for invalid YAML, got nil")
+	}
+}
+
+func TestLoad_P2PMsgBusDefaults(t *testing.T) {
+	clearConfigEnv(t)
+	os.Setenv("CONFIG_FILE", "/tmp/nonexistent-config-file.yaml")
+	defer os.Unsetenv("CONFIG_FILE")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+
+	if cfg.P2P.MsgBus.DHTMode != "off" {
+		t.Errorf("P2P.MsgBus.DHTMode: expected %q, got %q", "off", cfg.P2P.MsgBus.DHTMode)
+	}
+	if cfg.P2P.MsgBus.Port != 9905 {
+		t.Errorf("P2P.MsgBus.Port: expected 9905, got %d", cfg.P2P.MsgBus.Port)
+	}
+	if cfg.P2P.MsgBus.EnableNAT {
+		t.Error("P2P.MsgBus.EnableNAT: expected false")
+	}
+	if cfg.P2P.MsgBus.EnableMDNS {
+		t.Error("P2P.MsgBus.EnableMDNS: expected false")
+	}
+}
+
+func TestLoad_P2PDHTModeEnvOverride(t *testing.T) {
+	clearConfigEnv(t)
+	os.Setenv("CONFIG_FILE", "/tmp/nonexistent-config-file.yaml")
+	os.Setenv("P2P_DHT_MODE", "server")
+	defer func() {
+		os.Unsetenv("CONFIG_FILE")
+		os.Unsetenv("P2P_DHT_MODE")
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+
+	if cfg.P2P.MsgBus.DHTMode != "server" {
+		t.Errorf("P2P.MsgBus.DHTMode: expected %q via env, got %q", "server", cfg.P2P.MsgBus.DHTMode)
 	}
 }

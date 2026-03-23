@@ -45,13 +45,13 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
-// callbackPayload mirrors the JSON body delivered by the callback service.
+// callbackPayload mirrors the JSON body delivered by the callback service (Arcade's CallbackMessage).
 type callbackPayload struct {
-	TxID      string   `json:"txid,omitempty"`
-	TxIDs     []string `json:"txids,omitempty"`
-	Status    string   `json:"status"`
-	StumpData string   `json:"stumpData,omitempty"`
-	BlockHash string   `json:"blockHash,omitempty"`
+	Type         string `json:"type"`
+	TxID         string `json:"txid,omitempty"`
+	BlockHash    string `json:"blockHash,omitempty"`
+	SubtreeIndex int    `json:"subtreeIndex,omitempty"`
+	Stump        string `json:"stump,omitempty"`
 }
 
 // callbackCollector is a thread-safe collector for received callbacks.
@@ -153,26 +153,26 @@ func newAerospikeClient(t *testing.T, namespace string) *store.AerospikeClient {
 	return client
 }
 
-// newStumpsProducer creates a Kafka producer for the given stumps topic.
-func newStumpsProducer(t *testing.T, topic string) *kafka.Producer {
+// newCallbackProducer creates a Kafka producer for the given callback topic.
+func newCallbackProducer(t *testing.T, topic string) *kafka.Producer {
 	t.Helper()
 	producer, err := kafka.NewProducer([]string{kafkaBroker}, topic, testLogger())
 	if err != nil {
-		t.Fatalf("failed to create stumps producer: %v", err)
+		t.Fatalf("failed to create callback producer: %v", err)
 	}
 	t.Cleanup(func() { producer.Close() })
 	return producer
 }
 
 // startDeliveryService creates and starts a callback delivery service that
-// consumes from the given stumps topic and delivers to callback URLs.
-func startDeliveryService(t *testing.T, stumpsTopic string) *callback.DeliveryService {
+// consumes from the given callback topic and delivers to callback URLs.
+func startDeliveryService(t *testing.T, callbackTopic string) *callback.DeliveryService {
 	t.Helper()
 	cfg := &config.Config{
 		Kafka: config.KafkaConfig{
-			Brokers:        []string{kafkaBroker},
-			StumpsTopic:    stumpsTopic,
-			StumpsDLQTopic: stumpsTopic + "-dlq",
+			Brokers:          []string{kafkaBroker},
+			CallbackTopic:    callbackTopic,
+			CallbackDLQTopic: callbackTopic + "-dlq",
 			ConsumerGroup:  fmt.Sprintf("e2e-test-%d", time.Now().UnixNano()),
 		},
 		Callback: config.CallbackConfig{
@@ -183,7 +183,7 @@ func startDeliveryService(t *testing.T, stumpsTopic string) *callback.DeliverySe
 		},
 	}
 
-	ds := callback.NewDeliveryService(cfg, nil, nil)
+	ds := callback.NewDeliveryService(cfg, nil)
 	if err := ds.Init(nil); err != nil {
 		t.Fatalf("failed to init delivery service: %v", err)
 	}
@@ -232,33 +232,33 @@ func TestSeenOnNetworkCallback(t *testing.T) {
 		t.Fatal("expected txid to be registered")
 	}
 
-	// 3. Set up Kafka stumps topic and delivery service.
+	// 3. Set up Kafka callback topic and delivery service.
 	stumpsTopic := uniqueTopic("stumps")
 	ds := startDeliveryService(t, stumpsTopic)
 	_ = ds
 
 	// 4. Simulate what the subtree processor does: publish a SEEN_ON_NETWORK
-	//    message to the stumps topic for each registered callback URL.
-	stumpsProducer := newStumpsProducer(t, stumpsTopic)
-	stumpsMsg := &kafka.StumpsMessage{
+	//    message to the callback topic for each registered callback URL.
+	callbackProducer := newCallbackProducer(t, stumpsTopic)
+	stumpsMsg := &kafka.CallbackTopicMessage{
 		CallbackURL: callbackURL,
 		TxID:        txid,
-		StatusType:  kafka.StatusSeenOnNetwork,
-		SubtreeID:   "subtree-001",
+		Type:  kafka.CallbackSeenOnNetwork,
+		//"subtree-001",
 		RetryCount:  0,
 	}
 	data, err := stumpsMsg.Encode()
 	if err != nil {
 		t.Fatalf("failed to encode stumps message: %v", err)
 	}
-	if err := stumpsProducer.PublishWithHashKey(callbackURL, data); err != nil {
+	if err := callbackProducer.PublishWithHashKey(callbackURL, data); err != nil {
 		t.Fatalf("failed to publish stumps message: %v", err)
 	}
 
 	// 5. Wait for the mock server to receive the callback.
 	payloads := collector.waitForN(t, 1, 15*time.Second)
-	if payloads[0].Status != "SEEN_ON_NETWORK" {
-		t.Errorf("expected status SEEN_ON_NETWORK, got %q", payloads[0].Status)
+	if payloads[0].Type != "SEEN_ON_NETWORK" {
+		t.Errorf("expected status SEEN_ON_NETWORK, got %q", payloads[0].Type)
 	}
 	if payloads[0].TxID != txid {
 		t.Errorf("expected txid %s, got %s", txid, payloads[0].TxID)
@@ -287,48 +287,47 @@ func TestMinedCallbackWithSTUMP(t *testing.T) {
 		t.Fatalf("failed to register txid: %v", err)
 	}
 
-	// 2. Set up Kafka stumps topic and delivery service.
+	// 2. Set up Kafka callback topic and delivery service.
 	stumpsTopic := uniqueTopic("stumps")
 	_ = startDeliveryService(t, stumpsTopic)
 
 	// 3. Simulate what the block processor does: publish a MINED stumps message
 	//    with stumpData and blockHash.
-	stumpsProducer := newStumpsProducer(t, stumpsTopic)
+	callbackProducer := newCallbackProducer(t, stumpsTopic)
 	fakeStumpData := []byte{0x01, 0x02, 0x03, 0x04, 0xAA, 0xBB, 0xCC, 0xDD}
 	blockHash := "00000000000000000abc123def456789"
 
-	stumpsMsg := &kafka.StumpsMessage{
-		CallbackURL: callbackURL,
-		TxIDs:       []string{txid},
-		StumpData:   fakeStumpData,
-		StatusType:  kafka.StatusMined,
-		BlockHash:   blockHash,
-		SubtreeID:   "subtree-mined-001",
-		RetryCount:  0,
+	cbMsg := &kafka.CallbackTopicMessage{
+		CallbackURL:  callbackURL,
+		Type:         kafka.CallbackStump,
+		TxID:         txid,
+		BlockHash:    blockHash,
+		SubtreeIndex: 1,
+		Stump:        fakeStumpData,
 	}
-	data, err := stumpsMsg.Encode()
+	data, err := cbMsg.Encode()
 	if err != nil {
-		t.Fatalf("failed to encode stumps message: %v", err)
+		t.Fatalf("failed to encode callback message: %v", err)
 	}
-	if err := stumpsProducer.PublishWithHashKey(callbackURL, data); err != nil {
-		t.Fatalf("failed to publish stumps message: %v", err)
+	if err := callbackProducer.PublishWithHashKey(callbackURL, data); err != nil {
+		t.Fatalf("failed to publish callback message: %v", err)
 	}
 
 	// 4. Wait for the mock server to receive the callback.
 	payloads := collector.waitForN(t, 1, 15*time.Second)
-	if payloads[0].Status != "MINED" {
-		t.Errorf("expected status MINED, got %q", payloads[0].Status)
+	if payloads[0].Type != "STUMP" {
+		t.Errorf("expected type STUMP, got %q", payloads[0].Type)
 	}
-	if payloads[0].StumpData == "" {
-		t.Error("expected stumpData to be present in MINED callback")
+	if payloads[0].Stump == "" {
+		t.Error("expected stump to be present in STUMP callback")
 	}
 	if payloads[0].BlockHash != blockHash {
 		t.Errorf("expected blockHash %s, got %s", blockHash, payloads[0].BlockHash)
 	}
-	if len(payloads[0].TxIDs) == 0 || payloads[0].TxIDs[0] != txid {
-		t.Errorf("expected txids to contain %s, got %v", txid, payloads[0].TxIDs)
+	if payloads[0].TxID != txid {
+		t.Errorf("expected txid %s, got %s", txid, payloads[0].TxID)
 	}
-	t.Logf("MINED callback with stumpData received for txid %s", txid)
+	t.Logf("STUMP callback received for txid %s", txid)
 }
 
 // TestMultipleCallbacks (10.3)
@@ -371,42 +370,42 @@ func TestMultipleCallbacks(t *testing.T) {
 		t.Fatalf("expected 2 callback URLs, got %d", len(regs[txid]))
 	}
 
-	// 3. Set up Kafka stumps topic and delivery service.
+	// 3. Set up Kafka callback topic and delivery service.
 	stumpsTopic := uniqueTopic("stumps")
 	_ = startDeliveryService(t, stumpsTopic)
-	stumpsProducer := newStumpsProducer(t, stumpsTopic)
+	callbackProducer := newCallbackProducer(t, stumpsTopic)
 
 	// 4. Simulate the subtree processor: publish SEEN_ON_NETWORK for each
 	//    callback URL (as the real processor would).
 	for _, cbURL := range []string{callbackURL1, callbackURL2} {
-		stumpsMsg := &kafka.StumpsMessage{
+		stumpsMsg := &kafka.CallbackTopicMessage{
 			CallbackURL: cbURL,
 			TxID:        txid,
-			StatusType:  kafka.StatusSeenOnNetwork,
-			SubtreeID:   "subtree-multi-001",
+			Type:  kafka.CallbackSeenOnNetwork,
+			//"subtree-multi-001",
 			RetryCount:  0,
 		}
 		data, err := stumpsMsg.Encode()
 		if err != nil {
 			t.Fatalf("failed to encode stumps message: %v", err)
 		}
-		if err := stumpsProducer.PublishWithHashKey(cbURL, data); err != nil {
+		if err := callbackProducer.PublishWithHashKey(cbURL, data); err != nil {
 			t.Fatalf("failed to publish stumps message: %v", err)
 		}
 	}
 
 	// 5. Wait for both mock servers to receive callbacks.
 	payloads1 := collector1.waitForN(t, 1, 15*time.Second)
-	if payloads1[0].Status != "SEEN_ON_NETWORK" {
-		t.Errorf("server1: expected status SEEN_ON_NETWORK, got %q", payloads1[0].Status)
+	if payloads1[0].Type != "SEEN_ON_NETWORK" {
+		t.Errorf("server1: expected status SEEN_ON_NETWORK, got %q", payloads1[0].Type)
 	}
 	if payloads1[0].TxID != txid {
 		t.Errorf("server1: expected txid %s, got %s", txid, payloads1[0].TxID)
 	}
 
 	payloads2 := collector2.waitForN(t, 1, 15*time.Second)
-	if payloads2[0].Status != "SEEN_ON_NETWORK" {
-		t.Errorf("server2: expected status SEEN_ON_NETWORK, got %q", payloads2[0].Status)
+	if payloads2[0].Type != "SEEN_ON_NETWORK" {
+		t.Errorf("server2: expected status SEEN_ON_NETWORK, got %q", payloads2[0].Type)
 	}
 	if payloads2[0].TxID != txid {
 		t.Errorf("server2: expected txid %s, got %s", txid, payloads2[0].TxID)
@@ -464,32 +463,32 @@ func TestSeenMultipleNodes(t *testing.T) {
 		t.Fatal("expected threshold to be reached during increments")
 	}
 
-	// 4. Set up Kafka stumps topic and delivery service.
+	// 4. Set up Kafka callback topic and delivery service.
 	stumpsTopic := uniqueTopic("stumps")
 	_ = startDeliveryService(t, stumpsTopic)
-	stumpsProducer := newStumpsProducer(t, stumpsTopic)
+	callbackProducer := newCallbackProducer(t, stumpsTopic)
 
 	// 5. Publish a SEEN_MULTIPLE_NODES message (as the subtree processor would
 	//    when the threshold is reached).
-	stumpsMsg := &kafka.StumpsMessage{
+	stumpsMsg := &kafka.CallbackTopicMessage{
 		CallbackURL: callbackURL,
 		TxID:        txid,
-		StatusType:  kafka.StatusSeenMultiNodes,
-		SubtreeID:   "subtree-multi-nodes-001",
+		Type:  kafka.CallbackSeenMultipleNodes,
+		//"subtree-multi-nodes-001",
 		RetryCount:  0,
 	}
 	data, err := stumpsMsg.Encode()
 	if err != nil {
 		t.Fatalf("failed to encode stumps message: %v", err)
 	}
-	if err := stumpsProducer.PublishWithHashKey(callbackURL, data); err != nil {
+	if err := callbackProducer.PublishWithHashKey(callbackURL, data); err != nil {
 		t.Fatalf("failed to publish stumps message: %v", err)
 	}
 
 	// 6. Wait for the mock server to receive the callback.
 	payloads := collector.waitForN(t, 1, 15*time.Second)
-	if payloads[0].Status != "SEEN_MULTIPLE_NODES" {
-		t.Errorf("expected status SEEN_MULTIPLE_NODES, got %q", payloads[0].Status)
+	if payloads[0].Type != "SEEN_MULTIPLE_NODES" {
+		t.Errorf("expected status SEEN_MULTIPLE_NODES, got %q", payloads[0].Type)
 	}
 	if payloads[0].TxID != txid {
 		t.Errorf("expected txid %s, got %s", txid, payloads[0].TxID)

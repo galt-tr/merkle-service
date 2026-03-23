@@ -7,7 +7,6 @@ import (
 
 	"github.com/bsv-blockchain/merkle-service/internal/block"
 	"github.com/bsv-blockchain/merkle-service/internal/config"
-	"github.com/bsv-blockchain/merkle-service/internal/kafka"
 	"github.com/bsv-blockchain/merkle-service/internal/service"
 	"github.com/bsv-blockchain/merkle-service/internal/store"
 )
@@ -54,13 +53,6 @@ func main() {
 		logger,
 	)
 
-	// Create Kafka stumps producer.
-	stumpsProducer, err := kafka.NewProducer(cfg.Kafka.Brokers, cfg.Kafka.StumpsTopic, logger)
-	if err != nil {
-		log.Fatal("failed to create stumps producer: ", err)
-	}
-	defer stumpsProducer.Close()
-
 	urlRegistry := store.NewCallbackURLRegistry(
 		asClient,
 		cfg.Aerospike.CallbackURLRegistry,
@@ -70,7 +62,7 @@ func main() {
 	)
 
 	// Create, init, and start the block processor.
-	processor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, stumpsProducer, regStore, subtreeStore, urlRegistry, nil, logger)
+	processor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, regStore, subtreeStore, urlRegistry, nil, logger)
 
 	if err := processor.Init(nil); err != nil {
 		log.Fatal("failed to init block processor: ", err)

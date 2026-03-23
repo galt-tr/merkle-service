@@ -24,7 +24,8 @@ func newAccumulatorTestStore(t *testing.T) *CallbackAccumulatorStore {
 func TestCallbackAccumulatorStore_AppendSingle(t *testing.T) {
 	store := newAccumulatorTestStore(t)
 
-	err := store.Append("block1", "http://example.com/cb", []string{"txid1", "txid2"}, "subtreeA")
+	stumpData := []byte{0x01, 0x02, 0x03}
+	err := store.Append("block1", "http://example.com/cb", []string{"txid1", "txid2"}, 0, stumpData)
 	if err != nil {
 		t.Fatalf("Append failed: %v", err)
 	}
@@ -42,22 +43,26 @@ func TestCallbackAccumulatorStore_AppendSingle(t *testing.T) {
 	if acc == nil {
 		t.Fatal("expected entry for callback URL")
 	}
-	if len(acc.TxIDs) != 2 {
-		t.Errorf("expected 2 txids, got %d", len(acc.TxIDs))
+	if len(acc.Entries) != 1 {
+		t.Fatalf("expected 1 entry (one subtree append), got %d", len(acc.Entries))
 	}
-	if len(acc.StumpRefs) != 1 || acc.StumpRefs[0] != "subtreeA" {
-		t.Errorf("expected StumpRefs=[subtreeA], got %v", acc.StumpRefs)
+	if len(acc.Entries[0].TxIDs) != 2 {
+		t.Errorf("expected 2 txids in entry, got %d", len(acc.Entries[0].TxIDs))
+	}
+	if acc.Entries[0].TxIDs[0] != "txid1" {
+		t.Errorf("expected first txid=txid1, got %s", acc.Entries[0].TxIDs[0])
 	}
 }
 
 func TestCallbackAccumulatorStore_AppendMultipleSameURL(t *testing.T) {
 	store := newAccumulatorTestStore(t)
 
-	// Two subtrees with txids for the same callback URL.
-	if err := store.Append("block2", "http://example.com/cb", []string{"txid1"}, "subtreeA"); err != nil {
+	stumpA := []byte{0x01}
+	stumpB := []byte{0x02}
+	if err := store.Append("block2", "http://example.com/cb", []string{"txid1"}, 0, stumpA); err != nil {
 		t.Fatalf("Append 1 failed: %v", err)
 	}
-	if err := store.Append("block2", "http://example.com/cb", []string{"txid2", "txid3"}, "subtreeB"); err != nil {
+	if err := store.Append("block2", "http://example.com/cb", []string{"txid2", "txid3"}, 1, stumpB); err != nil {
 		t.Fatalf("Append 2 failed: %v", err)
 	}
 
@@ -70,21 +75,19 @@ func TestCallbackAccumulatorStore_AppendMultipleSameURL(t *testing.T) {
 	if acc == nil {
 		t.Fatal("expected entry for callback URL")
 	}
-	if len(acc.TxIDs) != 3 {
-		t.Errorf("expected 3 txids, got %d: %v", len(acc.TxIDs), acc.TxIDs)
-	}
-	if len(acc.StumpRefs) != 2 {
-		t.Errorf("expected 2 StumpRefs, got %d: %v", len(acc.StumpRefs), acc.StumpRefs)
+	if len(acc.Entries) != 2 {
+		t.Errorf("expected 2 entries (two subtree appends), got %d", len(acc.Entries))
 	}
 }
 
 func TestCallbackAccumulatorStore_AppendDifferentURLs(t *testing.T) {
 	store := newAccumulatorTestStore(t)
 
-	if err := store.Append("block3", "http://a.com/cb", []string{"txid1"}, "subtreeA"); err != nil {
+	stump := []byte{0x01}
+	if err := store.Append("block3", "http://a.com/cb", []string{"txid1"}, 0, stump); err != nil {
 		t.Fatalf("Append 1 failed: %v", err)
 	}
-	if err := store.Append("block3", "http://b.com/cb", []string{"txid2"}, "subtreeA"); err != nil {
+	if err := store.Append("block3", "http://b.com/cb", []string{"txid2"}, 0, stump); err != nil {
 		t.Fatalf("Append 2 failed: %v", err)
 	}
 
@@ -104,7 +107,8 @@ func TestCallbackAccumulatorStore_AppendDifferentURLs(t *testing.T) {
 func TestCallbackAccumulatorStore_ReadAndDeleteRemovesRecord(t *testing.T) {
 	store := newAccumulatorTestStore(t)
 
-	if err := store.Append("block4", "http://example.com/cb", []string{"txid1"}, "subtreeA"); err != nil {
+	stump := []byte{0x01}
+	if err := store.Append("block4", "http://example.com/cb", []string{"txid1"}, 0, stump); err != nil {
 		t.Fatalf("Append failed: %v", err)
 	}
 

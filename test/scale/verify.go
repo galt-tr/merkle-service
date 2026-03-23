@@ -3,7 +3,7 @@
 package scale
 
 import (
-	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"testing"
 	"time"
@@ -63,11 +63,11 @@ func verifyMinedCompleteness(t *testing.T, fleet *CallbackFleet, manifest *Manif
 		server := fleet.GetServer(arcade.Index)
 		payloads := server.MinedPayloads()
 
-		// Collect all txids received by this server.
+		// Collect all txids received by this server (one per STUMP callback).
 		received := make(map[string]bool)
 		for _, p := range payloads {
-			for _, txid := range p.TxIDs {
-				received[txid] = true
+			if p.TxID != "" {
+				received[p.TxID] = true
 			}
 		}
 
@@ -118,8 +118,8 @@ func verifyMinedNoDuplicates(t *testing.T, fleet *CallbackFleet, manifest *Manif
 
 		seen := make(map[string]int)
 		for _, p := range payloads {
-			for _, txid := range p.TxIDs {
-				seen[txid]++
+			if p.TxID != "" {
+				seen[p.TxID]++
 			}
 		}
 
@@ -147,37 +147,37 @@ func verifyStumpValidity(t *testing.T, fleet *CallbackFleet, manifest *Manifest)
 		payloads := server.MinedPayloads()
 
 		for i, p := range payloads {
-			if p.StumpData == "" {
-				t.Errorf("arcade %d, MINED callback %d: empty stumpData", arcade.Index, i)
+			if p.Stump == "" {
+				t.Errorf("arcade %d, STUMP callback %d: empty stump", arcade.Index, i)
 				continue
 			}
 
-			// Decode base64.
-			stumpBytes, err := base64.StdEncoding.DecodeString(p.StumpData)
+			// Decode hex (Arcade's HexBytes format).
+			stumpBytes, err := hex.DecodeString(p.Stump)
 			if err != nil {
-				t.Errorf("arcade %d, MINED callback %d: invalid base64 stumpData: %v", arcade.Index, i, err)
+				t.Errorf("arcade %d, STUMP callback %d: invalid hex stump: %v", arcade.Index, i, err)
 				continue
 			}
 
 			// Validate BRC-0074 STUMP format: first bytes are CompactSize block height.
 			if len(stumpBytes) < 2 {
-				t.Errorf("arcade %d, MINED callback %d: stumpData too short (%d bytes)", arcade.Index, i, len(stumpBytes))
+				t.Errorf("arcade %d, STUMP callback %d: stump too short (%d bytes)", arcade.Index, i, len(stumpBytes))
 				continue
 			}
 
 			// Parse block height from CompactSize VarInt.
 			blockHeight, bytesRead := readCompactSize(stumpBytes)
 			if bytesRead == 0 {
-				t.Errorf("arcade %d, MINED callback %d: failed to parse block height from stumpData", arcade.Index, i)
+				t.Errorf("arcade %d, STUMP callback %d: failed to parse block height from stump", arcade.Index, i)
 				continue
 			}
 
 			if blockHeight != uint64(manifest.BlockHeight) {
-				t.Errorf("arcade %d, MINED callback %d: block height %d != expected %d", arcade.Index, i, blockHeight, manifest.BlockHeight)
+				t.Errorf("arcade %d, STUMP callback %d: block height %d != expected %d", arcade.Index, i, blockHeight, manifest.BlockHeight)
 			}
 
 			if p.BlockHash != manifest.BlockHash {
-				t.Errorf("arcade %d, MINED callback %d: blockHash %s != expected %s", arcade.Index, i, p.BlockHash, manifest.BlockHash)
+				t.Errorf("arcade %d, STUMP callback %d: blockHash %s != expected %s", arcade.Index, i, p.BlockHash, manifest.BlockHash)
 			}
 		}
 	}

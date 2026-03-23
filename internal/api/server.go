@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
+
+//go:embed dashboard.html
+var dashboardHTML []byte
 
 // Server implements the API server service.
 type Server struct {
@@ -54,8 +58,10 @@ func (s *Server) Init(cfg interface{}) error {
 	s.router.Use(middleware.Recoverer)
 
 	// Routes
+	s.router.Get("/", handleDashboard)
 	s.router.Post("/watch", s.handleWatch)
 	s.router.Get("/health", s.handleHealth)
+	s.router.Get("/api/lookup/{txid}", s.handleLookup)
 
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.cfg.Port),

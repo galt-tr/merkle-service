@@ -57,10 +57,6 @@ aerospike:
   # Env: AEROSPIKE_SUBTREE_COUNTER_SET
   subtreeCounterSet: subtree_counters
 
-  # Aerospike set used for distributed STUMP cache (when stumpCacheMode is "aerospike").
-  # Env: AEROSPIKE_STUMP_CACHE_SET
-  stumpCacheSet: stump_cache
-
   # TTL in seconds for subtree counter records. Should exceed maximum block processing time.
   # Env: AEROSPIKE_SUBTREE_COUNTER_TTL_SEC
   subtreeCounterTTLSec: 600
@@ -98,13 +94,13 @@ kafka:
   # Env: KAFKA_BLOCK_TOPIC
   blockTopic: block
 
-  # Topic for STUMP and callback status messages (SEEN_ON_NETWORK, MINED, etc.).
-  # Env: KAFKA_STUMPS_TOPIC
-  stumpsTopic: stumps
+  # Topic for callback messages (SEEN_ON_NETWORK, STUMP, BLOCK_PROCESSED, etc.).
+  # Env: KAFKA_CALLBACK_TOPIC
+  callbackTopic: callback
 
   # Dead-letter queue topic for permanently failed callback deliveries.
-  # Env: KAFKA_STUMPS_DLQ_TOPIC
-  stumpsDlqTopic: stumps-dlq
+  # Env: KAFKA_CALLBACK_DLQ_TOPIC
+  callbackDlqTopic: callback-dlq
 
   # Topic for subtree work items dispatched by the block processor for parallel processing.
   # Env: KAFKA_SUBTREE_WORK_TOPIC
@@ -213,21 +209,6 @@ callback:
   # Maximum idle HTTP connections kept alive per callback endpoint.
   # Env: CALLBACK_MAX_IDLE_CONNS_PER_HOST
   maxIdleConnsPerHost: 16
-
-  # TTL in seconds for the STUMP cache used by delivery workers.
-  # STUMPs are resolved from cache via StumpRef instead of inline Kafka data.
-  # Env: CALLBACK_STUMP_CACHE_TTL_SEC
-  stumpCacheTTLSec: 300
-
-  # STUMP cache backend: "memory" (in-process sync.Map) or "aerospike" (distributed).
-  # Use "memory" for all-in-one/dev mode, "aerospike" for Kubernetes/production.
-  # Env: CALLBACK_STUMP_CACHE_MODE
-  stumpCacheMode: memory
-
-  # Maximum entries in the local LRU read-through cache (aerospike mode only).
-  # Reduces Aerospike reads when multiple delivery workers resolve the same StumpRef.
-  # Env: CALLBACK_STUMP_CACHE_LRU_SIZE
-  stumpCacheLRUSize: 1024
 
 # ---------------------------------------------------------------------------
 # Blob Store — subtree data storage

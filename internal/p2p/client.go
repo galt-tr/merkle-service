@@ -92,6 +92,16 @@ func (c *Client) Start(ctx context.Context) error {
 		StoragePath: c.cfg.StoragePath,
 	}
 
+	mb := &p2pCfg.MsgBus
+	mb.DHTMode = c.cfg.MsgBus.DHTMode
+	mb.Port = c.cfg.MsgBus.Port
+	mb.AnnounceAddrs = c.cfg.MsgBus.AnnounceAddrs
+	mb.BootstrapPeers = c.cfg.MsgBus.BootstrapPeers
+	mb.MaxConnections = c.cfg.MsgBus.MaxConnections
+	mb.MinConnections = c.cfg.MsgBus.MinConnections
+	mb.EnableNAT = c.cfg.MsgBus.EnableNAT
+	mb.EnableMDNS = c.cfg.MsgBus.EnableMDNS
+
 	client, err := p2pCfg.Initialize(ctx, "merkle-service")
 	if err != nil {
 		return fmt.Errorf("failed to initialize p2p client: %w", err)
@@ -101,6 +111,8 @@ func (c *Client) Start(ctx context.Context) error {
 	c.Logger.Info("p2p client created",
 		"peerID", client.GetID(),
 		"network", client.GetNetwork(),
+		"dhtMode", c.cfg.MsgBus.DHTMode,
+		"port", c.cfg.MsgBus.Port,
 	)
 
 	// Subscribe to typed channels.

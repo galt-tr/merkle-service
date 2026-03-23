@@ -20,7 +20,6 @@ data:
       seenSet: seen_counters
       callbackDedupSet: callback_dedup
       subtreeCounterSet: subtree_counters
-      stumpCacheSet: stump_cache
       callbackAccumulatorSet: callback_accum
       subtreeCounterTTLSec: 600
       callbackAccumulatorTTLSec: 600
@@ -32,14 +31,27 @@ data:
         - kafka-0.kafka.merkle-service.svc.cluster.local:9092
       subtreeTopic: subtree
       blockTopic: block
-      stumpsTopic: stumps
-      stumpsDlqTopic: stumps-dlq
+      callbackTopic: callback
+      callbackDlqTopic: callback-dlq
       subtreeWorkTopic: subtree-work
       consumerGroup: merkle-service
 
     p2p:
       network: main
       storagePath: /data/p2p
+      msgbus:
+        # dhtMode: "off" is recommended for EKS/cloud pods with private IPs.
+        # The pod connects to bootstrap servers and joins the gossip mesh via relay
+        # circuits, without DHT crawling. Use "server" only for public bootstrap nodes.
+        dhtMode: off
+        # port: fixed listen port for the libp2p host. Matches Teranode bootstrap servers.
+        port: 9905
+        # announceAddrs: optional list of multiaddr strings to advertise to peers.
+        # Leave empty when dhtMode is "off" (relay handles NAT traversal).
+        # Set when the pod has a reachable external address, e.g.:
+        #   announceAddrs:
+        #     - /ip4/203.0.113.10/tcp/9905
+        announceAddrs: []
 
     subtree:
       storageMode: realtime
@@ -61,9 +73,6 @@ data:
       deliveryWorkers: 64
       maxConnsPerHost: 32
       maxIdleConnsPerHost: 16
-      stumpCacheTTLSec: 300
-      stumpCacheMode: aerospike
-      stumpCacheLRUSize: 1024
 
     # blobStore.url: Use file:// for single-node / all-in-one only.
     # For multi-replica subtree-fetcher deployments, use a shared object store:

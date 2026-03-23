@@ -5,14 +5,14 @@ import (
 	"time"
 )
 
-// StatusType represents the type of callback notification.
-type StatusType string
+// CallbackType represents the type of callback message, matching Arcade's CallbackType.
+type CallbackType string
 
 const (
-	StatusSeenOnNetwork  StatusType = "SEEN_ON_NETWORK"
-	StatusSeenMultiNodes StatusType = "SEEN_MULTIPLE_NODES"
-	StatusMined          StatusType = "MINED"
-	StatusBlockProcessed StatusType = "BLOCK_PROCESSED"
+	CallbackSeenOnNetwork    CallbackType = "SEEN_ON_NETWORK"
+	CallbackSeenMultipleNodes CallbackType = "SEEN_MULTIPLE_NODES"
+	CallbackStump            CallbackType = "STUMP"
+	CallbackBlockProcessed   CallbackType = "BLOCK_PROCESSED"
 )
 
 // SubtreeMessage represents a subtree announcement received from P2P.
@@ -34,19 +34,17 @@ type BlockMessage struct {
 	ClientName string `json:"clientName"`
 }
 
-// StumpsMessage represents a callback notification (STUMP or status).
-type StumpsMessage struct {
-	CallbackURL string     `json:"callbackUrl"`
-	TxID        string     `json:"txid,omitempty"`
-	TxIDs       []string   `json:"txids,omitempty"`
-	StumpData   []byte     `json:"stumpData,omitempty"`
-	StumpRef    string     `json:"stumpRef,omitempty"`
-	StumpRefs   []string   `json:"stumpRefs,omitempty"`
-	StatusType  StatusType `json:"statusType"`
-	BlockHash   string     `json:"blockHash,omitempty"`
-	SubtreeID   string     `json:"subtreeId,omitempty"`
-	RetryCount  int        `json:"retryCount"`
-	NextRetryAt time.Time  `json:"nextRetryAt,omitempty"`
+// CallbackTopicMessage is the message published to the callback Kafka topic.
+// It wraps the Arcade CallbackMessage fields plus delivery metadata.
+type CallbackTopicMessage struct {
+	CallbackURL  string       `json:"callbackUrl"`
+	Type         CallbackType `json:"type"`
+	TxID         string       `json:"txid,omitempty"`
+	BlockHash    string       `json:"blockHash,omitempty"`
+	SubtreeIndex int          `json:"subtreeIndex,omitempty"`
+	Stump        []byte       `json:"stump,omitempty"`
+	RetryCount   int          `json:"retryCount,omitempty"`
+	NextRetryAt  time.Time    `json:"nextRetryAt,omitempty"`
 }
 
 func (m *SubtreeMessage) Encode() ([]byte, error) {
@@ -71,10 +69,11 @@ func DecodeBlockMessage(data []byte) (*BlockMessage, error) {
 
 // SubtreeWorkMessage represents a subtree processing work item dispatched by the block processor.
 type SubtreeWorkMessage struct {
-	BlockHash   string `json:"blockHash"`
-	BlockHeight uint32 `json:"blockHeight"`
-	SubtreeHash string `json:"subtreeHash"`
-	DataHubURL  string `json:"dataHubUrl"`
+	BlockHash    string `json:"blockHash"`
+	BlockHeight  uint32 `json:"blockHeight"`
+	SubtreeHash  string `json:"subtreeHash"`
+	SubtreeIndex int    `json:"subtreeIndex"`
+	DataHubURL   string `json:"dataHubUrl"`
 }
 
 func (m *SubtreeWorkMessage) Encode() ([]byte, error) {
@@ -87,12 +86,12 @@ func DecodeSubtreeWorkMessage(data []byte) (*SubtreeWorkMessage, error) {
 	return &msg, err
 }
 
-func (m *StumpsMessage) Encode() ([]byte, error) {
+func (m *CallbackTopicMessage) Encode() ([]byte, error) {
 	return json.Marshal(m)
 }
 
-func DecodeStumpsMessage(data []byte) (*StumpsMessage, error) {
-	var msg StumpsMessage
+func DecodeCallbackTopicMessage(data []byte) (*CallbackTopicMessage, error) {
+	var msg CallbackTopicMessage
 	err := json.Unmarshal(data, &msg)
 	return &msg, err
 }
