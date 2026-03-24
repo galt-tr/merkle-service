@@ -40,6 +40,7 @@ type CallbackTopicMessage struct {
 	CallbackURL  string       `json:"callbackUrl"`
 	Type         CallbackType `json:"type"`
 	TxID         string       `json:"txid,omitempty"`
+	TxIDs        []string     `json:"txids,omitempty"`
 	BlockHash    string       `json:"blockHash,omitempty"`
 	SubtreeIndex int          `json:"subtreeIndex,omitempty"`
 	Stump        []byte       `json:"stump,omitempty"`

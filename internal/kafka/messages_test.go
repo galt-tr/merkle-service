@@ -179,6 +179,39 @@ func TestCallbackTopicMessage_Stump(t *testing.T) {
 	}
 }
 
+func TestCallbackTopicMessage_BatchedSeenOnNetwork(t *testing.T) {
+	msg := &CallbackTopicMessage{
+		CallbackURL: "https://example.com/cb",
+		Type:        CallbackSeenOnNetwork,
+		TxIDs:       []string{"txid1", "txid2", "txid3"},
+	}
+
+	data, err := msg.Encode()
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+
+	decoded, err := DecodeCallbackTopicMessage(data)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+
+	if decoded.Type != CallbackSeenOnNetwork {
+		t.Errorf("type mismatch: got %s", decoded.Type)
+	}
+	if len(decoded.TxIDs) != 3 {
+		t.Fatalf("expected 3 TxIDs, got %d", len(decoded.TxIDs))
+	}
+	for i, expected := range []string{"txid1", "txid2", "txid3"} {
+		if decoded.TxIDs[i] != expected {
+			t.Errorf("TxIDs[%d]: expected %s, got %s", i, expected, decoded.TxIDs[i])
+		}
+	}
+	if decoded.TxID != "" {
+		t.Errorf("expected empty TxID for batched message, got %s", decoded.TxID)
+	}
+}
+
 func TestCallbackTopicMessage_BlockProcessed(t *testing.T) {
 	msg := &CallbackTopicMessage{
 		CallbackURL: "https://arcade.example.com/callback",

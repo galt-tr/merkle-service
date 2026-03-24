@@ -162,11 +162,9 @@ func (s *SubtreeWorkerService) handleMessage(ctx context.Context, msg *sarama.Co
 		// can still fire. The subtree processing failure is logged.
 	}
 
-	// Publish individual STUMP callbacks immediately per txid.
-	// With per-txid messages (matching Arcade's CallbackMessage contract), there is no
-	// batching benefit from accumulating — publish as each subtree completes.
+	// Publish one STUMP callback per (callbackURL, subtree) combination.
 	if result != nil && len(result.CallbackGroups) > 0 {
-		s.publishIndividualCallbacks(workMsg, result)
+		s.publishSubtreeCallbacks(workMsg, result)
 	}
 
 	// Decrement the subtree counter. If it reaches zero, emit BLOCK_PROCESSED.
@@ -185,28 +183,25 @@ func (s *SubtreeWorkerService) handleMessage(ctx context.Context, msg *sarama.Co
 	return nil
 }
 
-// publishIndividualCallbacks publishes one CallbackTopicMessage per txid per callback URL.
-func (s *SubtreeWorkerService) publishIndividualCallbacks(workMsg *kafka.SubtreeWorkMessage, result *SubtreeResult) {
-	for callbackURL, txids := range result.CallbackGroups {
-		for _, txid := range txids {
-			msg := &kafka.CallbackTopicMessage{
-				CallbackURL:  callbackURL,
-				Type:         kafka.CallbackStump,
-				TxID:         txid,
-				BlockHash:    workMsg.BlockHash,
-				SubtreeIndex: workMsg.SubtreeIndex,
-				Stump:        result.StumpData,
-			}
-			data, err := msg.Encode()
-			if err != nil {
-				s.Logger.Error("failed to encode STUMP callback message",
-					"callbackURL", callbackURL, "txid", txid, "error", err)
-				continue
-			}
-			if err := s.callbackProducer.PublishWithHashKey(callbackURL, data); err != nil {
-				s.Logger.Error("failed to publish STUMP callback",
-					"callbackURL", callbackURL, "txid", txid, "error", err)
-			}
+// publishSubtreeCallbacks publishes one CallbackTopicMessage per callbackURL per subtree.
+func (s *SubtreeWorkerService) publishSubtreeCallbacks(workMsg *kafka.SubtreeWorkMessage, result *SubtreeResult) {
+	for callbackURL := range result.CallbackGroups {
+		msg := &kafka.CallbackTopicMessage{
+			CallbackURL:  callbackURL,
+			Type:         kafka.CallbackStump,
+			BlockHash:    workMsg.BlockHash,
+			SubtreeIndex: workMsg.SubtreeIndex,
+			Stump:        result.StumpData,
+		}
+		data, err := msg.Encode()
+		if err != nil {
+			s.Logger.Error("failed to encode STUMP callback message",
+				"callbackURL", callbackURL, "error", err)
+			continue
+		}
+		if err := s.callbackProducer.PublishWithHashKey(callbackURL, data); err != nil {
+			s.Logger.Error("failed to publish STUMP callback",
+				"callbackURL", callbackURL, "error", err)
 		}
 	}
 }

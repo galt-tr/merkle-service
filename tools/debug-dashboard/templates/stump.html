@@ -2,8 +2,8 @@
 <div class="card">
     <h2>STUMP Visualizer</h2>
     <div class="form-group">
-        <label for="stump-input">Base64-encoded STUMP (BRC-0074 BUMP format)</label>
-        <textarea id="stump-input" rows="4" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 12px;border-radius:6px;font-size:13px;font-family:monospace;width:100%;resize:vertical;" placeholder="Paste base64-encoded STUMP data here..."></textarea>
+        <label for="stump-input">STUMP data (base64 or hex encoded, BRC-0074 BUMP format)</label>
+        <textarea id="stump-input" rows="4" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 12px;border-radius:6px;font-size:13px;font-family:monospace;width:100%;resize:vertical;" placeholder="Paste base64 or hex-encoded STUMP data here..."></textarea>
     </div>
     <button id="decode-btn" onclick="decodeAndRender()">Decode &amp; Visualize</button>
     <button class="btn-secondary" onclick="loadExample()" style="margin-left:8px;">Load Example</button>
@@ -45,16 +45,25 @@
 // BRC-0074 BUMP Decoder (client-side)
 // ============================================================
 
-function decodeBase64(str) {
+function decodeInput(str) {
     str = str.trim();
     if (!str) throw new Error('Input is empty');
+    // Auto-detect: if it looks like pure hex (only 0-9a-fA-F, even length), decode as hex
+    if (/^[0-9a-fA-F]+$/.test(str) && str.length % 2 === 0) {
+        var arr = new Uint8Array(str.length / 2);
+        for (var i = 0; i < str.length; i += 2) {
+            arr[i / 2] = parseInt(str.substring(i, i + 2), 16);
+        }
+        return arr;
+    }
+    // Otherwise treat as base64
     try {
         var bin = atob(str);
         var arr = new Uint8Array(bin.length);
         for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
         return arr;
     } catch (e) {
-        throw new Error('Invalid base64: ' + e.message);
+        throw new Error('Invalid input: not valid hex or base64 (' + e.message + ')');
     }
 }
 
@@ -485,13 +494,13 @@ function decodeAndRender() {
     selectedTxidOffset = null;
 
     if (!input.trim()) {
-        errorBox.textContent = 'Please paste base64-encoded STUMP data above.';
+        errorBox.textContent = 'Please paste STUMP data (base64 or hex) above.';
         errorBox.style.display = '';
         return;
     }
 
     try {
-        var data = decodeBase64(input);
+        var data = decodeInput(input);
         var bump = decodeBUMP(data);
         currentBUMP = bump;
 

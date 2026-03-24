@@ -3,11 +3,15 @@ package callback
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,11 +31,72 @@ type CallbackDeduper interface {
 
 // callbackPayload is the JSON body sent to the callback URL, matching Arcade's CallbackMessage.
 type callbackPayload struct {
-	Type         string `json:"type"`
-	TxID         string `json:"txid,omitempty"`
-	BlockHash    string `json:"blockHash,omitempty"`
-	SubtreeIndex int    `json:"subtreeIndex,omitempty"`
-	Stump        string `json:"stump,omitempty"`
+	Type         string   `json:"type"`
+	TxID         string   `json:"txid,omitempty"`
+	TxIDs        []string `json:"txids,omitempty"`
+	BlockHash    string   `json:"blockHash,omitempty"`
+	SubtreeIndex int      `json:"subtreeIndex,omitempty"`
+	Stump        string   `json:"stump,omitempty"`
+}
+
+// stumpGate coordinates STUMP/BLOCK_PROCESSED delivery ordering.
+// It ensures all STUMP HTTP deliveries for a (blockHash, callbackURL) complete
+// before BLOCK_PROCESSED is delivered to that callbackURL.
+//
+// Safety: for a given callbackURL, all messages are hash-partitioned to the same
+// Kafka partition, so handleMessage sees STUMPs before BLOCK_PROCESSED. Add()
+// is called in handleMessage (sequential per partition) and Done()/Wait() are
+// called in processDelivery (concurrent workers).
+type stumpGate struct {
+	mu    sync.Mutex
+	gates map[string]*sync.WaitGroup
+}
+
+func newStumpGate() *stumpGate {
+	return &stumpGate{gates: make(map[string]*sync.WaitGroup)}
+}
+
+func stumpGateKey(blockHash, callbackURL string) string {
+	return blockHash + "|" + callbackURL
+}
+
+// Add registers a pending STUMP delivery. Called from handleMessage (sequential per partition).
+func (g *stumpGate) Add(blockHash, callbackURL string) {
+	key := stumpGateKey(blockHash, callbackURL)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wg, ok := g.gates[key]
+	if !ok {
+		wg = &sync.WaitGroup{}
+		g.gates[key] = wg
+	}
+	wg.Add(1)
+}
+
+// Done signals that a STUMP delivery has completed. Called from processDelivery.
+func (g *stumpGate) Done(blockHash, callbackURL string) {
+	key := stumpGateKey(blockHash, callbackURL)
+	g.mu.Lock()
+	wg, ok := g.gates[key]
+	g.mu.Unlock()
+	if ok {
+		wg.Done()
+	}
+}
+
+// Wait blocks until all registered STUMPs for the (blockHash, callbackURL) are done.
+// Called from processDelivery for BLOCK_PROCESSED messages.
+func (g *stumpGate) Wait(blockHash, callbackURL string) {
+	key := stumpGateKey(blockHash, callbackURL)
+	g.mu.Lock()
+	wg, ok := g.gates[key]
+	g.mu.Unlock()
+	if ok {
+		wg.Wait()
+		g.mu.Lock()
+		delete(g.gates, key)
+		g.mu.Unlock()
+	}
 }
 
 // DeliveryService consumes callback messages from the callback Kafka topic
@@ -45,6 +110,7 @@ type DeliveryService struct {
 	dlqProducer *kafka.Producer
 	httpClient  *http.Client
 	dedupStore  CallbackDeduper
+	stumpGate   *stumpGate
 
 	// Worker pool for concurrent delivery.
 	workCh   chan *kafka.CallbackTopicMessage
@@ -61,6 +127,7 @@ func NewDeliveryService(cfg *config.Config, dedupStore CallbackDeduper) *Deliver
 	return &DeliveryService{
 		cfg:        cfg,
 		dedupStore: dedupStore,
+		stumpGate:  newStumpGate(),
 	}
 }
 
@@ -261,6 +328,13 @@ func (d *DeliveryService) handleMessage(_ context.Context, msg *sarama.ConsumerM
 		return d.reenqueue(cbMsg)
 	}
 
+	// Register first-attempt STUMP deliveries with the gate so BLOCK_PROCESSED
+	// can wait for them. This runs sequentially per partition, guaranteeing all
+	// STUMPs for a callbackURL are registered before BLOCK_PROCESSED is dispatched.
+	if cbMsg.Type == kafka.CallbackStump && cbMsg.RetryCount == 0 {
+		d.stumpGate.Add(cbMsg.BlockHash, cbMsg.CallbackURL)
+	}
+
 	// Dispatch to worker pool (blocking send provides backpressure).
 	d.workCh <- cbMsg
 	return nil
@@ -276,11 +350,22 @@ func (d *DeliveryService) deliveryWorker() {
 
 // processDelivery handles dedup check, HTTP delivery, dedup record, and retry/DLQ logic for a single message.
 func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
+	// Signal STUMP completion when this function exits (success, dedup skip, or failure).
+	if cbMsg.Type == kafka.CallbackStump && cbMsg.RetryCount == 0 {
+		defer d.stumpGate.Done(cbMsg.BlockHash, cbMsg.CallbackURL)
+	}
+
+	// Wait for all STUMP deliveries to complete before delivering BLOCK_PROCESSED.
+	if cbMsg.Type == kafka.CallbackBlockProcessed {
+		d.stumpGate.Wait(cbMsg.BlockHash, cbMsg.CallbackURL)
+	}
+
 	d.Logger.Debug("processing callback message",
 		"callbackUrl", cbMsg.CallbackURL,
 		"txid", cbMsg.TxID,
 		"type", cbMsg.Type,
 		"retryCount", cbMsg.RetryCount,
+		"subtreeIndex", cbMsg.SubtreeIndex,
 	)
 
 	// Check callback dedup — skip if already delivered.
@@ -320,6 +405,7 @@ func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
 			"callbackUrl", cbMsg.CallbackURL,
 			"txid", cbMsg.TxID,
 			"type", cbMsg.Type,
+			"subtreeIndex", cbMsg.SubtreeIndex,
 		)
 		return
 	}
@@ -329,6 +415,7 @@ func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
 		"txid", cbMsg.TxID,
 		"type", cbMsg.Type,
 		"retryCount", cbMsg.RetryCount,
+		"subtreeIndex", cbMsg.SubtreeIndex,
 		"error", err,
 	)
 
@@ -339,6 +426,7 @@ func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
 			"txid", cbMsg.TxID,
 			"type", cbMsg.Type,
 			"retryCount", cbMsg.RetryCount,
+			"subtreeIndex", cbMsg.SubtreeIndex,
 		)
 		d.messagesFailed.Add(1)
 		if err := d.publishToDLQ(cbMsg); err != nil {
@@ -358,6 +446,7 @@ func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
 		"retryCount", cbMsg.RetryCount,
 		"nextRetryAt", cbMsg.NextRetryAt,
 		"backoffSec", backoffSec,
+		"subtreeIndex", cbMsg.SubtreeIndex,
 	)
 
 	d.messagesRetried.Add(1)
@@ -371,6 +460,7 @@ func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.Callba
 	payload := callbackPayload{
 		Type:         string(msg.Type),
 		TxID:         msg.TxID,
+		TxIDs:        msg.TxIDs,
 		BlockHash:    msg.BlockHash,
 		SubtreeIndex: msg.SubtreeIndex,
 	}
@@ -415,6 +505,12 @@ func buildIdempotencyKey(msg *kafka.CallbackTopicMessage) string {
 	if msg.Type == kafka.CallbackBlockProcessed {
 		return msg.BlockHash + ":" + string(msg.Type)
 	}
+	if msg.Type == kafka.CallbackStump {
+		return msg.BlockHash + ":" + strconv.Itoa(msg.SubtreeIndex) + ":STUMP"
+	}
+	if len(msg.TxIDs) > 0 {
+		return hashTxIDs(msg.TxIDs) + ":" + string(msg.Type)
+	}
 	if msg.TxID != "" {
 		return msg.TxID + ":" + string(msg.Type)
 	}
@@ -422,12 +518,26 @@ func buildIdempotencyKey(msg *kafka.CallbackTopicMessage) string {
 }
 
 // dedupKeyForMessage returns the dedup key for a message.
-// For BLOCK_PROCESSED, uses blockHash; for other types, uses txid.
 func dedupKeyForMessage(msg *kafka.CallbackTopicMessage) string {
 	if msg.Type == kafka.CallbackBlockProcessed {
 		return msg.BlockHash
 	}
+	if msg.Type == kafka.CallbackStump {
+		return msg.BlockHash + ":" + strconv.Itoa(msg.SubtreeIndex)
+	}
+	if len(msg.TxIDs) > 0 {
+		return hashTxIDs(msg.TxIDs)
+	}
 	return msg.TxID
+}
+
+// hashTxIDs produces a stable hash of a txid set for use as dedup/idempotency keys.
+func hashTxIDs(txids []string) string {
+	sorted := make([]string, len(txids))
+	copy(sorted, txids)
+	sort.Strings(sorted)
+	h := sha256.Sum256([]byte(strings.Join(sorted, ",")))
+	return hex.EncodeToString(h[:8])
 }
 
 // reenqueue publishes the message back to the callback topic for later processing.

@@ -240,12 +240,8 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 		return fmt.Errorf("checking registrations for subtree %s: %w", subtreeMsg.Hash, err)
 	}
 
-	// 4.5-4.6: Emit callbacks for registered txids.
-	for _, txid := range registeredTxids {
-		if err := p.emitSeenCallbacks(txid, subtreeMsg.Hash); err != nil {
-			p.Logger.Error("failed to emit callbacks", "txid", txid, "error", err)
-		}
-	}
+	// 4.5-4.6: Emit batched callbacks grouped by callbackURL.
+	p.emitBatchedSeenCallbacks(registeredTxids, subtreeMsg.Hash)
 
 	// Mark subtree as successfully processed for dedup.
 	if p.dedupCache != nil {
@@ -257,7 +253,8 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 }
 
 // findRegisteredTxids uses the cache and Aerospike to find which txids are registered.
-func (p *Processor) findRegisteredTxids(txids []string) ([]string, error) {
+// Returns a map of txid → callbackURLs for all registered txids.
+func (p *Processor) findRegisteredTxids(txids []string) (map[string][]string, error) {
 	var uncached, cachedRegistered []string
 
 	if p.regCache != nil {
@@ -295,65 +292,88 @@ func (p *Processor) findRegisteredTxids(txids []string) ([]string, error) {
 		}
 	}
 
-	// Combine cached registered + newly found registered.
-	allRegistered := make([]string, 0, len(cachedRegistered)+len(registeredFromStore))
-	allRegistered = append(allRegistered, cachedRegistered...)
-	for txid := range registeredFromStore {
-		allRegistered = append(allRegistered, txid)
+	// Combine: start with uncached results (already have callbackURLs from BatchGet).
+	allRegistered := make(map[string][]string, len(cachedRegistered)+len(registeredFromStore))
+	for txid, urls := range registeredFromStore {
+		allRegistered[txid] = urls
+	}
+
+	// For cached-registered txids, fetch callbackURLs via BatchGet.
+	if len(cachedRegistered) > 0 {
+		cachedURLs, err := p.registrationStore.BatchGet(cachedRegistered)
+		if err != nil {
+			p.Logger.Warn("failed to fetch callbackURLs for cached txids", "error", err)
+		} else {
+			for txid, urls := range cachedURLs {
+				allRegistered[txid] = urls
+			}
+		}
 	}
 
 	return allRegistered, nil
 }
 
-// emitSeenCallbacks emits SEEN_ON_NETWORK callbacks and checks the seen counter for SEEN_MULTIPLE_NODES.
-func (p *Processor) emitSeenCallbacks(txid string, subtreeID string) error {
-	// Get callback URLs for this txid.
-	callbacks, err := p.registrationStore.Get(txid)
-	if err != nil {
-		return fmt.Errorf("getting callbacks for %s: %w", txid, err)
+// emitBatchedSeenCallbacks emits batched SEEN_ON_NETWORK and SEEN_MULTIPLE_NODES callbacks.
+// Groups txids by callbackURL and publishes one message per callbackURL.
+func (p *Processor) emitBatchedSeenCallbacks(registeredTxids map[string][]string, subtreeID string) {
+	if len(registeredTxids) == 0 {
+		return
 	}
 
-	// 4.5: Emit SEEN_ON_NETWORK for each callback URL.
-	for _, callbackURL := range callbacks {
+	// Invert txid→callbackURLs to callbackURL→txids for SEEN_ON_NETWORK.
+	seenGroups := make(map[string][]string)
+	for txid, callbackURLs := range registeredTxids {
+		for _, url := range callbackURLs {
+			seenGroups[url] = append(seenGroups[url], txid)
+		}
+	}
+
+	// 4.5: Emit one batched SEEN_ON_NETWORK per callbackURL.
+	for callbackURL, txids := range seenGroups {
 		msg := &kafka.CallbackTopicMessage{
 			CallbackURL: callbackURL,
 			Type:        kafka.CallbackSeenOnNetwork,
-			TxID:        txid,
+			TxIDs:       txids,
 		}
 		data, err := msg.Encode()
 		if err != nil {
-			p.Logger.Error("failed to encode callback message", "txid", txid, "error", err)
+			p.Logger.Error("failed to encode batched SEEN_ON_NETWORK", "callbackURL", callbackURL, "error", err)
 			continue
 		}
-		if err := p.callbackProducer.Publish(txid, data); err != nil {
-			p.Logger.Error("failed to publish SEEN_ON_NETWORK", "txid", txid, "error", err)
+		if err := p.callbackProducer.PublishWithHashKey(callbackURL, data); err != nil {
+			p.Logger.Error("failed to publish batched SEEN_ON_NETWORK", "callbackURL", callbackURL, "error", err)
 		}
 	}
 
-	// 4.6: Increment seen counter and check threshold (idempotent per subtreeID).
-	result, err := p.seenCounterStore.Increment(txid, subtreeID)
-	if err != nil {
-		p.Logger.Warn("failed to increment seen counter", "txid", txid, "error", err)
-		return nil
-	}
-
-	if result.ThresholdReached {
-		for _, callbackURL := range callbacks {
-			msg := &kafka.CallbackTopicMessage{
-				CallbackURL: callbackURL,
-				Type:        kafka.CallbackSeenMultipleNodes,
-				TxID:        txid,
-			}
-			data, err := msg.Encode()
-			if err != nil {
-				p.Logger.Error("failed to encode callback message", "txid", txid, "error", err)
-				continue
-			}
-			if err := p.callbackProducer.Publish(txid, data); err != nil {
-				p.Logger.Error("failed to publish SEEN_MULTIPLE_NODES", "txid", txid, "error", err)
+	// 4.6: Increment seen counters and collect threshold-reached txids.
+	thresholdGroups := make(map[string][]string) // callbackURL → threshold-reached txids
+	for txid, callbackURLs := range registeredTxids {
+		result, err := p.seenCounterStore.Increment(txid, subtreeID)
+		if err != nil {
+			p.Logger.Warn("failed to increment seen counter", "txid", txid, "error", err)
+			continue
+		}
+		if result.ThresholdReached {
+			for _, url := range callbackURLs {
+				thresholdGroups[url] = append(thresholdGroups[url], txid)
 			}
 		}
 	}
 
-	return nil
+	// Emit one batched SEEN_MULTIPLE_NODES per callbackURL.
+	for callbackURL, txids := range thresholdGroups {
+		msg := &kafka.CallbackTopicMessage{
+			CallbackURL: callbackURL,
+			Type:        kafka.CallbackSeenMultipleNodes,
+			TxIDs:       txids,
+		}
+		data, err := msg.Encode()
+		if err != nil {
+			p.Logger.Error("failed to encode batched SEEN_MULTIPLE_NODES", "callbackURL", callbackURL, "error", err)
+			continue
+		}
+		if err := p.callbackProducer.PublishWithHashKey(callbackURL, data); err != nil {
+			p.Logger.Error("failed to publish batched SEEN_MULTIPLE_NODES", "callbackURL", callbackURL, "error", err)
+		}
+	}
 }

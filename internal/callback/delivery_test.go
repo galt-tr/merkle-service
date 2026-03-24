@@ -95,6 +95,7 @@ func newTestDeliveryService(t *testing.T, cfg *config.Config, httpClient *http.C
 		producer:    kafka.NewTestProducer(mockRetryProducer, cfg.Kafka.CallbackTopic, logger),
 		dlqProducer: kafka.NewTestProducer(mockDLQProducer, cfg.Kafka.CallbackDLQTopic, logger),
 		workCh:      make(chan *kafka.CallbackTopicMessage, 64),
+		stumpGate:   newStumpGate(),
 	}
 	ds.InitBase("callback-delivery-test")
 	ds.Logger = logger
@@ -164,7 +165,6 @@ func TestDeliverCallback_StumpSuccess(t *testing.T) {
 	msg := &kafka.CallbackTopicMessage{
 		CallbackURL:  server.URL + "/callback",
 		Type:         kafka.CallbackStump,
-		TxID:         "abc123",
 		BlockHash:    "blockhash456",
 		SubtreeIndex: 3,
 		Stump:        stumpData,
@@ -184,8 +184,8 @@ func TestDeliverCallback_StumpSuccess(t *testing.T) {
 		t.Fatalf("failed to unmarshal received payload: %v", err)
 	}
 
-	if payload.TxID != "abc123" {
-		t.Errorf("expected txid 'abc123', got %q", payload.TxID)
+	if payload.TxID != "" {
+		t.Errorf("expected empty txid, got %q", payload.TxID)
 	}
 	if payload.Type != "STUMP" {
 		t.Errorf("expected type 'STUMP', got %q", payload.Type)
@@ -222,7 +222,7 @@ func TestDeliverCallback_SeenOnNetwork(t *testing.T) {
 	msg := &kafka.CallbackTopicMessage{
 		CallbackURL: server.URL + "/callback",
 		Type:        kafka.CallbackSeenOnNetwork,
-		TxID:        "tx-seen",
+		TxIDs:       []string{"tx-1", "tx-2", "tx-3"},
 	}
 
 	err := ds.deliverCallback(context.Background(), msg)
@@ -240,6 +240,12 @@ func TestDeliverCallback_SeenOnNetwork(t *testing.T) {
 	}
 	if payload.Type != "SEEN_ON_NETWORK" {
 		t.Errorf("expected type 'SEEN_ON_NETWORK', got %q", payload.Type)
+	}
+	if len(payload.TxIDs) != 3 {
+		t.Errorf("expected 3 txids, got %d", len(payload.TxIDs))
+	}
+	if payload.TxID != "" {
+		t.Errorf("expected empty scalar txid, got %q", payload.TxID)
 	}
 }
 
@@ -263,9 +269,10 @@ func TestDeliverCallback_Non2xxReturnsError(t *testing.T) {
 			ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
 
 			msg := &kafka.CallbackTopicMessage{
-				CallbackURL: server.URL + "/callback",
-				Type:        kafka.CallbackStump,
-				TxID:        "tx-fail",
+				CallbackURL:  server.URL + "/callback",
+				Type:         kafka.CallbackStump,
+				BlockHash:    "blockhash",
+				SubtreeIndex: 1,
 			}
 
 			err := ds.deliverCallback(context.Background(), msg)
@@ -291,9 +298,10 @@ func TestDeliverCallback_2xxStatusesSucceed(t *testing.T) {
 			ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
 
 			msg := &kafka.CallbackTopicMessage{
-				CallbackURL: server.URL + "/callback",
-				Type:        kafka.CallbackStump,
-				TxID:        "tx-ok",
+				CallbackURL:  server.URL + "/callback",
+				Type:         kafka.CallbackStump,
+				BlockHash:    "blockhash",
+				SubtreeIndex: 1,
 			}
 
 			err := ds.deliverCallback(context.Background(), msg)
@@ -314,10 +322,11 @@ func TestProcessDelivery_RetriesOnFailure(t *testing.T) {
 	ds, retryMock, _ := newTestDeliveryService(t, cfg, server.Client())
 
 	msg := &kafka.CallbackTopicMessage{
-		CallbackURL: server.URL + "/callback",
-		Type:        kafka.CallbackStump,
-		TxID:        "tx-retry",
-		RetryCount:  0,
+		CallbackURL:  server.URL + "/callback",
+		Type:         kafka.CallbackStump,
+		BlockHash:    "blockhash",
+		SubtreeIndex: 1,
+		RetryCount:   0,
 	}
 
 	ds.processDelivery(msg)
@@ -348,10 +357,11 @@ func TestProcessDelivery_PublishesToDLQAfterMaxRetries(t *testing.T) {
 	ds, retryMock, dlqMock := newTestDeliveryService(t, cfg, server.Client())
 
 	msg := &kafka.CallbackTopicMessage{
-		CallbackURL: server.URL + "/callback",
-		Type:        kafka.CallbackStump,
-		TxID:        "tx-dlq",
-		RetryCount:  3, // Already at max retries.
+		CallbackURL:  server.URL + "/callback",
+		Type:         kafka.CallbackStump,
+		BlockHash:    "blockhash",
+		SubtreeIndex: 1,
+		RetryCount:   3, // Already at max retries.
 	}
 
 	ds.processDelivery(msg)
@@ -404,9 +414,10 @@ func TestProcessDelivery_DedupSkipsDuplicate(t *testing.T) {
 	ds.dedupStore = &mockDedupStore{exists: true}
 
 	msg := &kafka.CallbackTopicMessage{
-		CallbackURL: server.URL + "/callback",
-		Type:        kafka.CallbackStump,
-		TxID:        "tx-dedup",
+		CallbackURL:  server.URL + "/callback",
+		Type:         kafka.CallbackStump,
+		BlockHash:    "blockhash",
+		SubtreeIndex: 3,
 	}
 
 	ds.processDelivery(msg)
@@ -469,15 +480,32 @@ func TestBuildIdempotencyKey(t *testing.T) {
 			expected: "blockhash123:BLOCK_PROCESSED",
 		},
 		{
-			name: "STUMP uses txid",
+			name: "STUMP uses blockHash and subtreeIndex",
 			msg: &kafka.CallbackTopicMessage{
-				Type: kafka.CallbackStump,
-				TxID: "txid456",
+				Type:         kafka.CallbackStump,
+				BlockHash:    "blockhash",
+				SubtreeIndex: 3,
 			},
-			expected: "txid456:STUMP",
+			expected: "blockhash:3:STUMP",
 		},
 		{
-			name: "SEEN_ON_NETWORK uses txid",
+			name: "batched SEEN_ON_NETWORK uses TxIDs hash",
+			msg: &kafka.CallbackTopicMessage{
+				Type:  kafka.CallbackSeenOnNetwork,
+				TxIDs: []string{"tx1", "tx2"},
+			},
+			expected: hashTxIDs([]string{"tx1", "tx2"}) + ":SEEN_ON_NETWORK",
+		},
+		{
+			name: "batched TxIDs hash is order-independent",
+			msg: &kafka.CallbackTopicMessage{
+				Type:  kafka.CallbackSeenOnNetwork,
+				TxIDs: []string{"tx2", "tx1"},
+			},
+			expected: hashTxIDs([]string{"tx1", "tx2"}) + ":SEEN_ON_NETWORK",
+		},
+		{
+			name: "scalar SEEN_ON_NETWORK uses txid",
 			msg: &kafka.CallbackTopicMessage{
 				Type: kafka.CallbackSeenOnNetwork,
 				TxID: "txid789",
@@ -485,9 +513,9 @@ func TestBuildIdempotencyKey(t *testing.T) {
 			expected: "txid789:SEEN_ON_NETWORK",
 		},
 		{
-			name: "empty txid returns empty",
+			name: "empty txid returns empty for non-STUMP",
 			msg: &kafka.CallbackTopicMessage{
-				Type: kafka.CallbackStump,
+				Type: kafka.CallbackSeenOnNetwork,
 			},
 			expected: "",
 		},
@@ -518,15 +546,24 @@ func TestDedupKeyForMessage(t *testing.T) {
 			expected: "block123",
 		},
 		{
-			name: "STUMP uses txid",
+			name: "STUMP uses blockHash and subtreeIndex",
 			msg: &kafka.CallbackTopicMessage{
-				Type: kafka.CallbackStump,
-				TxID: "tx123",
+				Type:         kafka.CallbackStump,
+				BlockHash:    "blockhash",
+				SubtreeIndex: 3,
 			},
-			expected: "tx123",
+			expected: "blockhash:3",
 		},
 		{
-			name: "empty txid returns empty",
+			name: "batched SEEN uses TxIDs hash",
+			msg: &kafka.CallbackTopicMessage{
+				Type:  kafka.CallbackSeenOnNetwork,
+				TxIDs: []string{"tx1", "tx2"},
+			},
+			expected: hashTxIDs([]string{"tx1", "tx2"}),
+		},
+		{
+			name: "empty txid and txids returns empty",
 			msg: &kafka.CallbackTopicMessage{
 				Type: kafka.CallbackSeenOnNetwork,
 			},
@@ -616,6 +653,97 @@ func TestConcurrentDelivery(t *testing.T) {
 	if deliveryCount.Load() != 10 {
 		t.Errorf("expected 10 deliveries, got %d", deliveryCount.Load())
 	}
+}
+
+func TestBlockProcessedWaitsForStumps(t *testing.T) {
+	// Track delivery order to verify STUMPs arrive before BLOCK_PROCESSED.
+	var mu sync.Mutex
+	var deliveryOrder []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload callbackPayload
+		_ = json.Unmarshal(body, &payload)
+
+		mu.Lock()
+		deliveryOrder = append(deliveryOrder, payload.Type)
+		mu.Unlock()
+
+		// Simulate slow STUMP delivery so BLOCK_PROCESSED has a chance to race ahead.
+		if payload.Type == "STUMP" {
+			time.Sleep(50 * time.Millisecond)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+
+	callbackURL := server.URL + "/callback"
+	blockHash := "block-gate-test"
+
+	// Simulate handleMessage ordering: register STUMPs with the gate, then dispatch all.
+	stumps := []*kafka.CallbackTopicMessage{
+		{CallbackURL: callbackURL, Type: kafka.CallbackStump, BlockHash: blockHash, SubtreeIndex: 0, Stump: []byte{0x01}},
+		{CallbackURL: callbackURL, Type: kafka.CallbackStump, BlockHash: blockHash, SubtreeIndex: 1, Stump: []byte{0x02}},
+		{CallbackURL: callbackURL, Type: kafka.CallbackStump, BlockHash: blockHash, SubtreeIndex: 2, Stump: []byte{0x03}},
+	}
+	bp := &kafka.CallbackTopicMessage{CallbackURL: callbackURL, Type: kafka.CallbackBlockProcessed, BlockHash: blockHash}
+
+	// Register STUMPs with the gate (simulates handleMessage sequential dispatch).
+	for _, msg := range stumps {
+		ds.stumpGate.Add(msg.BlockHash, msg.CallbackURL)
+	}
+
+	// Dispatch BLOCK_PROCESSED first to the worker pool to maximize race opportunity.
+	ds.workCh <- bp
+	for _, msg := range stumps {
+		ds.workCh <- msg
+	}
+
+	waitForCondition(t, 5*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(deliveryOrder) == 4
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// BLOCK_PROCESSED must be last.
+	if deliveryOrder[len(deliveryOrder)-1] != "BLOCK_PROCESSED" {
+		t.Errorf("expected BLOCK_PROCESSED last, got delivery order: %v", deliveryOrder)
+	}
+	for i := 0; i < 3; i++ {
+		if deliveryOrder[i] != "STUMP" {
+			t.Errorf("expected STUMP at position %d, got %q (order: %v)", i, deliveryOrder[i], deliveryOrder)
+		}
+	}
+}
+
+func TestBlockProcessedProceedsWithoutStumps(t *testing.T) {
+	var delivered atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		delivered.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+
+	// Dispatch BLOCK_PROCESSED with no prior STUMPs — should proceed immediately.
+	msg := &kafka.CallbackTopicMessage{
+		CallbackURL: server.URL + "/callback",
+		Type:        kafka.CallbackBlockProcessed,
+		BlockHash:   "block-no-stumps",
+	}
+	ds.workCh <- msg
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return delivered.Load() == 1
+	})
 }
 
 // mockDedupStore implements CallbackDeduper for testing.

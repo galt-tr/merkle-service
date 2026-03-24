@@ -21,8 +21,9 @@
         .card h2 { font-size: 16px; margin-bottom: 12px; color: #f0f6fc; }
         .card h3 { font-size: 14px; margin-bottom: 8px; color: #8b949e; }
 
-        input[type="text"] { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 12px; border-radius: 6px; font-size: 14px; font-family: monospace; width: 100%; }
-        input[type="text"]:focus { border-color: #58a6ff; outline: none; }
+        input[type="text"], textarea { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 12px; border-radius: 6px; font-size: 14px; font-family: monospace; width: 100%; }
+        input[type="text"]:focus, textarea:focus { border-color: #58a6ff; outline: none; }
+        textarea { resize: vertical; font-size: 13px; }
 
         button { background: #238636; border: 1px solid #2ea043; color: #fff; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }
         button:hover { background: #2ea043; }
@@ -53,6 +54,22 @@
 
         .url-list { list-style: none; margin-top: 8px; }
         .url-list li { font-family: monospace; font-size: 13px; padding: 4px 0; }
+
+        /* STUMP visualizer styles */
+        .stump-error { background: #1c0e0e; border: 1px solid #da3633; color: #f85149; padding: 12px; border-radius: 6px; margin-bottom: 16px; font-size: 13px; display: none; }
+        .stump-legend { display: flex; gap: 20px; align-items: center; font-size: 13px; flex-wrap: wrap; }
+        .stump-legend-dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+        .stump-stats { display: flex; gap: 24px; margin-bottom: 12px; }
+        .stump-stat-value { font-size: 20px; font-weight: bold; color: #f0f6fc; }
+        .stump-stat-label { font-size: 12px; color: #8b949e; }
+        .stump-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+        .stump-table th, .stump-table td { padding: 6px 12px; text-align: left; border-bottom: 1px solid #21262d; }
+        .stump-table th { color: #8b949e; font-weight: normal; }
+        .stump-badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+        #stump-tooltip { display: none; position: fixed; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-size: 12px; font-family: monospace; color: #c9d1d9; pointer-events: none; z-index: 1000; max-width: 500px; word-break: break-all; }
+        .stump-detail-table { width: 100%; font-size: 13px; }
+        .stump-detail-table th { width: 100px; color: #8b949e; text-align: left; padding: 4px 0; font-weight: normal; }
+        .stump-detail-table td { word-break: break-all; padding: 4px 0; }
     </style>
 </head>
 <body>
@@ -61,6 +78,7 @@
         <a onclick="showSection('endpoints')" id="nav-endpoints" class="active">Endpoints</a>
         <a onclick="showSection('register')" id="nav-register">Register</a>
         <a onclick="showSection('lookup')" id="nav-lookup">Lookup</a>
+        <a onclick="showSection('stump')" id="nav-stump">STUMP</a>
     </nav>
     <div class="container">
 
@@ -169,42 +187,91 @@
             </div>
         </div>
 
+        <!-- STUMP Visualizer Section -->
+        <div id="section-stump" class="section">
+            <div class="card">
+                <h2>STUMP Visualizer</h2>
+                <div class="form-group">
+                    <label>STUMP data (base64 or hex encoded, BRC-0074 BUMP format)</label>
+                    <textarea id="stump-input" rows="4" placeholder="Paste base64 or hex-encoded STUMP data here..."></textarea>
+                </div>
+                <button onclick="stumpDecodeAndRender()">Decode &amp; Visualize</button>
+                <button class="btn-secondary" onclick="stumpLoadExample()" style="margin-left:8px;">Load Example</button>
+            </div>
+
+            <div id="stump-error" class="stump-error"></div>
+
+            <div id="stump-metadata" class="card" style="display:none;">
+                <h2>Metadata</h2>
+                <div class="stump-stats" id="stump-meta-stats"></div>
+                <div id="stump-meta-levels"></div>
+            </div>
+
+            <div id="stump-legend" class="card" style="display:none;">
+                <div class="stump-legend">
+                    <span><span class="stump-legend-dot" style="background:#3fb950;"></span> Registered TxID (0x02)</span>
+                    <span><span class="stump-legend-dot" style="background:#58a6ff;"></span> Sibling Hash (0x00)</span>
+                    <span><span class="stump-legend-dot" style="background:#484f58;"></span> Duplicate (0x01)</span>
+                    <span><span class="stump-legend-dot" style="background:#30363d;border:1px solid #484f58;"></span> Implied (not in STUMP)</span>
+                </div>
+            </div>
+
+            <div id="stump-tree-container" style="overflow-x:auto;margin-bottom:16px;"></div>
+
+            <div id="stump-detail" class="card" style="display:none;">
+                <h2>Node Details</h2>
+                <table class="stump-detail-table">
+                    <tr><th>Level</th><td id="stump-detail-level"></td></tr>
+                    <tr><th>Offset</th><td id="stump-detail-offset"></td></tr>
+                    <tr><th>Type</th><td id="stump-detail-type"></td></tr>
+                    <tr><th>Hash</th><td id="stump-detail-hash"></td></tr>
+                </table>
+            </div>
+        </div>
+
     </div>
 
+    <div id="stump-tooltip"></div>
+
     <script>
+        // ============================================================
+        // Tab Navigation
+        // ============================================================
         function showSection(name) {
-            document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-            document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
+            document.querySelectorAll('.section').forEach(function(s) { s.classList.remove('active'); });
+            document.querySelectorAll('.nav a').forEach(function(a) { a.classList.remove('active'); });
             document.getElementById('section-' + name).classList.add('active');
             document.getElementById('nav-' + name).classList.add('active');
         }
 
         function showResult(id, message, type) {
-            const el = document.getElementById(id);
+            var el = document.getElementById(id);
             el.textContent = message;
             el.className = 'result ' + type;
             el.style.display = 'block';
         }
 
         function showResultHTML(id, html, type) {
-            const el = document.getElementById(id);
+            var el = document.getElementById(id);
             el.innerHTML = html;
             el.className = 'result ' + type;
             el.style.display = 'block';
         }
 
+        // ============================================================
+        // Register & Lookup
+        // ============================================================
         async function handleRegister(e) {
             e.preventDefault();
-            const txid = document.getElementById('reg-txid').value.trim();
-            const callbackUrl = document.getElementById('reg-callback').value.trim();
-
+            var txid = document.getElementById('reg-txid').value.trim();
+            var callbackUrl = document.getElementById('reg-callback').value.trim();
             try {
-                const resp = await fetch('/watch', {
+                var resp = await fetch('/watch', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ txid, callbackUrl })
+                    body: JSON.stringify({ txid: txid, callbackUrl: callbackUrl })
                 });
-                const data = await resp.json();
+                var data = await resp.json();
                 if (resp.ok) {
                     showResult('register-result', 'Registration successful: ' + data.message, 'success');
                 } else {
@@ -218,21 +285,15 @@
 
         async function handleLookup(e) {
             e.preventDefault();
-            const txid = document.getElementById('lookup-txid').value.trim();
-            if (!txid) {
-                showResult('lookup-result', 'Please enter a transaction ID', 'error');
-                return false;
-            }
-
+            var txid = document.getElementById('lookup-txid').value.trim();
+            if (!txid) { showResult('lookup-result', 'Please enter a transaction ID', 'error'); return false; }
             try {
-                const resp = await fetch('/api/lookup/' + encodeURIComponent(txid));
-                const data = await resp.json();
+                var resp = await fetch('/api/lookup/' + encodeURIComponent(txid));
+                var data = await resp.json();
                 if (resp.ok) {
                     if (data.callbackUrls && data.callbackUrls.length > 0) {
-                        let html = '<strong>Registered callback URLs for ' + txid.substring(0, 16) + '...:</strong><ul class="url-list">';
-                        data.callbackUrls.forEach(function(url) {
-                            html += '<li>' + escapeHtml(url) + '</li>';
-                        });
+                        var html = '<strong>Registered callback URLs for ' + txid.substring(0, 16) + '...:</strong><ul class="url-list">';
+                        data.callbackUrls.forEach(function(url) { html += '<li>' + escapeHtml(url) + '</li>'; });
                         html += '</ul>';
                         showResultHTML('lookup-result', html, 'info');
                     } else {
@@ -248,9 +309,326 @@
         }
 
         function escapeHtml(text) {
-            const div = document.createElement('div');
+            var div = document.createElement('div');
             div.appendChild(document.createTextNode(text));
             return div.innerHTML;
+        }
+
+        // ============================================================
+        // STUMP: BRC-0074 BUMP Decoder
+        // ============================================================
+
+        function stumpDecodeInput(str) {
+            str = str.trim();
+            if (!str) throw new Error('Input is empty');
+            // Auto-detect: if it looks like pure hex (only 0-9a-fA-F), decode as hex
+            if (/^[0-9a-fA-F]+$/.test(str) && str.length % 2 === 0) {
+                var arr = new Uint8Array(str.length / 2);
+                for (var i = 0; i < str.length; i += 2) {
+                    arr[i / 2] = parseInt(str.substring(i, i + 2), 16);
+                }
+                return arr;
+            }
+            // Otherwise treat as base64
+            try {
+                var bin = atob(str);
+                var arr = new Uint8Array(bin.length);
+                for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+                return arr;
+            } catch (e) {
+                throw new Error('Invalid input: not valid hex or base64 (' + e.message + ')');
+            }
+        }
+
+        function stumpReadCompactSize(data, offset) {
+            if (offset >= data.length) throw new Error('Unexpected end of data at byte ' + offset);
+            var first = data[offset];
+            if (first < 253) return { value: first, bytesRead: 1 };
+            if (first === 0xFD) {
+                if (offset + 3 > data.length) throw new Error('Unexpected end of data (0xFD CompactSize)');
+                return { value: data[offset+1] | (data[offset+2] << 8), bytesRead: 3 };
+            }
+            if (first === 0xFE) {
+                if (offset + 5 > data.length) throw new Error('Unexpected end of data (0xFE CompactSize)');
+                return { value: (data[offset+1] | (data[offset+2] << 8) | (data[offset+3] << 16) | (data[offset+4] << 24)) >>> 0, bytesRead: 5 };
+            }
+            if (offset + 9 > data.length) throw new Error('Unexpected end of data (0xFF CompactSize)');
+            var lo = (data[offset+1] | (data[offset+2] << 8) | (data[offset+3] << 16) | (data[offset+4] << 24)) >>> 0;
+            var hi = (data[offset+5] | (data[offset+6] << 8) | (data[offset+7] << 16) | (data[offset+8] << 24)) >>> 0;
+            return { value: hi * 0x100000000 + lo, bytesRead: 9 };
+        }
+
+        function stumpReadHash(data, offset) {
+            if (offset + 32 > data.length) throw new Error('Unexpected end of data (expected 32 bytes for hash)');
+            var hex = '';
+            for (var i = 0; i < 32; i++) { var b = data[offset + i]; hex += (b < 16 ? '0' : '') + b.toString(16); }
+            return { hash: hex, bytesRead: 32 };
+        }
+
+        function stumpDecodeBUMP(uint8Array) {
+            var pos = 0;
+            var r = stumpReadCompactSize(uint8Array, pos);
+            var blockHeight = r.value; pos += r.bytesRead;
+            if (pos >= uint8Array.length) throw new Error('Unexpected end of data (expected tree height)');
+            var treeHeight = uint8Array[pos]; pos++;
+            var levels = [];
+            for (var lvl = 0; lvl < treeHeight; lvl++) {
+                r = stumpReadCompactSize(uint8Array, pos);
+                var nLeaves = r.value; pos += r.bytesRead;
+                var leaves = [];
+                for (var j = 0; j < nLeaves; j++) {
+                    r = stumpReadCompactSize(uint8Array, pos);
+                    var off = r.value; pos += r.bytesRead;
+                    if (pos >= uint8Array.length) throw new Error('Unexpected end of data (expected flag)');
+                    var flag = uint8Array[pos]; pos++;
+                    if (flag !== 0x00 && flag !== 0x01 && flag !== 0x02) throw new Error('Invalid flag 0x' + flag.toString(16));
+                    var hash = null;
+                    if (flag !== 0x01) { var hr = stumpReadHash(uint8Array, pos); hash = hr.hash; pos += hr.bytesRead; }
+                    leaves.push({ offset: off, flag: flag, hash: hash });
+                }
+                levels.push({ levelIndex: lvl, leaves: leaves });
+            }
+            return { blockHeight: blockHeight, treeHeight: treeHeight, levels: levels };
+        }
+
+        // ============================================================
+        // STUMP: Tree Layout & SVG Rendering
+        // ============================================================
+
+        var stumpCurrentBUMP = null;
+        var stumpSelectedOffset = null;
+        var stumpNodeElements = {};
+        var stumpLineElements = {};
+
+        function stumpFlagName(flag) { return flag === 0x02 ? 'txid' : flag === 0x01 ? 'duplicate' : 'hash'; }
+        function stumpFlagColor(flag) { return flag === 0x02 ? '#3fb950' : flag === 0x01 ? '#484f58' : '#58a6ff'; }
+
+        function stumpComputeLayout(bump) {
+            var spX = 80, spY = 90, rad = 16, padL = 60, padT = 40, padB = 40;
+            var maxOff = 0;
+            for (var i = 0; i < bump.levels.length; i++)
+                for (var j = 0; j < bump.levels[i].leaves.length; j++)
+                    if (bump.levels[i].leaves[j].offset > maxOff) maxOff = bump.levels[i].leaves[j].offset;
+            var maxPossible = Math.pow(2, bump.treeHeight) - 1;
+            if (maxOff < maxPossible) maxOff = maxPossible;
+            var w = padL + (maxOff + 1) * spX + 40;
+            var h = padT + bump.treeHeight * spY + padB;
+            var nodes = [], nodeMap = {};
+            for (var i = 0; i < bump.levels.length; i++) {
+                var lvl = bump.levels[i];
+                for (var j = 0; j < lvl.leaves.length; j++) {
+                    var leaf = lvl.leaves[j];
+                    var x = padL + leaf.offset * spX + spX / 2;
+                    var y = padT + (bump.treeHeight - 1 - lvl.levelIndex) * spY + spY / 2;
+                    var node = { x: x, y: y, level: lvl.levelIndex, offset: leaf.offset, flag: leaf.flag, hash: leaf.hash, radius: rad };
+                    nodes.push(node);
+                    nodeMap[lvl.levelIndex + '-' + leaf.offset] = node;
+                }
+            }
+            var lines = [];
+            for (var i = 0; i < nodes.length; i++) {
+                var n = nodes[i];
+                if (n.level >= bump.treeHeight - 1) continue;
+                var pOff = Math.floor(n.offset / 2);
+                var parent = nodeMap[(n.level + 1) + '-' + pOff];
+                if (parent) lines.push({ x1: n.x, y1: n.y, x2: parent.x, y2: parent.y, childLevel: n.level, childOffset: n.offset });
+            }
+            return { nodes: nodes, lines: lines, width: w, height: h, nodeMap: nodeMap, padLeft: padL, padTop: padT, nodeSpacingY: spY, treeHeight: bump.treeHeight };
+        }
+
+        function stumpRenderTree(bump, layout) {
+            var container = document.getElementById('stump-tree-container');
+            container.innerHTML = '';
+            stumpNodeElements = {};
+            stumpLineElements = {};
+            var ns = 'http://www.w3.org/2000/svg';
+            var svg = document.createElementNS(ns, 'svg');
+            svg.setAttribute('width', layout.width);
+            svg.setAttribute('height', layout.height);
+            svg.style.background = '#0d1117';
+            svg.style.borderRadius = '6px';
+            svg.style.border = '1px solid #30363d';
+            // Glow filter
+            var defs = document.createElementNS(ns, 'defs');
+            var filter = document.createElementNS(ns, 'filter');
+            filter.setAttribute('id', 'stump-glow');
+            filter.setAttribute('x', '-50%'); filter.setAttribute('y', '-50%');
+            filter.setAttribute('width', '200%'); filter.setAttribute('height', '200%');
+            var feG = document.createElementNS(ns, 'feGaussianBlur');
+            feG.setAttribute('stdDeviation', '3'); feG.setAttribute('result', 'glow');
+            filter.appendChild(feG);
+            var feM = document.createElementNS(ns, 'feMerge');
+            var mn1 = document.createElementNS(ns, 'feMergeNode'); mn1.setAttribute('in', 'glow'); feM.appendChild(mn1);
+            var mn2 = document.createElementNS(ns, 'feMergeNode'); mn2.setAttribute('in', 'SourceGraphic'); feM.appendChild(mn2);
+            filter.appendChild(feM);
+            defs.appendChild(filter);
+            svg.appendChild(defs);
+            // Level labels
+            for (var lvl = 0; lvl < layout.treeHeight; lvl++) {
+                var label = document.createElementNS(ns, 'text');
+                var ly = layout.padTop + (layout.treeHeight - 1 - lvl) * layout.nodeSpacingY + layout.nodeSpacingY / 2;
+                label.setAttribute('x', 12); label.setAttribute('y', ly + 4);
+                label.setAttribute('fill', '#8b949e'); label.setAttribute('font-size', '11'); label.setAttribute('font-family', 'monospace');
+                label.textContent = 'L' + lvl;
+                svg.appendChild(label);
+            }
+            // Lines
+            for (var i = 0; i < layout.lines.length; i++) {
+                var l = layout.lines[i];
+                var line = document.createElementNS(ns, 'line');
+                line.setAttribute('x1', l.x1); line.setAttribute('y1', l.y1);
+                line.setAttribute('x2', l.x2); line.setAttribute('y2', l.y2);
+                line.setAttribute('stroke', '#30363d'); line.setAttribute('stroke-width', '1.5');
+                svg.appendChild(line);
+                stumpLineElements[l.childLevel + '-' + l.childOffset] = line;
+            }
+            // Nodes
+            for (var i = 0; i < layout.nodes.length; i++) {
+                var n = layout.nodes[i];
+                var g = document.createElementNS(ns, 'g');
+                g.style.cursor = 'pointer';
+                var circle = document.createElementNS(ns, 'circle');
+                circle.setAttribute('cx', n.x); circle.setAttribute('cy', n.y);
+                circle.setAttribute('r', n.radius); circle.setAttribute('fill', stumpFlagColor(n.flag));
+                circle.setAttribute('stroke', 'none'); circle.setAttribute('stroke-width', '2');
+                g.appendChild(circle);
+                var text = document.createElementNS(ns, 'text');
+                text.setAttribute('x', n.x); text.setAttribute('y', n.y + n.radius + 14);
+                text.setAttribute('text-anchor', 'middle'); text.setAttribute('fill', '#8b949e');
+                text.setAttribute('font-size', '10'); text.setAttribute('font-family', 'monospace');
+                text.textContent = n.hash ? n.hash.substring(0, 8) : 'dup';
+                g.appendChild(text);
+                (function(node, group) {
+                    group.addEventListener('mouseover', function(e) { stumpShowTooltip(e, node); });
+                    group.addEventListener('mousemove', function(e) { stumpMoveTooltip(e); });
+                    group.addEventListener('mouseout', function() { stumpHideTooltip(); });
+                    group.addEventListener('click', function() { stumpOnNodeClick(node); });
+                })(n, g);
+                svg.appendChild(g);
+                stumpNodeElements[n.level + '-' + n.offset] = g;
+            }
+            container.appendChild(svg);
+        }
+
+        // ============================================================
+        // STUMP: Tooltip
+        // ============================================================
+        function stumpShowTooltip(e, node) {
+            var tip = document.getElementById('stump-tooltip');
+            tip.innerHTML = '<strong>Level:</strong> ' + node.level + ' &nbsp; <strong>Offset:</strong> ' + node.offset +
+                ' &nbsp; <strong>Type:</strong> ' + stumpFlagName(node.flag) +
+                '<br><strong>Hash:</strong> ' + (node.hash || '(duplicate of working hash)');
+            tip.style.display = 'block';
+            stumpMoveTooltip(e);
+        }
+        function stumpMoveTooltip(e) {
+            var tip = document.getElementById('stump-tooltip');
+            tip.style.left = (e.clientX + 12) + 'px'; tip.style.top = (e.clientY + 12) + 'px';
+        }
+        function stumpHideTooltip() { document.getElementById('stump-tooltip').style.display = 'none'; }
+
+        // ============================================================
+        // STUMP: Node Click / Detail / Proof Path
+        // ============================================================
+        function stumpOnNodeClick(node) {
+            document.getElementById('stump-detail').style.display = '';
+            document.getElementById('stump-detail-level').textContent = node.level;
+            document.getElementById('stump-detail-offset').textContent = node.offset;
+            document.getElementById('stump-detail-type').textContent = stumpFlagName(node.flag) + (node.flag === 0x02 ? ' (registered transaction)' : '');
+            document.getElementById('stump-detail-hash').textContent = node.hash || '(duplicate)';
+            if (node.flag === 0x02 && node.level === 0) {
+                if (stumpSelectedOffset === node.offset) { stumpClearHighlight(); stumpSelectedOffset = null; return; }
+                stumpClearHighlight();
+                stumpSelectedOffset = node.offset;
+                stumpHighlightPath(node.offset);
+            } else { stumpClearHighlight(); stumpSelectedOffset = null; }
+        }
+
+        function stumpHighlightPath(leafOffset) {
+            if (!stumpCurrentBUMP) return;
+            var off = leafOffset;
+            for (var lvl = 0; lvl < stumpCurrentBUMP.treeHeight; lvl++) {
+                var sib = off ^ 1;
+                stumpHighlightNode(lvl, off); stumpHighlightNode(lvl, sib);
+                stumpHighlightLine(lvl, off); stumpHighlightLine(lvl, sib);
+                off = Math.floor(off / 2);
+            }
+        }
+
+        function stumpHighlightNode(level, offset) {
+            var g = stumpNodeElements[level + '-' + offset]; if (!g) return;
+            var c = g.querySelector('circle');
+            if (c) { c.setAttribute('stroke', '#f0f6fc'); c.setAttribute('stroke-width', '3'); c.setAttribute('filter', 'url(#stump-glow)'); }
+        }
+        function stumpHighlightLine(level, offset) {
+            var line = stumpLineElements[level + '-' + offset];
+            if (line) { line.setAttribute('stroke', '#f0f6fc'); line.setAttribute('stroke-width', '2.5'); }
+        }
+        function stumpClearHighlight() {
+            for (var key in stumpNodeElements) {
+                var c = stumpNodeElements[key].querySelector('circle');
+                if (c) { c.setAttribute('stroke', 'none'); c.setAttribute('stroke-width', '2'); c.removeAttribute('filter'); }
+            }
+            for (var key in stumpLineElements) {
+                stumpLineElements[key].setAttribute('stroke', '#30363d'); stumpLineElements[key].setAttribute('stroke-width', '1.5');
+            }
+        }
+
+        // ============================================================
+        // STUMP: Metadata
+        // ============================================================
+        function stumpShowMetadata(bump) {
+            document.getElementById('stump-metadata').style.display = '';
+            var total = 0;
+            for (var i = 0; i < bump.levels.length; i++) total += bump.levels[i].leaves.length;
+            document.getElementById('stump-meta-stats').innerHTML =
+                '<div><div class="stump-stat-value">' + bump.blockHeight + '</div><div class="stump-stat-label">Block Height</div></div>' +
+                '<div><div class="stump-stat-value">' + bump.treeHeight + '</div><div class="stump-stat-label">Tree Height</div></div>' +
+                '<div><div class="stump-stat-value">' + total + '</div><div class="stump-stat-label">Total Nodes</div></div>';
+            var html = '<table class="stump-table"><tr><th>Level</th><th>Nodes</th><th>TxIDs</th><th>Hashes</th><th>Duplicates</th></tr>';
+            for (var i = 0; i < bump.levels.length; i++) {
+                var lvl = bump.levels[i], txids = 0, hashes = 0, dups = 0;
+                for (var j = 0; j < lvl.leaves.length; j++) {
+                    if (lvl.leaves[j].flag === 0x02) txids++; else if (lvl.leaves[j].flag === 0x01) dups++; else hashes++;
+                }
+                html += '<tr><td>Level ' + lvl.levelIndex + '</td><td>' + lvl.leaves.length + '</td>' +
+                    '<td><span class="stump-badge" style="background:#0d2818;color:#3fb950;border:1px solid #238636;">' + txids + '</span></td>' +
+                    '<td><span class="stump-badge" style="background:#0d1f3c;color:#58a6ff;border:1px solid #1f6feb;">' + hashes + '</span></td>' +
+                    '<td><span class="stump-badge" style="background:#21262d;color:#8b949e;border:1px solid #30363d;">' + dups + '</span></td></tr>';
+            }
+            html += '</table>';
+            document.getElementById('stump-meta-levels').innerHTML = html;
+        }
+
+        // ============================================================
+        // STUMP: Entry Points
+        // ============================================================
+        function stumpDecodeAndRender() {
+            var input = document.getElementById('stump-input').value;
+            var errBox = document.getElementById('stump-error');
+            errBox.style.display = 'none';
+            document.getElementById('stump-metadata').style.display = 'none';
+            document.getElementById('stump-legend').style.display = 'none';
+            document.getElementById('stump-detail').style.display = 'none';
+            document.getElementById('stump-tree-container').innerHTML = '';
+            stumpCurrentBUMP = null; stumpSelectedOffset = null;
+            if (!input.trim()) { errBox.textContent = 'Please paste STUMP data (base64 or hex) above.'; errBox.style.display = ''; return; }
+            try {
+                var data = stumpDecodeInput(input);
+                var bump = stumpDecodeBUMP(data);
+                stumpCurrentBUMP = bump;
+                stumpShowMetadata(bump);
+                document.getElementById('stump-legend').style.display = '';
+                var layout = stumpComputeLayout(bump);
+                stumpRenderTree(bump, layout);
+            } catch (e) {
+                errBox.textContent = 'Decode error: ' + e.message; errBox.style.display = '';
+            }
+        }
+
+        function stumpLoadExample() {
+            document.getElementById('stump-input').value = '/fQBAgQAApailtIk8oXGe+6Tww+KMJFX8NqjXcW4fkELeGMKCc/HAQBH3FQMlM63BKI4dcESc+FrsLioeu2E3pEfITNWgRXyVAICmb5e+4jKIBO9jk6wNf1C1SRUaP6a+nDYupwcQZpIxOgDAJtPsk7dbR2IMOJyOYJjzb8Ca5c5LMNTh7mR3AJIpij5AgAA6ltlDw+3PC3JFIbkNMD0qRXGEhJ1puWMoC9TXIUW4sEBACyjCeYVrSt/X+zKSCWxqSNIBLKpN5C42BxvBRPgwM7g';
+            stumpDecodeAndRender();
         }
     </script>
 </body>

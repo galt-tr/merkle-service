@@ -2,14 +2,18 @@ package subtree
 
 import (
 	"encoding/hex"
+	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/IBM/sarama"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 
 	"github.com/bsv-blockchain/merkle-service/internal/cache"
 	"github.com/bsv-blockchain/merkle-service/internal/datahub"
+	"github.com/bsv-blockchain/merkle-service/internal/kafka"
 	"github.com/bsv-blockchain/merkle-service/internal/store"
 )
 
@@ -204,8 +208,12 @@ func TestFindRegisteredTxids_NoCache(t *testing.T) {
 	if len(result) != 1 {
 		t.Fatalf("expected 1 registered txid, got %d", len(result))
 	}
-	if result[0] != regTxid {
-		t.Errorf("expected %s, got %s", regTxid, result[0])
+	urls, ok := result[regTxid]
+	if !ok {
+		t.Fatalf("expected %s in result", regTxid)
+	}
+	if len(urls) != 1 || urls[0] != "http://callback.example.com/notify" {
+		t.Errorf("expected [http://callback.example.com/notify], got %v", urls)
 	}
 
 	// All txids should have been sent to store (no cache)
@@ -226,6 +234,7 @@ func TestFindRegisteredTxids_WithCache(t *testing.T) {
 
 	regStore := &mockRegStore{
 		registrations: map[string][]string{
+			cachedRegTxid:   {"http://cached-cb.example.com"},
 			uncachedRegTxid: {"http://cb.example.com"},
 		},
 	}
@@ -254,24 +263,24 @@ func TestFindRegisteredTxids_WithCache(t *testing.T) {
 		t.Fatalf("expected 2 registered txids, got %d: %v", len(result), result)
 	}
 
-	resultSet := make(map[string]bool)
-	for _, txid := range result {
-		resultSet[txid] = true
-	}
-	if !resultSet[cachedRegTxid] {
+	if _, ok := result[cachedRegTxid]; !ok {
 		t.Error("missing cached registered txid in result")
 	}
-	if !resultSet[uncachedRegTxid] {
+	if _, ok := result[uncachedRegTxid]; !ok {
 		t.Error("missing uncached registered txid in result")
 	}
 
-	// Only uncached txids should be sent to the store
-	if len(regStore.batchGetCalls) != 1 {
-		t.Fatalf("expected 1 BatchGet call, got %d", len(regStore.batchGetCalls))
+	// Two BatchGet calls: one for uncached txids, one for cached-registered txids' URLs.
+	if len(regStore.batchGetCalls) != 2 {
+		t.Fatalf("expected 2 BatchGet calls, got %d", len(regStore.batchGetCalls))
 	}
 	batchTxids := regStore.batchGetCalls[0]
 	if len(batchTxids) != 2 {
-		t.Errorf("expected 2 uncached txids in BatchGet, got %d", len(batchTxids))
+		t.Errorf("expected 2 uncached txids in first BatchGet, got %d", len(batchTxids))
+	}
+	cachedBatchTxids := regStore.batchGetCalls[1]
+	if len(cachedBatchTxids) != 1 || cachedBatchTxids[0] != cachedRegTxid {
+		t.Errorf("expected cached-registered txid in second BatchGet, got %v", cachedBatchTxids)
 	}
 
 	// Cache should be updated: uncachedRegTxid → registered, uncachedNotRegTxid → not registered
@@ -289,7 +298,9 @@ func TestFindRegisteredTxids_AllCached(t *testing.T) {
 	txid2 := "2222000000000000000000000000000000000000000000000000000000000002"
 
 	regStore := &mockRegStore{
-		registrations: map[string][]string{},
+		registrations: map[string][]string{
+			txid1: {"http://cb.example.com"},
+		},
 	}
 
 	cache := &mockRegCache{
@@ -309,13 +320,16 @@ func TestFindRegisteredTxids_AllCached(t *testing.T) {
 		t.Fatalf("findRegisteredTxids: %v", err)
 	}
 
-	if len(result) != 1 || result[0] != txid1 {
-		t.Errorf("expected [%s], got %v", txid1, result)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 registered txid, got %d", len(result))
+	}
+	if _, ok := result[txid1]; !ok {
+		t.Errorf("expected %s in result", txid1)
 	}
 
-	// No store calls should be made when everything is cached
-	if len(regStore.batchGetCalls) != 0 {
-		t.Errorf("expected 0 BatchGet calls when all cached, got %d", len(regStore.batchGetCalls))
+	// One BatchGet call for cached-registered txids' URLs (no call for uncached since all cached).
+	if len(regStore.batchGetCalls) != 1 {
+		t.Errorf("expected 1 BatchGet call for cached URLs, got %d", len(regStore.batchGetCalls))
 	}
 }
 
@@ -340,7 +354,7 @@ func TestFindRegisteredTxids_NoneRegistered(t *testing.T) {
 	}
 
 	if len(result) != 0 {
-		t.Errorf("expected 0 registered txids, got %d: %v", len(result), result)
+		t.Errorf("expected 0 registered txids, got %d", len(result))
 	}
 }
 
@@ -414,10 +428,10 @@ func TestEndToEnd_RawDataToRegistrationMatch(t *testing.T) {
 	}
 
 	if len(result) != 1 {
-		t.Fatalf("expected 1 registered txid, got %d: %v", len(result), result)
+		t.Fatalf("expected 1 registered txid, got %d", len(result))
 	}
-	if result[0] != registeredTxid {
-		t.Errorf("expected %s, got %s", registeredTxid, result[0])
+	if _, ok := result[registeredTxid]; !ok {
+		t.Errorf("expected %s in result", registeredTxid)
 	}
 }
 
@@ -500,12 +514,14 @@ func TestFindRegisteredTxids_LargeSubtree(t *testing.T) {
 		t.Fatalf("expected 3 registered txids, got %d", len(result))
 	}
 
-	resultSet := make(map[string]bool)
-	for _, txid := range result {
-		resultSet[txid] = true
+	if _, ok := result[txids[42]]; !ok {
+		t.Error("missing txids[42] in result")
 	}
-	if !resultSet[txids[42]] || !resultSet[txids[999]] || !resultSet[txids[9999]] {
-		t.Errorf("missing expected registered txids in result: %v", result)
+	if _, ok := result[txids[999]]; !ok {
+		t.Error("missing txids[999] in result")
+	}
+	if _, ok := result[txids[9999]]; !ok {
+		t.Error("missing txids[9999] in result")
 	}
 }
 
@@ -729,8 +745,11 @@ func TestIntegration_DuplicateSubtreeOnlyProcessedOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first findRegisteredTxids: %v", err)
 	}
-	if len(result1) != 1 || result1[0] != "txid-registered" {
-		t.Errorf("first call: expected [txid-registered], got %v", result1)
+	if len(result1) != 1 {
+		t.Fatalf("first call: expected 1 registered txid, got %d", len(result1))
+	}
+	if _, ok := result1["txid-registered"]; !ok {
+		t.Error("first call: expected txid-registered in result")
 	}
 	// Mark as processed.
 	dc.Add(subtreeHash)
@@ -858,5 +877,226 @@ func TestDedupCache_IntegrationWithProcessor(t *testing.T) {
 	// Verify it's in cache now
 	if !dc.Contains("subtree-hash-1") {
 		t.Error("expected subtree hash in dedup cache")
+	}
+}
+
+// --- Batched Callback Emission Tests ---
+
+type mockSyncProducer struct {
+	mu       sync.Mutex
+	messages []*sarama.ProducerMessage
+}
+
+func (m *mockSyncProducer) SendMessage(msg *sarama.ProducerMessage) (int32, int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.messages = append(m.messages, msg)
+	return 0, int64(len(m.messages)), nil
+}
+func (m *mockSyncProducer) SendMessages(msgs []*sarama.ProducerMessage) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.messages = append(m.messages, msgs...)
+	return nil
+}
+func (m *mockSyncProducer) Close() error                { return nil }
+func (m *mockSyncProducer) IsTransactional() bool       { return false }
+func (m *mockSyncProducer) TxnStatus() sarama.ProducerTxnStatusFlag { return 0 }
+func (m *mockSyncProducer) BeginTxn() error             { return nil }
+func (m *mockSyncProducer) CommitTxn() error             { return nil }
+func (m *mockSyncProducer) AbortTxn() error              { return nil }
+func (m *mockSyncProducer) AddOffsetsToTxn(map[string][]*sarama.PartitionOffsetMetadata, string) error {
+	return nil
+}
+func (m *mockSyncProducer) AddMessageToTxn(*sarama.ConsumerMessage, string, *string) error {
+	return nil
+}
+
+func (m *mockSyncProducer) getMessages() []*sarama.ProducerMessage {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]*sarama.ProducerMessage, len(m.messages))
+	copy(result, m.messages)
+	return result
+}
+
+func decodeCallbackMsg(t *testing.T, pm *sarama.ProducerMessage) *kafka.CallbackTopicMessage {
+	t.Helper()
+	b, err := pm.Value.Encode()
+	if err != nil {
+		t.Fatalf("encode value: %v", err)
+	}
+	msg, err := kafka.DecodeCallbackTopicMessage(b)
+	if err != nil {
+		t.Fatalf("decode callback msg: %v", err)
+	}
+	return msg
+}
+
+func newTestProcessor(t *testing.T, regStore RegistrationGetter, seenCounter SeenCounter) (*Processor, *mockSyncProducer) {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mockProducer := &mockSyncProducer{}
+	p := &Processor{
+		registrationStore: regStore,
+		seenCounterStore:  seenCounter,
+		callbackProducer:  kafka.NewTestProducer(mockProducer, "callback-test", logger),
+	}
+	p.InitBase("subtree-test")
+	p.Logger = logger
+	return p, mockProducer
+}
+
+// TestBatchedSeenCallbacks_SingleCallbackURL verifies that multiple txids for
+// the same callbackURL produce one batched SEEN_ON_NETWORK message.
+func TestBatchedSeenCallbacks_SingleCallbackURL(t *testing.T) {
+	regStore := &mockRegStore{registrations: map[string][]string{}}
+	p, mockProd := newTestProcessor(t, regStore, &mockSeenCounter{})
+
+	registered := map[string][]string{
+		"tx1": {"http://arcade.example.com/cb"},
+		"tx2": {"http://arcade.example.com/cb"},
+		"tx3": {"http://arcade.example.com/cb"},
+	}
+
+	p.emitBatchedSeenCallbacks(registered, "subtree-A")
+
+	msgs := mockProd.getMessages()
+	// 1 SEEN_ON_NETWORK (no threshold reached → 0 SEEN_MULTIPLE_NODES)
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+
+	cb := decodeCallbackMsg(t, msgs[0])
+	if cb.Type != kafka.CallbackSeenOnNetwork {
+		t.Errorf("expected SEEN_ON_NETWORK, got %s", cb.Type)
+	}
+	if cb.CallbackURL != "http://arcade.example.com/cb" {
+		t.Errorf("unexpected callbackURL: %s", cb.CallbackURL)
+	}
+	if len(cb.TxIDs) != 3 {
+		t.Errorf("expected 3 TxIDs, got %d", len(cb.TxIDs))
+	}
+	txSet := make(map[string]bool)
+	for _, id := range cb.TxIDs {
+		txSet[id] = true
+	}
+	if !txSet["tx1"] || !txSet["tx2"] || !txSet["tx3"] {
+		t.Errorf("missing txids in batch: %v", cb.TxIDs)
+	}
+}
+
+// TestBatchedSeenCallbacks_MultipleCallbackURLs verifies separate batched messages per callbackURL.
+func TestBatchedSeenCallbacks_MultipleCallbackURLs(t *testing.T) {
+	regStore := &mockRegStore{registrations: map[string][]string{}}
+	p, mockProd := newTestProcessor(t, regStore, &mockSeenCounter{})
+
+	registered := map[string][]string{
+		"tx1": {"http://url-A/cb"},
+		"tx2": {"http://url-B/cb"},
+		"tx3": {"http://url-A/cb"},
+	}
+
+	p.emitBatchedSeenCallbacks(registered, "subtree-A")
+
+	msgs := mockProd.getMessages()
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages (one per callbackURL), got %d", len(msgs))
+	}
+
+	byURL := make(map[string]*kafka.CallbackTopicMessage)
+	for _, pm := range msgs {
+		cb := decodeCallbackMsg(t, pm)
+		byURL[cb.CallbackURL] = cb
+	}
+
+	msgA := byURL["http://url-A/cb"]
+	if msgA == nil || len(msgA.TxIDs) != 2 {
+		t.Errorf("expected 2 txids for url-A, got %v", msgA)
+	}
+	msgB := byURL["http://url-B/cb"]
+	if msgB == nil || len(msgB.TxIDs) != 1 || msgB.TxIDs[0] != "tx2" {
+		t.Errorf("expected [tx2] for url-B, got %v", msgB)
+	}
+}
+
+// TestBatchedSeenCallbacks_NoRegistered verifies no messages when no txids registered.
+func TestBatchedSeenCallbacks_NoRegistered(t *testing.T) {
+	regStore := &mockRegStore{registrations: map[string][]string{}}
+	p, mockProd := newTestProcessor(t, regStore, &mockSeenCounter{})
+
+	p.emitBatchedSeenCallbacks(map[string][]string{}, "subtree-A")
+
+	if len(mockProd.getMessages()) != 0 {
+		t.Error("expected no messages for empty registered map")
+	}
+}
+
+// TestBatchedSeenCallbacks_SeenMultipleNodesThreshold verifies batched SEEN_MULTIPLE_NODES.
+func TestBatchedSeenCallbacks_SeenMultipleNodesThreshold(t *testing.T) {
+	// Threshold=1 so every txid triggers SEEN_MULTIPLE_NODES.
+	sc := newMockIdempotentSeenCounter(1)
+	regStore := &mockRegStore{registrations: map[string][]string{}}
+	p, mockProd := newTestProcessor(t, regStore, sc)
+
+	registered := map[string][]string{
+		"tx1": {"http://arcade/cb"},
+		"tx2": {"http://arcade/cb"},
+	}
+
+	p.emitBatchedSeenCallbacks(registered, "subtree-A")
+
+	msgs := mockProd.getMessages()
+	// 1 SEEN_ON_NETWORK + 1 SEEN_MULTIPLE_NODES = 2 messages
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(msgs))
+	}
+
+	byType := make(map[kafka.CallbackType]*kafka.CallbackTopicMessage)
+	for _, pm := range msgs {
+		cb := decodeCallbackMsg(t, pm)
+		byType[cb.Type] = cb
+	}
+
+	seen := byType[kafka.CallbackSeenOnNetwork]
+	if seen == nil || len(seen.TxIDs) != 2 {
+		t.Errorf("expected 2 txids in SEEN_ON_NETWORK, got %v", seen)
+	}
+
+	multi := byType[kafka.CallbackSeenMultipleNodes]
+	if multi == nil || len(multi.TxIDs) != 2 {
+		t.Errorf("expected 2 txids in SEEN_MULTIPLE_NODES, got %v", multi)
+	}
+}
+
+// TestBatchedSeenCallbacks_PartialThreshold verifies only threshold-reached txids in SEEN_MULTIPLE_NODES.
+func TestBatchedSeenCallbacks_PartialThreshold(t *testing.T) {
+	// Threshold=2: tx1 has already been seen once (will reach threshold), tx2 hasn't.
+	sc := newMockIdempotentSeenCounter(2)
+	sc.Increment("tx1", "subtree-PREV") // pre-seen once
+
+	regStore := &mockRegStore{registrations: map[string][]string{}}
+	p, mockProd := newTestProcessor(t, regStore, sc)
+
+	registered := map[string][]string{
+		"tx1": {"http://arcade/cb"},
+		"tx2": {"http://arcade/cb"},
+	}
+
+	p.emitBatchedSeenCallbacks(registered, "subtree-A")
+
+	msgs := mockProd.getMessages()
+	// 1 SEEN_ON_NETWORK (both txids) + 1 SEEN_MULTIPLE_NODES (only tx1) = 2
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(msgs))
+	}
+
+	for _, pm := range msgs {
+		cb := decodeCallbackMsg(t, pm)
+		if cb.Type == kafka.CallbackSeenMultipleNodes {
+			if len(cb.TxIDs) != 1 || cb.TxIDs[0] != "tx1" {
+				t.Errorf("expected SEEN_MULTIPLE_NODES with [tx1], got %v", cb.TxIDs)
+			}
+		}
 	}
 }
