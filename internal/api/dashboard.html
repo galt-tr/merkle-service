@@ -78,7 +78,7 @@
         <a onclick="showSection('endpoints')" id="nav-endpoints" class="active">Endpoints</a>
         <a onclick="showSection('register')" id="nav-register">Register</a>
         <a onclick="showSection('lookup')" id="nav-lookup">Lookup</a>
-        <a onclick="showSection('stump')" id="nav-stump">STUMP</a>
+        <a onclick="showSection('stump')" id="nav-stump">STUMP/BUMP</a>
     </nav>
     <div class="container">
 
@@ -190,16 +190,22 @@
         <!-- STUMP Visualizer Section -->
         <div id="section-stump" class="section">
             <div class="card">
-                <h2>STUMP Visualizer</h2>
+                <h2>STUMP / BUMP Visualizer</h2>
                 <div class="form-group">
-                    <label>STUMP data (base64 or hex encoded, BRC-0074 BUMP format)</label>
-                    <textarea id="stump-input" rows="4" placeholder="Paste base64 or hex-encoded STUMP data here..."></textarea>
+                    <label>STUMP or BUMP data (base64 or hex encoded, BRC-0074 format)</label>
+                    <textarea id="stump-input" rows="4" placeholder="Paste base64 or hex-encoded STUMP/BUMP data here..."></textarea>
+                </div>
+                <div class="form-group" style="margin-top:8px;">
+                    <label>Merkle root (optional, hex — for verification)</label>
+                    <input type="text" id="stump-merkle-root-input" placeholder="Paste expected merkle root hash to verify validity...">
                 </div>
                 <button onclick="stumpDecodeAndRender()">Decode &amp; Visualize</button>
                 <button class="btn-secondary" onclick="stumpLoadExample()" style="margin-left:8px;">Load Example</button>
             </div>
 
             <div id="stump-error" class="stump-error"></div>
+
+            <div id="stump-verify-result" style="display:none;padding:12px 16px;border-radius:6px;margin-bottom:16px;font-size:13px;font-family:monospace;"></div>
 
             <div id="stump-metadata" class="card" style="display:none;">
                 <h2>Metadata</h2>
@@ -581,7 +587,9 @@
             document.getElementById('stump-metadata').style.display = '';
             var total = 0;
             for (var i = 0; i < bump.levels.length; i++) total += bump.levels[i].leaves.length;
+            var formatName = stumpHasTxids(bump) ? 'STUMP' : 'BUMP';
             document.getElementById('stump-meta-stats').innerHTML =
+                '<div><div class="stump-stat-value">' + formatName + '</div><div class="stump-stat-label">Format</div></div>' +
                 '<div><div class="stump-stat-value">' + bump.blockHeight + '</div><div class="stump-stat-label">Block Height</div></div>' +
                 '<div><div class="stump-stat-value">' + bump.treeHeight + '</div><div class="stump-stat-label">Tree Height</div></div>' +
                 '<div><div class="stump-stat-value">' + total + '</div><div class="stump-stat-label">Total Nodes</div></div>';
@@ -601,18 +609,152 @@
         }
 
         // ============================================================
+        // STUMP: Merkle Root Verification
+        // ============================================================
+
+        function stumpHexToBytes(hex) {
+            var bytes = new Uint8Array(hex.length / 2);
+            for (var i = 0; i < hex.length; i += 2) bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+            return bytes;
+        }
+        function stumpBytesToHex(bytes) {
+            var hex = '';
+            for (var i = 0; i < bytes.length; i++) hex += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
+            return hex;
+        }
+        function stumpReverseHex(hex) {
+            var b = stumpHexToBytes(hex);
+            var r = new Uint8Array(b.length);
+            for (var i = 0; i < b.length; i++) r[i] = b[b.length - 1 - i];
+            return stumpBytesToHex(r);
+        }
+        async function stumpSha256d(data) {
+            var first = await crypto.subtle.digest('SHA-256', data);
+            return new Uint8Array(await crypto.subtle.digest('SHA-256', first));
+        }
+
+        function stumpHasTxids(bump) {
+            for (var i = 0; i < bump.levels.length; i++) {
+                for (var j = 0; j < bump.levels[i].leaves.length; j++) {
+                    if (bump.levels[i].leaves[j].flag === 0x02) return true;
+                }
+            }
+            return false;
+        }
+
+        async function stumpComputeMerkleRoot(bump) {
+            var hashByLevel = {};
+            for (var i = 0; i < bump.levels.length; i++) {
+                var lvl = bump.levels[i];
+                if (!hashByLevel[lvl.levelIndex]) hashByLevel[lvl.levelIndex] = {};
+                for (var j = 0; j < lvl.leaves.length; j++) {
+                    var leaf = lvl.leaves[j];
+                    hashByLevel[lvl.levelIndex][leaf.offset] = { flag: leaf.flag, hash: leaf.hash };
+                }
+            }
+            var computed = {};
+            for (var lvl = 0; lvl < bump.treeHeight; lvl++) {
+                var levelData = hashByLevel[lvl] || {};
+                if (!computed[lvl]) computed[lvl] = {};
+                for (var off in levelData) {
+                    var entry = levelData[off];
+                    if (entry.flag === 0x01) {
+                        var sibOff = parseInt(off) ^ 1;
+                        var sibHash = (levelData[sibOff] && levelData[sibOff].hash) || computed[lvl][sibOff];
+                        if (sibHash) computed[lvl][off] = sibHash;
+                    } else if (entry.hash) {
+                        computed[lvl][off] = entry.hash;
+                    }
+                }
+                if (!computed[lvl + 1]) computed[lvl + 1] = {};
+                var processedPairs = {};
+                var allOffsets = {};
+                for (var k in levelData) allOffsets[k] = true;
+                for (var k in computed[lvl]) allOffsets[k] = true;
+                for (var k in allOffsets) {
+                    var o = parseInt(k);
+                    var pairBase = o - (o % 2);
+                    if (processedPairs[pairBase]) continue;
+                    processedPairs[pairBase] = true;
+                    var leftHash = computed[lvl][pairBase];
+                    var rightHash = computed[lvl][pairBase + 1];
+                    if (!leftHash || !rightHash) continue;
+                    var parentOff = Math.floor(pairBase / 2);
+                    if (hashByLevel[lvl + 1] && hashByLevel[lvl + 1][parentOff] && hashByLevel[lvl + 1][parentOff].hash) continue;
+                    var concat = new Uint8Array(64);
+                    concat.set(stumpHexToBytes(leftHash), 0);
+                    concat.set(stumpHexToBytes(rightHash), 32);
+                    var parentHash = await stumpSha256d(concat);
+                    computed[lvl + 1][parentOff] = stumpBytesToHex(parentHash);
+                }
+            }
+            for (var lvl = bump.treeHeight; lvl >= 0; lvl--) {
+                if (computed[lvl] && computed[lvl][0]) return computed[lvl][0];
+            }
+            return null;
+        }
+
+        async function stumpVerifyMerkleRoot(bump) {
+            var resultBox = document.getElementById('stump-verify-result');
+            var rootInput = document.getElementById('stump-merkle-root-input').value.trim();
+            resultBox.style.display = 'none';
+            if (!rootInput) return;
+
+            var formatName = stumpHasTxids(bump) ? 'STUMP' : 'BUMP';
+
+            if (!stumpHasTxids(bump)) {
+                resultBox.style.display = '';
+                resultBox.style.background = '#1c0e0e'; resultBox.style.border = '1px solid #da3633'; resultBox.style.color = '#f85149';
+                resultBox.innerHTML = '<strong>Verification failed:</strong> No embedded txids (0x02 flags) found in ' + formatName + ' data. ' +
+                    'A valid BRC-0074 BUMP must include at least one txid entry at level 0.';
+                return;
+            }
+
+            try {
+                var computedRoot = await stumpComputeMerkleRoot(bump);
+                if (!computedRoot) {
+                    resultBox.style.display = '';
+                    resultBox.style.background = '#1c0e0e'; resultBox.style.border = '1px solid #da3633'; resultBox.style.color = '#f85149';
+                    resultBox.innerHTML = '<strong>Verification failed:</strong> Could not compute merkle root from ' + formatName + ' data.';
+                    return;
+                }
+                var inputLower = rootInput.toLowerCase();
+                var reversedRoot = stumpReverseHex(computedRoot);
+                var match = (inputLower === computedRoot || inputLower === reversedRoot);
+                resultBox.style.display = '';
+                if (match) {
+                    resultBox.style.background = '#0d2818'; resultBox.style.border = '1px solid #238636'; resultBox.style.color = '#3fb950';
+                    resultBox.innerHTML = '<strong>&#10003; Valid ' + formatName + '</strong> &mdash; Computed merkle root matches.' +
+                        '<br>Computed root: ' + computedRoot +
+                        (inputLower === reversedRoot && inputLower !== computedRoot ? ' (matched in display byte order)' : '');
+                } else {
+                    resultBox.style.background = '#1c0e0e'; resultBox.style.border = '1px solid #da3633'; resultBox.style.color = '#f85149';
+                    resultBox.innerHTML = '<strong>&#10007; Invalid ' + formatName + '</strong> &mdash; Computed merkle root does not match.' +
+                        '<br>Expected: ' + rootInput +
+                        '<br>Computed: ' + computedRoot +
+                        '<br>Computed (display order): ' + reversedRoot;
+                }
+            } catch (e) {
+                resultBox.style.display = '';
+                resultBox.style.background = '#1c0e0e'; resultBox.style.border = '1px solid #da3633'; resultBox.style.color = '#f85149';
+                resultBox.innerHTML = '<strong>Verification error:</strong> ' + e.message;
+            }
+        }
+
+        // ============================================================
         // STUMP: Entry Points
         // ============================================================
         function stumpDecodeAndRender() {
             var input = document.getElementById('stump-input').value;
             var errBox = document.getElementById('stump-error');
             errBox.style.display = 'none';
+            document.getElementById('stump-verify-result').style.display = 'none';
             document.getElementById('stump-metadata').style.display = 'none';
             document.getElementById('stump-legend').style.display = 'none';
             document.getElementById('stump-detail').style.display = 'none';
             document.getElementById('stump-tree-container').innerHTML = '';
             stumpCurrentBUMP = null; stumpSelectedOffset = null;
-            if (!input.trim()) { errBox.textContent = 'Please paste STUMP data (base64 or hex) above.'; errBox.style.display = ''; return; }
+            if (!input.trim()) { errBox.textContent = 'Please paste STUMP/BUMP data (base64 or hex) above.'; errBox.style.display = ''; return; }
             try {
                 var data = stumpDecodeInput(input);
                 var bump = stumpDecodeBUMP(data);
@@ -621,6 +763,7 @@
                 document.getElementById('stump-legend').style.display = '';
                 var layout = stumpComputeLayout(bump);
                 stumpRenderTree(bump, layout);
+                stumpVerifyMerkleRoot(bump);
             } catch (e) {
                 errBox.textContent = 'Decode error: ' + e.message; errBox.style.display = '';
             }
@@ -628,6 +771,7 @@
 
         function stumpLoadExample() {
             document.getElementById('stump-input').value = '/fQBAgQAApailtIk8oXGe+6Tww+KMJFX8NqjXcW4fkELeGMKCc/HAQBH3FQMlM63BKI4dcESc+FrsLioeu2E3pEfITNWgRXyVAICmb5e+4jKIBO9jk6wNf1C1SRUaP6a+nDYupwcQZpIxOgDAJtPsk7dbR2IMOJyOYJjzb8Ca5c5LMNTh7mR3AJIpij5AgAA6ltlDw+3PC3JFIbkNMD0qRXGEhJ1puWMoC9TXIUW4sEBACyjCeYVrSt/X+zKSCWxqSNIBLKpN5C42BxvBRPgwM7g';
+            document.getElementById('stump-merkle-root-input').value = 'bd5740a64b2e0737c3a78790fa3f1622af554ee537400f47fb4a64dc357fad9d';
             stumpDecodeAndRender();
         }
     </script>

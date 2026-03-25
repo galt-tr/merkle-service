@@ -194,8 +194,8 @@ func TestHandleStump_Returns200(t *testing.T) {
 	if !strings.Contains(body, "decode-btn") {
 		t.Error("expected page to contain decode button with id 'decode-btn'")
 	}
-	if !strings.Contains(body, "STUMP Visualizer") {
-		t.Error("expected page to contain 'STUMP Visualizer' heading")
+	if !strings.Contains(body, "STUMP / BUMP Visualizer") {
+		t.Error("expected page to contain 'STUMP / BUMP Visualizer' heading")
 	}
 }
 
