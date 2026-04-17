@@ -41,8 +41,21 @@ func main() {
 		logger,
 	)
 
+	// Delivery must resolve StumpRefs via the shared blob store (claim-check);
+	// point cfg.BlobStore.URL at the same location the subtree worker writes to
+	// (file path for all-in-one, s3:// / gs:// in K8s).
+	blobStore, err := store.NewBlobStoreFromURL(cfg.BlobStore.URL)
+	if err != nil {
+		log.Fatal("failed to create blob store: ", err)
+	}
+	stumpStore := store.NewStumpStore(
+		blobStore,
+		uint64(cfg.Subtree.StumpDAHOffset),
+		logger,
+	)
+
 	// Create, init, and start the callback delivery service.
-	deliverySvc := callback.NewDeliveryService(cfg, callbackDedupStore)
+	deliverySvc := callback.NewDeliveryService(cfg, callbackDedupStore, stumpStore)
 
 	if err := deliverySvc.Init(nil); err != nil {
 		log.Fatal("failed to init callback delivery service: ", err)

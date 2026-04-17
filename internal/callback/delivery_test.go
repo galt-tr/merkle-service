@@ -18,6 +18,7 @@ import (
 
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
+	"github.com/bsv-blockchain/merkle-service/internal/store"
 )
 
 // mockSyncProducer implements sarama.SyncProducer for testing.
@@ -81,19 +82,29 @@ func decodePublishedCallbackMessage(t *testing.T, pm *sarama.ProducerMessage) *k
 }
 
 // newTestDeliveryService creates a DeliveryService wired with mock producers and a custom HTTP client.
+// The returned StumpStore is backed by an in-memory blob store — tests that
+// want to exercise STUMP delivery should Put bytes into it and reference them
+// via CallbackTopicMessage.StumpRef.
 func newTestDeliveryService(t *testing.T, cfg *config.Config, httpClient *http.Client) (*DeliveryService, *mockSyncProducer, *mockSyncProducer) {
+	ds, retry, dlq, _ := newTestDeliveryServiceWithStumps(t, cfg, httpClient)
+	return ds, retry, dlq
+}
+
+func newTestDeliveryServiceWithStumps(t *testing.T, cfg *config.Config, httpClient *http.Client) (*DeliveryService, *mockSyncProducer, *mockSyncProducer, *store.StumpStore) {
 	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	mockRetryProducer := &mockSyncProducer{}
 	mockDLQProducer := &mockSyncProducer{}
+	stumpStore := store.NewStumpStore(store.NewMemoryBlobStore(), 0, logger)
 
 	ds := &DeliveryService{
 		cfg:         cfg,
 		httpClient:  httpClient,
 		producer:    kafka.NewTestProducer(mockRetryProducer, cfg.Kafka.CallbackTopic, logger),
 		dlqProducer: kafka.NewTestProducer(mockDLQProducer, cfg.Kafka.CallbackDLQTopic, logger),
+		stumpStore:  stumpStore,
 		workCh:      make(chan *kafka.CallbackTopicMessage, 64),
 		stumpGate:   newStumpGate(),
 	}
@@ -112,7 +123,7 @@ func newTestDeliveryService(t *testing.T, cfg *config.Config, httpClient *http.C
 		ds.workerWg.Wait()
 	})
 
-	return ds, mockRetryProducer, mockDLQProducer
+	return ds, mockRetryProducer, mockDLQProducer, stumpStore
 }
 
 // waitForCondition polls until condition returns true or timeout expires.
@@ -159,19 +170,22 @@ func TestDeliverCallback_StumpSuccess(t *testing.T) {
 	defer server.Close()
 
 	cfg := defaultTestConfig()
-	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+	ds, _, _, stumpStore := newTestDeliveryServiceWithStumps(t, cfg, server.Client())
 
 	stumpData := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	stumpRef, err := stumpStore.Put(stumpData, 0)
+	if err != nil {
+		t.Fatalf("failed to put stump: %v", err)
+	}
 	msg := &kafka.CallbackTopicMessage{
 		CallbackURL:  server.URL + "/callback",
 		Type:         kafka.CallbackStump,
 		BlockHash:    "blockhash456",
 		SubtreeIndex: 3,
-		Stump:        stumpData,
+		StumpRef:     stumpRef,
 	}
 
-	err := ds.deliverCallback(context.Background(), msg)
-	if err != nil {
+	if err := ds.deliverCallback(context.Background(), msg); err != nil {
 		t.Fatalf("expected successful delivery, got error: %v", err)
 	}
 
@@ -376,6 +390,43 @@ func TestProcessDelivery_PublishesToDLQAfterMaxRetries(t *testing.T) {
 	dlqMsgs := dlqMock.getMessages()
 	if len(dlqMsgs) != 1 {
 		t.Fatalf("expected 1 DLQ message, got %d", len(dlqMsgs))
+	}
+}
+
+// TestProcessDelivery_MissingStumpBlobGoesStraightToDLQ asserts that when a
+// STUMP message's StumpRef resolves to no blob (e.g. pruned past DAH), the
+// delivery is marked permanent and routed to the DLQ without consuming the
+// retry budget — retrying cannot recover a missing blob.
+func TestProcessDelivery_MissingStumpBlobGoesStraightToDLQ(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("callback URL should never be hit when STUMP blob is missing")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := defaultTestConfig()
+	ds, retryMock, dlqMock, _ := newTestDeliveryServiceWithStumps(t, cfg, server.Client())
+
+	msg := &kafka.CallbackTopicMessage{
+		CallbackURL:  server.URL + "/callback",
+		Type:         kafka.CallbackStump,
+		BlockHash:    "blockhash-missing",
+		SubtreeIndex: 7,
+		StumpRef:     "ref-that-was-never-stored",
+		RetryCount:   0,
+	}
+
+	ds.processDelivery(msg)
+
+	if got := len(retryMock.getMessages()); got != 0 {
+		t.Errorf("expected 0 retry messages for missing blob, got %d", got)
+	}
+	dlqMsgs := dlqMock.getMessages()
+	if len(dlqMsgs) != 1 {
+		t.Fatalf("expected 1 DLQ message, got %d", len(dlqMsgs))
+	}
+	if ds.messagesFailed.Load() != 1 {
+		t.Errorf("expected messagesFailed=1, got %d", ds.messagesFailed.Load())
 	}
 }
 
@@ -678,16 +729,24 @@ func TestBlockProcessedWaitsForStumps(t *testing.T) {
 	defer server.Close()
 
 	cfg := defaultTestConfig()
-	ds, _, _ := newTestDeliveryService(t, cfg, server.Client())
+	ds, _, _, stumpStore := newTestDeliveryServiceWithStumps(t, cfg, server.Client())
 
 	callbackURL := server.URL + "/callback"
 	blockHash := "block-gate-test"
 
+	mustPutStump := func(b []byte) string {
+		ref, err := stumpStore.Put(b, 0)
+		if err != nil {
+			t.Fatalf("failed to put stump: %v", err)
+		}
+		return ref
+	}
+
 	// Simulate handleMessage ordering: register STUMPs with the gate, then dispatch all.
 	stumps := []*kafka.CallbackTopicMessage{
-		{CallbackURL: callbackURL, Type: kafka.CallbackStump, BlockHash: blockHash, SubtreeIndex: 0, Stump: []byte{0x01}},
-		{CallbackURL: callbackURL, Type: kafka.CallbackStump, BlockHash: blockHash, SubtreeIndex: 1, Stump: []byte{0x02}},
-		{CallbackURL: callbackURL, Type: kafka.CallbackStump, BlockHash: blockHash, SubtreeIndex: 2, Stump: []byte{0x03}},
+		{CallbackURL: callbackURL, Type: kafka.CallbackStump, BlockHash: blockHash, SubtreeIndex: 0, StumpRef: mustPutStump([]byte{0x01})},
+		{CallbackURL: callbackURL, Type: kafka.CallbackStump, BlockHash: blockHash, SubtreeIndex: 1, StumpRef: mustPutStump([]byte{0x02})},
+		{CallbackURL: callbackURL, Type: kafka.CallbackStump, BlockHash: blockHash, SubtreeIndex: 2, StumpRef: mustPutStump([]byte{0x03})},
 	}
 	bp := &kafka.CallbackTopicMessage{CallbackURL: callbackURL, Type: kafka.CallbackBlockProcessed, BlockHash: blockHash}
 

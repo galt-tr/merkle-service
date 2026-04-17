@@ -51,6 +51,11 @@ func main() {
 		uint64(cfg.Subtree.DAHOffset),
 		logger,
 	)
+	stumpStore := store.NewStumpStore(
+		blobStore,
+		uint64(cfg.Subtree.StumpDAHOffset),
+		logger,
+	)
 
 	urlRegistry := store.NewCallbackURLRegistry(
 		asClient,
@@ -71,7 +76,7 @@ func main() {
 
 	worker := block.NewSubtreeWorkerService(
 		cfg.Kafka, cfg.Block, cfg.DataHub,
-		regStore, subtreeStore, urlRegistry, subtreeCounter,
+		regStore, subtreeStore, stumpStore, urlRegistry, subtreeCounter,
 		logger,
 	)
 

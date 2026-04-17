@@ -18,6 +18,7 @@ func TestSubtreeWorkerService_NewAndHealth(t *testing.T) {
 		config.DataHubConfig{},
 		nil, // regStore
 		nil, // subtreeStore
+		nil, // stumpStore
 		nil, // urlRegistry
 		nil, // subtreeCounter
 		logger,

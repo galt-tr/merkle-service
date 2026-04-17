@@ -23,6 +23,12 @@ func NewProducer(brokers []string, topic string, logger *slog.Logger) (*Producer
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Retry.Max = 3
 	config.Producer.Partitioner = sarama.NewHashPartitioner
+	// Defense-in-depth: callback payloads are claim-checked (stump bytes live in
+	// the blob store, Kafka carries only a reference) so messages should be tiny,
+	// but raise the cap well above Sarama's ~1MB default to avoid silent
+	// regressions if future code accidentally inlines large data. Brokers must be
+	// configured with message.max.bytes >= this value.
+	config.Producer.MaxMessageBytes = 10 * 1024 * 1024
 
 	producer, err := sarama.NewSyncProducer(brokers, config)
 	if err != nil {

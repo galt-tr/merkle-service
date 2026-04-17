@@ -85,7 +85,7 @@ func (f *FileBlobStore) Get(key string) ([]byte, error) {
 	data, err := os.ReadFile(f.path(key))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("key not found: %s", key)
+			return nil, fmt.Errorf("%w: %s", ErrBlobNotFound, key)
 		}
 		return nil, fmt.Errorf("reading blob %s: %w", key, err)
 	}

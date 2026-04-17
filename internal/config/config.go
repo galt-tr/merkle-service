@@ -80,6 +80,7 @@ type P2PConfig struct {
 type SubtreeConfig struct {
 	StorageMode    string `yaml:"storageMode"    mapstructure:"storagemode"`
 	DAHOffset      int    `yaml:"dahOffset"      mapstructure:"dahoffset"`
+	StumpDAHOffset int    `yaml:"stumpDahOffset" mapstructure:"stumpdahoffset"`
 	CacheMaxMB     int    `yaml:"cacheMaxMB"     mapstructure:"cachemaxmb"`
 	DedupCacheSize int    `yaml:"dedupCacheSize" mapstructure:"dedupcachesize"`
 }
@@ -158,6 +159,7 @@ func registerDefaults(v *viper.Viper) {
 	// Subtree
 	v.SetDefault("subtree.storagemode", "realtime")
 	v.SetDefault("subtree.dahoffset", 1)
+	v.SetDefault("subtree.stumpdahoffset", 6)
 	v.SetDefault("subtree.cachemaxmb", 64)
 	v.SetDefault("subtree.dedupcachesize", 100000)
 
@@ -237,10 +239,11 @@ func bindEnvVars(v *viper.Viper) {
 		"p2p.msgbus.enablemdns":     "P2P_ENABLE_MDNS",
 
 		// Subtree
-		"subtree.storagemode": "SUBTREE_STORAGE_MODE",
-		"subtree.dahoffset":   "SUBTREE_DAH_OFFSET",
-		"subtree.cachemaxmb":      "SUBTREE_CACHE_MAX_MB",
-		"subtree.dedupcachesize":  "SUBTREE_DEDUP_CACHE_SIZE",
+		"subtree.storagemode":    "SUBTREE_STORAGE_MODE",
+		"subtree.dahoffset":      "SUBTREE_DAH_OFFSET",
+		"subtree.stumpdahoffset": "SUBTREE_STUMP_DAH_OFFSET",
+		"subtree.cachemaxmb":     "SUBTREE_CACHE_MAX_MB",
+		"subtree.dedupcachesize": "SUBTREE_DEDUP_CACHE_SIZE",
 
 		// Block
 		"block.workerpoolsize": "BLOCK_WORKER_POOL_SIZE",

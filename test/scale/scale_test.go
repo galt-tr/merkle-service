@@ -183,6 +183,7 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 
 	blobStore := store.NewMemoryBlobStore()
 	subtreeStore := store.NewSubtreeStore(blobStore, 100, logger)
+	stumpStore := store.NewStumpStore(blobStore, 100, logger)
 
 	// Pre-load registrations.
 	logger.Info("pre-loading registrations", "count", manifest.TotalTxids)
@@ -253,7 +254,7 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 	t.Cleanup(func() { processor.Stop() })
 
 	// Start subtree worker service.
-	subtreeWorker := block.NewSubtreeWorkerService(kafkaCfg, blockCfg, datahubCfg, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
+	subtreeWorker := block.NewSubtreeWorkerService(kafkaCfg, blockCfg, datahubCfg, regStore, subtreeStore, stumpStore, urlRegistry, subtreeCounter, logger)
 	if err := subtreeWorker.Init(nil); err != nil {
 		t.Fatalf("failed to init subtree worker: %v", err)
 	}
@@ -274,7 +275,7 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 			MaxIdleConnsPerHost: 32,
 		},
 	}
-	deliveryService1 := callback.NewDeliveryService(deliveryCfg, nil)
+	deliveryService1 := callback.NewDeliveryService(deliveryCfg, nil, stumpStore)
 	if err := deliveryService1.Init(nil); err != nil {
 		t.Fatalf("failed to init delivery service 1: %v", err)
 	}
@@ -284,7 +285,7 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 	t.Cleanup(func() { deliveryService1.Stop() })
 
 	// Start second delivery service instance (same consumer group) for multi-instance validation.
-	deliveryService2 := callback.NewDeliveryService(deliveryCfg, nil)
+	deliveryService2 := callback.NewDeliveryService(deliveryCfg, nil, stumpStore)
 	if err := deliveryService2.Init(nil); err != nil {
 		t.Fatalf("failed to init delivery service 2: %v", err)
 	}

@@ -52,7 +52,7 @@ func (m *MemoryBlobStore) Get(key string) ([]byte, error) {
 	defer m.mu.RUnlock()
 	data, ok := m.data[key]
 	if !ok {
-		return nil, fmt.Errorf("key not found: %s", key)
+		return nil, fmt.Errorf("%w: %s", ErrBlobNotFound, key)
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)

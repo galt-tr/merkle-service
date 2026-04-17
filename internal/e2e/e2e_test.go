@@ -165,8 +165,10 @@ func newCallbackProducer(t *testing.T, topic string) *kafka.Producer {
 }
 
 // startDeliveryService creates and starts a callback delivery service that
-// consumes from the given callback topic and delivers to callback URLs.
-func startDeliveryService(t *testing.T, callbackTopic string) *callback.DeliveryService {
+// consumes from the given callback topic and delivers to callback URLs. The
+// returned StumpStore is backed by an in-memory blob store — tests that send
+// STUMP messages must Put the bytes here and reference them by StumpRef.
+func startDeliveryService(t *testing.T, callbackTopic string) (*callback.DeliveryService, *store.StumpStore) {
 	t.Helper()
 	cfg := &config.Config{
 		Kafka: config.KafkaConfig{
@@ -183,7 +185,8 @@ func startDeliveryService(t *testing.T, callbackTopic string) *callback.Delivery
 		},
 	}
 
-	ds := callback.NewDeliveryService(cfg, nil)
+	stumpStore := store.NewStumpStore(store.NewMemoryBlobStore(), 0, testLogger())
+	ds := callback.NewDeliveryService(cfg, nil, stumpStore)
 	if err := ds.Init(nil); err != nil {
 		t.Fatalf("failed to init delivery service: %v", err)
 	}
@@ -196,7 +199,7 @@ func startDeliveryService(t *testing.T, callbackTopic string) *callback.Delivery
 
 	// Allow the consumer to settle.
 	time.Sleep(500 * time.Millisecond)
-	return ds
+	return ds, stumpStore
 }
 
 // ---------- tests ----------
@@ -234,7 +237,7 @@ func TestSeenOnNetworkCallback(t *testing.T) {
 
 	// 3. Set up Kafka callback topic and delivery service.
 	stumpsTopic := uniqueTopic("stumps")
-	ds := startDeliveryService(t, stumpsTopic)
+	ds, _ := startDeliveryService(t, stumpsTopic)
 	_ = ds
 
 	// 4. Simulate what the subtree processor does: publish a SEEN_ON_NETWORK
@@ -289,12 +292,16 @@ func TestMinedCallbackWithSTUMP(t *testing.T) {
 
 	// 2. Set up Kafka callback topic and delivery service.
 	stumpsTopic := uniqueTopic("stumps")
-	_ = startDeliveryService(t, stumpsTopic)
+	_, stumpStore := startDeliveryService(t, stumpsTopic)
 
 	// 3. Simulate what the block processor does: publish a MINED stumps message
-	//    with stumpData and blockHash.
+	//    whose StumpRef points at the bytes the delivery service will fetch.
 	callbackProducer := newCallbackProducer(t, stumpsTopic)
 	fakeStumpData := []byte{0x01, 0x02, 0x03, 0x04, 0xAA, 0xBB, 0xCC, 0xDD}
+	stumpRef, err := stumpStore.Put(fakeStumpData, 0)
+	if err != nil {
+		t.Fatalf("failed to put stump: %v", err)
+	}
 	blockHash := "00000000000000000abc123def456789"
 
 	cbMsg := &kafka.CallbackTopicMessage{
@@ -303,7 +310,7 @@ func TestMinedCallbackWithSTUMP(t *testing.T) {
 		TxID:         txid,
 		BlockHash:    blockHash,
 		SubtreeIndex: 1,
-		Stump:        fakeStumpData,
+		StumpRef:     stumpRef,
 	}
 	data, err := cbMsg.Encode()
 	if err != nil {
@@ -372,7 +379,7 @@ func TestMultipleCallbacks(t *testing.T) {
 
 	// 3. Set up Kafka callback topic and delivery service.
 	stumpsTopic := uniqueTopic("stumps")
-	_ = startDeliveryService(t, stumpsTopic)
+	_, _ = startDeliveryService(t, stumpsTopic)
 	callbackProducer := newCallbackProducer(t, stumpsTopic)
 
 	// 4. Simulate the subtree processor: publish SEEN_ON_NETWORK for each
@@ -465,7 +472,7 @@ func TestSeenMultipleNodes(t *testing.T) {
 
 	// 4. Set up Kafka callback topic and delivery service.
 	stumpsTopic := uniqueTopic("stumps")
-	_ = startDeliveryService(t, stumpsTopic)
+	_, _ = startDeliveryService(t, stumpsTopic)
 	callbackProducer := newCallbackProducer(t, stumpsTopic)
 
 	// 5. Publish a SEEN_MULTIPLE_NODES message (as the subtree processor would

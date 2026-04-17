@@ -145,6 +145,15 @@ subtree:
   # Env: SUBTREE_DAH_OFFSET
   dahOffset: 1
 
+  # Delete-at-height offset for STUMP blob expiry. STUMP payloads are stored in
+  # the blob store (claim-check pattern) and referenced by Kafka callback
+  # messages. Must outlive the callback retry window
+  # (callback.maxRetries * callback.backoffBaseSec) plus a margin for brief
+  # blob-store outages. Default of 6 blocks (~1 hour) covers the defaults with
+  # generous headroom.
+  # Env: SUBTREE_STUMP_DAH_OFFSET
+  stumpDahOffset: 6
+
   # Maximum memory (MB) for the registration deduplication cache (txmetacache).
   # Reduces Aerospike load by caching recently-checked txid registration results.
   # Env: SUBTREE_CACHE_MAX_MB

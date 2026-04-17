@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -21,12 +22,31 @@ import (
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
 	"github.com/bsv-blockchain/merkle-service/internal/service"
+	"github.com/bsv-blockchain/merkle-service/internal/store"
 )
 
 // CallbackDeduper abstracts callback deduplication for testability.
 type CallbackDeduper interface {
 	Exists(txid, callbackURL, statusType string) (bool, error)
 	Record(txid, callbackURL, statusType string, ttl time.Duration) error
+}
+
+// permanentDeliveryError marks a delivery failure that cannot be cured by
+// retrying (e.g. the STUMP blob has expired or is unreachable). Wrapping an
+// error with errPermanentDelivery causes processDelivery to skip the retry
+// schedule and send the message straight to the DLQ.
+type permanentDeliveryError struct {
+	err error
+}
+
+func (e *permanentDeliveryError) Error() string { return e.err.Error() }
+func (e *permanentDeliveryError) Unwrap() error { return e.err }
+
+func errPermanentDelivery(err error) error { return &permanentDeliveryError{err: err} }
+
+func isPermanentDeliveryError(err error) bool {
+	var p *permanentDeliveryError
+	return errors.As(err, &p)
 }
 
 // callbackPayload is the JSON body sent to the callback URL, matching Arcade's CallbackMessage.
@@ -110,6 +130,7 @@ type DeliveryService struct {
 	dlqProducer *kafka.Producer
 	httpClient  *http.Client
 	dedupStore  CallbackDeduper
+	stumpStore  *store.StumpStore
 	stumpGate   *stumpGate
 
 	// Worker pool for concurrent delivery.
@@ -122,11 +143,14 @@ type DeliveryService struct {
 	messagesDedupe    atomic.Int64
 }
 
-// NewDeliveryService creates a new callback DeliveryService.
-func NewDeliveryService(cfg *config.Config, dedupStore CallbackDeduper) *DeliveryService {
+// NewDeliveryService creates a new callback DeliveryService. stumpStore is
+// required whenever STUMP-type messages are delivered — it is the claim-check
+// store holding the STUMP bytes referenced by CallbackTopicMessage.StumpRef.
+func NewDeliveryService(cfg *config.Config, dedupStore CallbackDeduper, stumpStore *store.StumpStore) *DeliveryService {
 	return &DeliveryService{
 		cfg:        cfg,
 		dedupStore: dedupStore,
+		stumpStore: stumpStore,
 		stumpGate:  newStumpGate(),
 	}
 }
@@ -419,6 +443,24 @@ func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
 		"error", err,
 	)
 
+	// Permanent failures (e.g. STUMP blob expired) skip the retry schedule
+	// and go straight to the DLQ — retrying cannot recover them.
+	if isPermanentDeliveryError(err) {
+		d.Logger.Error("callback permanently failed, publishing to DLQ",
+			"callbackUrl", cbMsg.CallbackURL,
+			"txid", cbMsg.TxID,
+			"type", cbMsg.Type,
+			"retryCount", cbMsg.RetryCount,
+			"subtreeIndex", cbMsg.SubtreeIndex,
+			"reason", "permanent",
+		)
+		d.messagesFailed.Add(1)
+		if dlqErr := d.publishToDLQ(cbMsg); dlqErr != nil {
+			d.Logger.Error("failed to publish to DLQ", "error", dlqErr)
+		}
+		return
+	}
+
 	// Check if we've exhausted retries.
 	if cbMsg.RetryCount >= d.cfg.Callback.MaxRetries {
 		d.Logger.Error("callback permanently failed, publishing to DLQ",
@@ -465,9 +507,22 @@ func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.Callba
 		SubtreeIndex: msg.SubtreeIndex,
 	}
 
-	// Hex-encode stump data (matching Arcade's HexBytes type).
-	if len(msg.Stump) > 0 {
-		payload.Stump = hex.EncodeToString(msg.Stump)
+	// STUMP bytes are claim-checked: CallbackTopicMessage carries only a ref,
+	// fetch the blob and hex-encode for the HTTP payload.
+	if msg.Type == kafka.CallbackStump && msg.StumpRef != "" {
+		if d.stumpStore == nil {
+			return errPermanentDelivery(fmt.Errorf("stump store not configured for STUMP delivery"))
+		}
+		stumpBytes, err := d.stumpStore.Get(msg.StumpRef)
+		if err != nil {
+			if errors.Is(err, store.ErrStumpNotFound) {
+				// Blob expired (DAH) or never written — no amount of retry will
+				// produce it. Fail permanently so processDelivery routes to DLQ.
+				return errPermanentDelivery(fmt.Errorf("stump blob missing for ref %s: %w", msg.StumpRef, err))
+			}
+			return fmt.Errorf("fetching stump ref %s: %w", msg.StumpRef, err)
+		}
+		payload.Stump = hex.EncodeToString(stumpBytes)
 	}
 
 	body, err := json.Marshal(payload)

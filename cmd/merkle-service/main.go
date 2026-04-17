@@ -65,6 +65,11 @@ func main() {
 		uint64(cfg.Subtree.DAHOffset),
 		logger,
 	)
+	stumpStore := store.NewStumpStore(
+		blobStore,
+		uint64(cfg.Subtree.StumpDAHOffset),
+		logger,
+	)
 
 	// Create Kafka producers.
 	subtreeProducer, err := kafka.NewProducer(cfg.Kafka.Brokers, cfg.Kafka.SubtreeTopic, logger)
@@ -102,7 +107,7 @@ func main() {
 	p2pClient := p2p.NewClient(cfg.P2P, subtreeProducer, blockProducer, logger)
 	subtreeFetcher := subtree.NewProcessor(cfg, regStore, seenStore, subtreeStore)
 	blockProcessor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
-	subtreeWorker := block.NewSubtreeWorkerService(cfg.Kafka, cfg.Block, cfg.DataHub, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
+	subtreeWorker := block.NewSubtreeWorkerService(cfg.Kafka, cfg.Block, cfg.DataHub, regStore, subtreeStore, stumpStore, urlRegistry, subtreeCounter, logger)
 	callbackDedupStore := store.NewCallbackDedupStore(
 		asClient,
 		cfg.Aerospike.CallbackDedupSet,
@@ -110,7 +115,7 @@ func main() {
 		cfg.Aerospike.RetryBaseMs,
 		logger,
 	)
-	callbackDelivery := callback.NewDeliveryService(cfg, callbackDedupStore)
+	callbackDelivery := callback.NewDeliveryService(cfg, callbackDedupStore, stumpStore)
 
 	// Initialize all services.
 	services := []service.Service{apiServer, p2pClient, subtreeFetcher, blockProcessor, subtreeWorker, callbackDelivery}

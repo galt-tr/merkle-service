@@ -84,8 +84,8 @@ func TestBlockProcessedMessage_CorrectFields(t *testing.T) {
 	if msg.TxID != "" {
 		t.Errorf("expected empty TxID for BLOCK_PROCESSED, got %s", msg.TxID)
 	}
-	if len(msg.Stump) != 0 {
-		t.Errorf("expected empty Stump for BLOCK_PROCESSED, got %v", msg.Stump)
+	if msg.StumpRef != "" {
+		t.Errorf("expected empty StumpRef for BLOCK_PROCESSED, got %q", msg.StumpRef)
 	}
 
 	// Verify encode/decode round-trip preserves fields.

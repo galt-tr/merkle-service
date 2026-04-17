@@ -28,6 +28,7 @@ type SubtreeWorkerService struct {
 	callbackProducer *kafka.Producer
 	regStore         *store.RegistrationStore
 	subtreeStore     *store.SubtreeStore
+	stumpStore       *store.StumpStore
 	urlRegistry      *store.CallbackURLRegistry
 	subtreeCounter   *store.SubtreeCounterStore
 	dataHubClient    *datahub.Client
@@ -39,6 +40,7 @@ func NewSubtreeWorkerService(
 	datahubCfg config.DataHubConfig,
 	regStore *store.RegistrationStore,
 	subtreeStore *store.SubtreeStore,
+	stumpStore *store.StumpStore,
 	urlRegistry *store.CallbackURLRegistry,
 	subtreeCounter *store.SubtreeCounterStore,
 	logger *slog.Logger,
@@ -49,6 +51,7 @@ func NewSubtreeWorkerService(
 		datahubCfg:     datahubCfg,
 		regStore:       regStore,
 		subtreeStore:   subtreeStore,
+		stumpStore:     stumpStore,
 		urlRegistry:    urlRegistry,
 		subtreeCounter: subtreeCounter,
 	}
@@ -184,14 +187,38 @@ func (s *SubtreeWorkerService) handleMessage(ctx context.Context, msg *sarama.Co
 }
 
 // publishSubtreeCallbacks publishes one CallbackTopicMessage per callbackURL per subtree.
+// The STUMP bytes are written once to the blob store (content-addressed, so the
+// same blob is reused across every callback URL for this subtree), and each
+// Kafka message carries only the reference.
 func (s *SubtreeWorkerService) publishSubtreeCallbacks(workMsg *kafka.SubtreeWorkMessage, result *SubtreeResult) {
+	if s.stumpStore == nil {
+		s.Logger.Error("stump store not configured; cannot publish STUMP callbacks",
+			"blockHash", workMsg.BlockHash,
+			"subtreeIndex", workMsg.SubtreeIndex,
+		)
+		return
+	}
+
+	stumpRef, err := s.stumpStore.Put(result.StumpData, uint64(workMsg.BlockHeight))
+	if err != nil {
+		// Without a ref, downstream delivery can't fetch the STUMP — skip this
+		// subtree's callbacks entirely rather than publishing broken messages.
+		s.Logger.Error("failed to store STUMP blob; skipping subtree callbacks",
+			"blockHash", workMsg.BlockHash,
+			"subtreeIndex", workMsg.SubtreeIndex,
+			"callbackURLs", len(result.CallbackGroups),
+			"error", err,
+		)
+		return
+	}
+
 	for callbackURL := range result.CallbackGroups {
 		msg := &kafka.CallbackTopicMessage{
 			CallbackURL:  callbackURL,
 			Type:         kafka.CallbackStump,
 			BlockHash:    workMsg.BlockHash,
 			SubtreeIndex: workMsg.SubtreeIndex,
-			Stump:        result.StumpData,
+			StumpRef:     stumpRef,
 		}
 		data, err := msg.Encode()
 		if err != nil {

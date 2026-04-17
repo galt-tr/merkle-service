@@ -1,11 +1,17 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"sync"
 )
+
+// ErrBlobNotFound is returned by BlobStore.Get / GetIoReader when the key is absent.
+// Callers should use errors.Is to distinguish missing blobs from transient I/O errors
+// so they can decide between retrying (transient) and giving up (permanent).
+var ErrBlobNotFound = errors.New("blob not found")
 
 // BlobStore defines the interface for subtree blob storage, mirroring Teranode's stores/blob.Store.
 // When integrating with Teranode, this can be implemented by a wrapper around blob.Store.

@@ -43,7 +43,7 @@ type CallbackTopicMessage struct {
 	TxIDs        []string     `json:"txids,omitempty"`
 	BlockHash    string       `json:"blockHash,omitempty"`
 	SubtreeIndex int          `json:"subtreeIndex,omitempty"`
-	Stump        []byte       `json:"stump,omitempty"`
+	StumpRef     string       `json:"stumpRef,omitempty"`
 	RetryCount   int          `json:"retryCount,omitempty"`
 	NextRetryAt  time.Time    `json:"nextRetryAt,omitempty"`
 }

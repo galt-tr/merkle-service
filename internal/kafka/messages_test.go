@@ -142,14 +142,14 @@ func TestCallbackTopicMessage_SeenOnNetwork(t *testing.T) {
 }
 
 func TestCallbackTopicMessage_Stump(t *testing.T) {
-	stumpData := []byte{0x01, 0x02, 0x03, 0x04}
+	stumpRef := "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 	msg := &CallbackTopicMessage{
 		CallbackURL:  "https://example.com/cb",
 		Type:         CallbackStump,
 		TxID:         "txid1",
 		BlockHash:    "blockhash123",
 		SubtreeIndex: 5,
-		Stump:        stumpData,
+		StumpRef:     stumpRef,
 	}
 
 	data, err := msg.Encode()
@@ -174,9 +174,33 @@ func TestCallbackTopicMessage_Stump(t *testing.T) {
 	if decoded.SubtreeIndex != 5 {
 		t.Errorf("subtreeIndex mismatch: got %d", decoded.SubtreeIndex)
 	}
-	if len(decoded.Stump) != 4 {
-		t.Errorf("stump data length mismatch: got %d", len(decoded.Stump))
+	if decoded.StumpRef != stumpRef {
+		t.Errorf("stumpRef mismatch: got %s", decoded.StumpRef)
 	}
+	// Verify the old "stump" JSON field is gone — ensures Kafka messages are
+	// small (claim-check) rather than inlining the STUMP.
+	if bytesContains(data, []byte(`"stump":`)) {
+		t.Errorf("encoded message still contains raw stump field: %s", string(data))
+	}
+}
+
+func bytesContains(haystack, needle []byte) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		match := true
+		for j := 0; j < len(needle); j++ {
+			if haystack[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCallbackTopicMessage_BatchedSeenOnNetwork(t *testing.T) {
@@ -241,7 +265,7 @@ func TestCallbackTopicMessage_BlockProcessed(t *testing.T) {
 	if decoded.TxID != "" {
 		t.Errorf("expected empty txid, got %s", decoded.TxID)
 	}
-	if len(decoded.Stump) != 0 {
-		t.Errorf("expected empty stump, got %v", decoded.Stump)
+	if decoded.StumpRef != "" {
+		t.Errorf("expected empty stumpRef, got %v", decoded.StumpRef)
 	}
 }

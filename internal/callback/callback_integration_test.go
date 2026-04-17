@@ -16,7 +16,15 @@ import (
 	"github.com/bsv-blockchain/merkle-service/internal/callback"
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
+	"github.com/bsv-blockchain/merkle-service/internal/store"
 )
+
+// newTestStumpStore builds a StumpStore backed by an in-memory blob for
+// integration tests. Callers Put the STUMP bytes and embed the returned ref
+// in their CallbackTopicMessage.
+func newTestStumpStore() *store.StumpStore {
+	return store.NewStumpStore(store.NewMemoryBlobStore(), 0, slog.Default())
+}
 
 var brokers = []string{"localhost:9092"}
 
@@ -63,7 +71,7 @@ func TestCallbackDelivery_SuccessfulCallback(t *testing.T) {
 		},
 	}
 
-	svc := callback.NewDeliveryService(cfg, nil)
+	svc := callback.NewDeliveryService(cfg, nil, newTestStumpStore())
 	if err := svc.Init(nil); err != nil {
 		t.Fatalf("DeliveryService.Init failed: %v", err)
 	}
@@ -167,7 +175,7 @@ func TestCallbackDelivery_RetryOnFailure(t *testing.T) {
 		},
 	}
 
-	svc := callback.NewDeliveryService(cfg, nil)
+	svc := callback.NewDeliveryService(cfg, nil, newTestStumpStore())
 	if err := svc.Init(nil); err != nil {
 		t.Fatalf("DeliveryService.Init failed: %v", err)
 	}

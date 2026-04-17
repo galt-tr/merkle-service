@@ -303,7 +303,7 @@ func TestStumpCallbackMessageEncoding(t *testing.T) {
 		TxID:         "txid1",
 		BlockHash:    "blockhash123",
 		SubtreeIndex: 3,
-		Stump:        []byte{0x01, 0x02, 0x03},
+		StumpRef:     "deadbeef",
 	}
 
 	data, err := msg.Encode()
