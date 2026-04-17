@@ -60,7 +60,16 @@ func (f *FileBlobStore) Set(key string, data []byte, opts ...BlobOption) error {
 		opt(o)
 	}
 
-	if err := os.WriteFile(f.path(key), data, 0o644); err != nil {
+	path := f.path(key)
+	// Keys may contain path separators (e.g. "stump/<sha256>") to namespace
+	// different blob categories. os.WriteFile does not create parents, so
+	// ensure the containing directory exists before writing.
+	if parent := filepath.Dir(path); parent != "" && parent != f.dir {
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			return fmt.Errorf("creating blob parent dir %s: %w", parent, err)
+		}
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("writing blob %s: %w", key, err)
 	}
 
