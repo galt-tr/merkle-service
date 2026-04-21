@@ -328,20 +328,23 @@ func (p *Processor) emitBatchedSeenCallbacks(registeredTxids map[string][]string
 		}
 	}
 
-	// 4.5: Emit one batched SEEN_ON_NETWORK per callbackURL.
+	// 4.5: Emit one batched SEEN_ON_NETWORK per callbackURL, chunked so the JSON
+	// payload stays comfortably under Kafka brokers' default message.max.bytes (1MB).
 	for callbackURL, txids := range seenGroups {
-		msg := &kafka.CallbackTopicMessage{
-			CallbackURL: callbackURL,
-			Type:        kafka.CallbackSeenOnNetwork,
-			TxIDs:       txids,
-		}
-		data, err := msg.Encode()
-		if err != nil {
-			p.Logger.Error("failed to encode batched SEEN_ON_NETWORK", "callbackURL", callbackURL, "error", err)
-			continue
-		}
-		if err := p.callbackProducer.PublishWithHashKey(callbackURL, data); err != nil {
-			p.Logger.Error("failed to publish batched SEEN_ON_NETWORK", "callbackURL", callbackURL, "error", err)
+		for _, chunk := range chunkTxIDs(txids, callbackBatchChunkSize) {
+			msg := &kafka.CallbackTopicMessage{
+				CallbackURL: callbackURL,
+				Type:        kafka.CallbackSeenOnNetwork,
+				TxIDs:       chunk,
+			}
+			data, err := msg.Encode()
+			if err != nil {
+				p.Logger.Error("failed to encode batched SEEN_ON_NETWORK", "callbackURL", callbackURL, "error", err)
+				continue
+			}
+			if err := p.callbackProducer.PublishWithHashKey(callbackURL, data); err != nil {
+				p.Logger.Error("failed to publish batched SEEN_ON_NETWORK", "callbackURL", callbackURL, "error", err)
+			}
 		}
 	}
 
@@ -360,20 +363,42 @@ func (p *Processor) emitBatchedSeenCallbacks(registeredTxids map[string][]string
 		}
 	}
 
-	// Emit one batched SEEN_MULTIPLE_NODES per callbackURL.
+	// Emit one batched SEEN_MULTIPLE_NODES per callbackURL, chunked to fit broker limits.
 	for callbackURL, txids := range thresholdGroups {
-		msg := &kafka.CallbackTopicMessage{
-			CallbackURL: callbackURL,
-			Type:        kafka.CallbackSeenMultipleNodes,
-			TxIDs:       txids,
-		}
-		data, err := msg.Encode()
-		if err != nil {
-			p.Logger.Error("failed to encode batched SEEN_MULTIPLE_NODES", "callbackURL", callbackURL, "error", err)
-			continue
-		}
-		if err := p.callbackProducer.PublishWithHashKey(callbackURL, data); err != nil {
-			p.Logger.Error("failed to publish batched SEEN_MULTIPLE_NODES", "callbackURL", callbackURL, "error", err)
+		for _, chunk := range chunkTxIDs(txids, callbackBatchChunkSize) {
+			msg := &kafka.CallbackTopicMessage{
+				CallbackURL: callbackURL,
+				Type:        kafka.CallbackSeenMultipleNodes,
+				TxIDs:       chunk,
+			}
+			data, err := msg.Encode()
+			if err != nil {
+				p.Logger.Error("failed to encode batched SEEN_MULTIPLE_NODES", "callbackURL", callbackURL, "error", err)
+				continue
+			}
+			if err := p.callbackProducer.PublishWithHashKey(callbackURL, data); err != nil {
+				p.Logger.Error("failed to publish batched SEEN_MULTIPLE_NODES", "callbackURL", callbackURL, "error", err)
+			}
 		}
 	}
+}
+
+// callbackBatchChunkSize caps txids per batched callback message so the JSON
+// payload (~67 bytes per hex txid plus envelope) stays well under Kafka's
+// default broker message.max.bytes of 1MB.
+const callbackBatchChunkSize = 5000
+
+func chunkTxIDs(txids []string, size int) [][]string {
+	if len(txids) <= size {
+		return [][]string{txids}
+	}
+	chunks := make([][]string, 0, (len(txids)+size-1)/size)
+	for i := 0; i < len(txids); i += size {
+		end := i + size
+		if end > len(txids) {
+			end = len(txids)
+		}
+		chunks = append(chunks, txids[i:end])
+	}
+	return chunks
 }

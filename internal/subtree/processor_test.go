@@ -2,6 +2,7 @@ package subtree
 
 import (
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -1098,5 +1099,50 @@ func TestBatchedSeenCallbacks_PartialThreshold(t *testing.T) {
 				t.Errorf("expected SEEN_MULTIPLE_NODES with [tx1], got %v", cb.TxIDs)
 			}
 		}
+	}
+}
+
+// TestBatchedSeenCallbacks_ChunksLargeBatch verifies that batches exceeding
+// callbackBatchChunkSize are split into multiple messages, preventing
+// Kafka "Message was too large" rejections.
+func TestBatchedSeenCallbacks_ChunksLargeBatch(t *testing.T) {
+	regStore := &mockRegStore{registrations: map[string][]string{}}
+	p, mockProd := newTestProcessor(t, regStore, &mockSeenCounter{})
+
+	const total = callbackBatchChunkSize*2 + 17
+	registered := make(map[string][]string, total)
+	for i := 0; i < total; i++ {
+		registered[fmt.Sprintf("tx%05d", i)] = []string{"http://arcade/cb"}
+	}
+
+	p.emitBatchedSeenCallbacks(registered, "subtree-A")
+
+	msgs := mockProd.getMessages()
+	// total txids / chunk size, rounded up → 3 SEEN_ON_NETWORK messages.
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 chunked messages, got %d", len(msgs))
+	}
+
+	seenTxids := make(map[string]bool, total)
+	for _, pm := range msgs {
+		cb := decodeCallbackMsg(t, pm)
+		if cb.Type != kafka.CallbackSeenOnNetwork {
+			t.Errorf("expected SEEN_ON_NETWORK, got %s", cb.Type)
+		}
+		if cb.CallbackURL != "http://arcade/cb" {
+			t.Errorf("unexpected callbackURL: %s", cb.CallbackURL)
+		}
+		if len(cb.TxIDs) > callbackBatchChunkSize {
+			t.Errorf("chunk exceeds max size: got %d, max %d", len(cb.TxIDs), callbackBatchChunkSize)
+		}
+		for _, id := range cb.TxIDs {
+			if seenTxids[id] {
+				t.Errorf("duplicate txid across chunks: %s", id)
+			}
+			seenTxids[id] = true
+		}
+	}
+	if len(seenTxids) != total {
+		t.Errorf("expected %d unique txids across chunks, got %d", total, len(seenTxids))
 	}
 }
