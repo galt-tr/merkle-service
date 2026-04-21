@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sort"
@@ -542,8 +543,18 @@ func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.Callba
 		req.Header.Set("X-Idempotency-Key", idempotencyKey)
 	}
 
+	start := time.Now()
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
+		d.Logger.Debug("callback http transport error",
+			"callbackUrl", msg.CallbackURL,
+			"durationMs", time.Since(start).Milliseconds(),
+			"idempotencyKey", idempotencyKey,
+			"type", msg.Type,
+			"txid", msg.TxID,
+			"subtreeIndex", msg.SubtreeIndex,
+			"error", err,
+		)
 		return fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -552,7 +563,46 @@ func (d *DeliveryService) deliverCallback(ctx context.Context, msg *kafka.Callba
 		return nil
 	}
 
-	return fmt.Errorf("callback returned non-2xx status: %d", resp.StatusCode)
+	bodyBytes, truncated := readBodyCapped(resp.Body, 4*1024)
+	d.Logger.Debug("callback http error response",
+		"callbackUrl", msg.CallbackURL,
+		"status", resp.StatusCode,
+		"statusText", resp.Status,
+		"durationMs", time.Since(start).Milliseconds(),
+		"responseBody", string(bodyBytes),
+		"bodyTruncated", truncated,
+		"contentType", resp.Header.Get("Content-Type"),
+		"contentLength", resp.Header.Get("Content-Length"),
+		"retryAfter", resp.Header.Get("Retry-After"),
+		"xRequestId", resp.Header.Get("X-Request-Id"),
+		"idempotencyKey", idempotencyKey,
+		"type", msg.Type,
+		"txid", msg.TxID,
+		"subtreeIndex", msg.SubtreeIndex,
+	)
+
+	snippet := bodyBytes
+	if len(snippet) > 256 {
+		snippet = snippet[:256]
+	}
+	if len(snippet) == 0 {
+		return fmt.Errorf("callback returned non-2xx status: %d", resp.StatusCode)
+	}
+	return fmt.Errorf("callback returned non-2xx status: %d: %s", resp.StatusCode, string(snippet))
+}
+
+// readBodyCapped reads up to max bytes from r and reports whether the
+// underlying body had more data than was read. Used so a misbehaving receiver
+// returning a huge HTML error page cannot balloon log size or memory.
+func readBodyCapped(r io.Reader, max int64) ([]byte, bool) {
+	buf, err := io.ReadAll(io.LimitReader(r, max))
+	if err != nil {
+		return buf, false
+	}
+	// Probe one more byte to see whether the body was larger than the cap.
+	var probe [1]byte
+	n, _ := r.Read(probe[:])
+	return buf, n > 0
 }
 
 // buildIdempotencyKey creates a unique key for a callback delivery.
