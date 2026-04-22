@@ -127,7 +127,6 @@ type DeliveryService struct {
 
 	cfg         *config.Config
 	consumer    *kafka.Consumer
-	producer    *kafka.Producer
 	dlqProducer *kafka.Producer
 	httpClient  *http.Client
 	dedupStore  CallbackDeduper
@@ -138,10 +137,17 @@ type DeliveryService struct {
 	workCh   chan *kafka.CallbackTopicMessage
 	workerWg sync.WaitGroup
 
+	// shuttingDown guards the retry-scheduler path: once Stop begins, in-flight
+	// time.AfterFunc callbacks must not attempt to send on workCh. Tracked with
+	// retryTimerWg so Stop can wait for pending timer callbacks to finish.
+	shuttingDown atomic.Bool
+	retryTimerWg sync.WaitGroup
+
 	messagesProcessed atomic.Int64
 	messagesRetried   atomic.Int64
 	messagesFailed    atomic.Int64
 	messagesDedupe    atomic.Int64
+	messagesParked    atomic.Int64 // retries currently parked in time.AfterFunc timers
 }
 
 // NewDeliveryService creates a new callback DeliveryService. stumpStore is
@@ -187,18 +193,9 @@ func (d *DeliveryService) Init(_ interface{}) error {
 		Transport: transport,
 	}
 
-	// Create producer for re-enqueuing retries to the callback topic.
-	producer, err := kafka.NewProducer(
-		d.cfg.Kafka.Brokers,
-		d.cfg.Kafka.CallbackTopic,
-		d.Logger,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create callback producer: %w", err)
-	}
-	d.producer = producer
-
 	// Create producer for publishing permanently failed messages to the DLQ topic.
+	// Retries are parked in-process (see scheduleRetry) rather than republished
+	// to the callback topic, so no retry-producer is needed.
 	dlqProducer, err := kafka.NewProducer(
 		d.cfg.Kafka.Brokers,
 		d.cfg.Kafka.CallbackDLQTopic,
@@ -254,8 +251,12 @@ func (d *DeliveryService) Start(ctx context.Context) error {
 	}
 	d.workerWg.Add(workers)
 	for i := 0; i < workers; i++ {
-		go d.deliveryWorker()
+		go d.deliveryWorker(d.Context())
 	}
+
+	// Observability: periodic INFO heartbeat so prod operators can see
+	// throughput without enabling DEBUG (successful deliveries log at DEBUG).
+	go d.heartbeat(d.Context())
 
 	if err := d.consumer.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start callback consumer: %w", err)
@@ -272,6 +273,11 @@ func (d *DeliveryService) Stop() error {
 
 	var firstErr error
 
+	// Flip the shutdown flag before closing workCh so in-flight retry timers
+	// drop their messages instead of sending to a closed channel.
+	d.shuttingDown.Store(true)
+	d.retryTimerWg.Wait()
+
 	// Close work channel to signal workers to drain and exit.
 	if d.workCh != nil {
 		close(d.workCh)
@@ -282,15 +288,6 @@ func (d *DeliveryService) Stop() error {
 		if err := d.consumer.Stop(); err != nil {
 			d.Logger.Error("failed to stop consumer", "error", err)
 			firstErr = err
-		}
-	}
-
-	if d.producer != nil {
-		if err := d.producer.Close(); err != nil {
-			d.Logger.Error("failed to close callback producer", "error", err)
-			if firstErr == nil {
-				firstErr = err
-			}
 		}
 	}
 
@@ -343,14 +340,24 @@ func (d *DeliveryService) handleMessage(_ context.Context, msg *sarama.ConsumerM
 		return fmt.Errorf("failed to decode callback message: %w", err)
 	}
 
-	// Check delay for retry messages before dispatching.
+	// Park not-yet-due retries in-process instead of looping them through Kafka.
+	// Before this change, a message with NextRetryAt in the future was
+	// immediately republished to the callback topic, which caused the consumer
+	// to spin at partition speed republishing the same retry until the delay
+	// elapsed. The Kafka offset still advances (MarkMessage runs after
+	// handleMessage returns nil) so there's no durability regression —
+	// retries were never persisted across restarts anyway, dedup prevents
+	// double-delivery on re-drive from upstream.
 	if !cbMsg.NextRetryAt.IsZero() && time.Now().Before(cbMsg.NextRetryAt) {
-		d.Logger.Debug("message not yet due for retry, re-enqueuing",
+		delay := time.Until(cbMsg.NextRetryAt)
+		d.Logger.Debug("parking retry in-process",
 			"callbackUrl", cbMsg.CallbackURL,
 			"txid", cbMsg.TxID,
 			"nextRetryAt", cbMsg.NextRetryAt,
+			"delay", delay,
 		)
-		return d.reenqueue(cbMsg)
+		d.scheduleRetry(cbMsg, delay)
+		return nil
 	}
 
 	// Register first-attempt STUMP deliveries with the gate so BLOCK_PROCESSED
@@ -366,15 +373,15 @@ func (d *DeliveryService) handleMessage(_ context.Context, msg *sarama.ConsumerM
 }
 
 // deliveryWorker is a goroutine that processes delivery jobs from the work channel.
-func (d *DeliveryService) deliveryWorker() {
+func (d *DeliveryService) deliveryWorker(ctx context.Context) {
 	defer d.workerWg.Done()
 	for msg := range d.workCh {
-		d.processDelivery(msg)
+		d.processDelivery(ctx, msg)
 	}
 }
 
 // processDelivery handles dedup check, HTTP delivery, dedup record, and retry/DLQ logic for a single message.
-func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
+func (d *DeliveryService) processDelivery(ctx context.Context, cbMsg *kafka.CallbackTopicMessage) {
 	// Signal STUMP completion when this function exits (success, dedup skip, or failure).
 	if cbMsg.Type == kafka.CallbackStump && cbMsg.RetryCount == 0 {
 		defer d.stumpGate.Done(cbMsg.BlockHash, cbMsg.CallbackURL)
@@ -399,8 +406,16 @@ func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
 		if dedupKey != "" {
 			exists, err := d.dedupStore.Exists(dedupKey, cbMsg.CallbackURL, string(cbMsg.Type))
 			if err != nil {
-				d.Logger.Warn("dedup check failed, proceeding with delivery", "error", err)
-			} else if exists {
+				// Previous behaviour was "proceed with delivery" — but if a
+				// prior attempt had succeeded and Aerospike is briefly
+				// unreadable, we'd deliver a duplicate BLOCK_PROCESSED. Safer
+				// to fall through to the retry path so the next attempt
+				// re-checks dedup once the store recovers.
+				d.Logger.Error("dedup check failed, scheduling retry", "error", err, "dedupKey", dedupKey, "callbackUrl", cbMsg.CallbackURL)
+				d.scheduleRetryAfterFailure(cbMsg, fmt.Errorf("dedup check: %w", err))
+				return
+			}
+			if exists {
 				d.Logger.Debug("skipping duplicate callback delivery",
 					"dedupKey", dedupKey,
 					"callbackUrl", cbMsg.CallbackURL,
@@ -413,15 +428,18 @@ func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
 	}
 
 	// Attempt HTTP POST delivery.
-	err := d.deliverCallback(context.Background(), cbMsg)
+	err := d.deliverCallback(ctx, cbMsg)
 	if err == nil {
-		// Record successful delivery for dedup.
+		// Record successful delivery for dedup. Delivery already succeeded —
+		// the offset will advance regardless. Raising to ERROR (vs the
+		// previous Warn) so dedup-store outages are visible in prod logs
+		// without requiring DEBUG.
 		if d.dedupStore != nil {
 			dedupKey := dedupKeyForMessage(cbMsg)
 			if dedupKey != "" {
 				ttl := time.Duration(d.cfg.Callback.DedupTTLSec) * time.Second
 				if recErr := d.dedupStore.Record(dedupKey, cbMsg.CallbackURL, string(cbMsg.Type), ttl); recErr != nil {
-					d.Logger.Warn("failed to record callback dedup", "error", recErr)
+					d.Logger.Error("failed to record callback dedup", "error", recErr, "dedupKey", dedupKey, "callbackUrl", cbMsg.CallbackURL)
 				}
 			}
 		}
@@ -456,9 +474,7 @@ func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
 			"reason", "permanent",
 		)
 		d.messagesFailed.Add(1)
-		if dlqErr := d.publishToDLQ(cbMsg); dlqErr != nil {
-			d.Logger.Error("failed to publish to DLQ", "error", dlqErr)
-		}
+		d.publishToDLQWithRetry(cbMsg)
 		return
 	}
 
@@ -472,13 +488,17 @@ func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
 			"subtreeIndex", cbMsg.SubtreeIndex,
 		)
 		d.messagesFailed.Add(1)
-		if err := d.publishToDLQ(cbMsg); err != nil {
-			d.Logger.Error("failed to publish to DLQ", "error", err)
-		}
+		d.publishToDLQWithRetry(cbMsg)
 		return
 	}
 
-	// Increment retry count and calculate next retry time with linear backoff.
+	d.scheduleRetryAfterFailure(cbMsg, err)
+}
+
+// scheduleRetryAfterFailure bumps RetryCount, computes the next NextRetryAt
+// using linear backoff, and parks the message in-process until the delay
+// elapses. Shared by the HTTP-delivery-failed and dedup-check-failed paths.
+func (d *DeliveryService) scheduleRetryAfterFailure(cbMsg *kafka.CallbackTopicMessage, cause error) {
 	cbMsg.RetryCount++
 	backoffSec := d.cfg.Callback.BackoffBaseSec * cbMsg.RetryCount
 	cbMsg.NextRetryAt = time.Now().Add(time.Duration(backoffSec) * time.Second)
@@ -490,11 +510,104 @@ func (d *DeliveryService) processDelivery(cbMsg *kafka.CallbackTopicMessage) {
 		"nextRetryAt", cbMsg.NextRetryAt,
 		"backoffSec", backoffSec,
 		"subtreeIndex", cbMsg.SubtreeIndex,
+		"cause", cause,
 	)
 
 	d.messagesRetried.Add(1)
-	if err := d.reenqueue(cbMsg); err != nil {
-		d.Logger.Error("failed to reenqueue message", "error", err)
+	d.scheduleRetry(cbMsg, time.Duration(backoffSec)*time.Second)
+}
+
+// scheduleRetry parks the message in a time.AfterFunc for the given delay,
+// then re-dispatches it to the worker pool. Respects shutdown: if Stop has
+// fired, the timer callback drops the message instead of sending on a
+// potentially-closing channel.
+func (d *DeliveryService) scheduleRetry(cbMsg *kafka.CallbackTopicMessage, delay time.Duration) {
+	if d.shuttingDown.Load() {
+		d.Logger.Warn("shutdown in progress, dropping parked retry",
+			"callbackUrl", cbMsg.CallbackURL,
+			"txid", cbMsg.TxID,
+			"retryCount", cbMsg.RetryCount,
+		)
+		return
+	}
+
+	d.retryTimerWg.Add(1)
+	d.messagesParked.Add(1)
+	time.AfterFunc(delay, func() {
+		defer d.retryTimerWg.Done()
+		defer d.messagesParked.Add(-1)
+		if d.shuttingDown.Load() {
+			return
+		}
+		// Non-blocking send protects us if the workCh has somehow been closed
+		// between the shuttingDown check and the send. The recover is a
+		// belt-and-braces because AfterFunc has no ctx handle of its own.
+		defer func() {
+			if r := recover(); r != nil {
+				d.Logger.Warn("retry dispatch recovered from panic, message dropped",
+					"callbackUrl", cbMsg.CallbackURL,
+					"txid", cbMsg.TxID,
+					"panic", r,
+				)
+			}
+		}()
+		d.workCh <- cbMsg
+	})
+}
+
+// publishToDLQWithRetry attempts publishToDLQ up to 3 times with 500ms →
+// 1s → 2s backoff. On final failure the message is dropped but the ERROR
+// log + messagesFailed counter surface it — previously the log said
+// "failed to publish to DLQ" with no follow-up and callers assumed success.
+func (d *DeliveryService) publishToDLQWithRetry(cbMsg *kafka.CallbackTopicMessage) {
+	delays := []time.Duration{0, 500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
+	var lastErr error
+	for i, delay := range delays {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		if err := d.publishToDLQ(cbMsg); err != nil {
+			lastErr = err
+			d.Logger.Warn("DLQ publish attempt failed",
+				"attempt", i+1,
+				"callbackUrl", cbMsg.CallbackURL,
+				"txid", cbMsg.TxID,
+				"error", err,
+			)
+			continue
+		}
+		return
+	}
+	d.Logger.Error("DLQ publish exhausted all retries, message lost",
+		"callbackUrl", cbMsg.CallbackURL,
+		"txid", cbMsg.TxID,
+		"type", cbMsg.Type,
+		"retryCount", cbMsg.RetryCount,
+		"error", lastErr,
+	)
+}
+
+// heartbeat emits an INFO-level throughput line every 30 seconds until ctx
+// is cancelled. Lets operators see "service is alive and doing work" without
+// turning on DEBUG for per-message success logs.
+func (d *DeliveryService) heartbeat(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.Logger.Info("callback delivery heartbeat",
+				"messagesProcessed", d.messagesProcessed.Load(),
+				"messagesRetried", d.messagesRetried.Load(),
+				"messagesFailed", d.messagesFailed.Load(),
+				"messagesDedupe", d.messagesDedupe.Load(),
+				"messagesParked", d.messagesParked.Load(),
+				"workChLen", len(d.workCh),
+				"workChCap", cap(d.workCh),
+			)
+		}
 	}
 }
 
@@ -643,20 +756,6 @@ func hashTxIDs(txids []string) string {
 	sort.Strings(sorted)
 	h := sha256.Sum256([]byte(strings.Join(sorted, ",")))
 	return hex.EncodeToString(h[:8])
-}
-
-// reenqueue publishes the message back to the callback topic for later processing.
-func (d *DeliveryService) reenqueue(msg *kafka.CallbackTopicMessage) error {
-	data, err := msg.Encode()
-	if err != nil {
-		return fmt.Errorf("failed to encode callback message for re-enqueue: %w", err)
-	}
-
-	if err := d.producer.PublishWithHashKey(msg.CallbackURL, data); err != nil {
-		return fmt.Errorf("failed to re-enqueue callback message: %w", err)
-	}
-
-	return nil
 }
 
 // publishToDLQ publishes a permanently failed message to the dead-letter queue topic.

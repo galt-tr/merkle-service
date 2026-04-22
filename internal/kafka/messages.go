@@ -16,11 +16,15 @@ const (
 )
 
 // SubtreeMessage represents a subtree announcement received from P2P.
+// AttemptCount is incremented by subtree-fetcher when re-publishing the message
+// for retry; on reaching SubtreeConfig.MaxAttempts the message is routed to
+// the subtree-dlq topic instead of being re-driven again.
 type SubtreeMessage struct {
-	Hash       string `json:"hash"`
-	DataHubURL string `json:"dataHubUrl"`
-	PeerID     string `json:"peerId"`
-	ClientName string `json:"clientName"`
+	Hash         string `json:"hash"`
+	DataHubURL   string `json:"dataHubUrl"`
+	PeerID       string `json:"peerId"`
+	ClientName   string `json:"clientName"`
+	AttemptCount int    `json:"attemptCount,omitempty"`
 }
 
 // BlockMessage represents a block announcement received from P2P.

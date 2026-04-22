@@ -40,7 +40,9 @@ type Processor struct {
 
 	cfg               *config.Config
 	consumer          *kafka.Consumer
-	callbackProducer    *kafka.Producer
+	callbackProducer  *kafka.Producer
+	retryProducer     *kafka.Producer // re-publishes to the subtree topic on transient failure
+	dlqProducer       *kafka.Producer // publishes to subtree-dlq when MaxAttempts is exceeded
 	registrationStore RegistrationGetter
 	seenCounterStore  SeenCounter
 	subtreeStore      *store.SubtreeStore
@@ -49,6 +51,8 @@ type Processor struct {
 	dataHubClient     *datahub.Client
 
 	messagesProcessed atomic.Int64
+	messagesRetried   atomic.Int64
+	messagesDLQ       atomic.Int64
 }
 
 // NewProcessor creates a new subtree Processor.
@@ -96,6 +100,32 @@ func (p *Processor) Init(_ interface{}) error {
 	}
 	p.callbackProducer = callbackProducer
 
+	// Bounded-retry producer: transient failures republish the subtree message
+	// back onto the same topic with AttemptCount+1. Separate producer so we can
+	// close it explicitly on shutdown without touching callbackProducer.
+	retryProducer, err := kafka.NewProducer(
+		p.cfg.Kafka.Brokers,
+		p.cfg.Kafka.SubtreeTopic,
+		p.Logger,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create subtree retry producer: %w", err)
+	}
+	p.retryProducer = retryProducer
+
+	// DLQ producer: when AttemptCount hits SubtreeConfig.MaxAttempts the
+	// message is routed here instead of being re-driven again, preventing the
+	// partition-stall that the consumer-without-MarkMessage path used to cause.
+	dlqProducer, err := kafka.NewProducer(
+		p.cfg.Kafka.Brokers,
+		p.cfg.Kafka.SubtreeDLQTopic,
+		p.Logger,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create subtree DLQ producer: %w", err)
+	}
+	p.dlqProducer = dlqProducer
+
 	consumer, err := kafka.NewConsumer(
 		p.cfg.Kafka.Brokers,
 		p.cfg.Kafka.ConsumerGroup+"-subtree",
@@ -111,7 +141,9 @@ func (p *Processor) Init(_ interface{}) error {
 	p.Logger.Info("subtree-fetcher initialized",
 		"storageMode", p.cfg.Subtree.StorageMode,
 		"subtreeTopic", p.cfg.Kafka.SubtreeTopic,
+		"subtreeDLQTopic", p.cfg.Kafka.SubtreeDLQTopic,
 		"callbackTopic", p.cfg.Kafka.CallbackTopic,
+		"maxAttempts", p.cfg.Subtree.MaxAttempts,
 		"cacheEnabled", p.regCache != nil,
 	)
 
@@ -153,9 +185,31 @@ func (p *Processor) Stop() error {
 		}
 	}
 
+	if p.retryProducer != nil {
+		if err := p.retryProducer.Close(); err != nil {
+			p.Logger.Error("failed to close retry producer", "error", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
+	if p.dlqProducer != nil {
+		if err := p.dlqProducer.Close(); err != nil {
+			p.Logger.Error("failed to close DLQ producer", "error", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
 	p.SetStarted(false)
 	p.Cancel()
-	p.Logger.Info("subtree-fetcher stopped", "messagesProcessed", p.messagesProcessed.Load())
+	p.Logger.Info("subtree-fetcher stopped",
+		"messagesProcessed", p.messagesProcessed.Load(),
+		"messagesRetried", p.messagesRetried.Load(),
+		"messagesDLQ", p.messagesDLQ.Load(),
+	)
 	return firstErr
 }
 
@@ -176,20 +230,36 @@ func (p *Processor) Health() service.HealthStatus {
 }
 
 // handleMessage processes a single subtree announcement message from Kafka.
+//
+// On transient failure (DataHub/blob store/parse/registration lookup) the
+// message is re-published to the subtree topic with AttemptCount+1 and nil is
+// returned so the consumer MarkMessage's and the partition advances. Once
+// AttemptCount reaches SubtreeConfig.MaxAttempts the message is routed to the
+// subtree-dlq topic instead of being re-driven again.
+//
+// The only errors returned upward are producer-level failures that prevent us
+// from either acking or requeueing — those still stall the partition so we
+// don't lose data, but they indicate Kafka-side trouble rather than a poison
+// pill.
 func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage) error {
 	subtreeMsg, err := kafka.DecodeSubtreeMessage(msg.Value)
 	if err != nil {
-		p.Logger.Error("failed to decode subtree message",
+		// Malformed bytes at the head of the partition cannot be recovered by
+		// re-driving — drop the offset by returning nil after logging. A
+		// decode failure is not DLQ-able because we don't have a structured
+		// message to wrap.
+		p.Logger.Error("failed to decode subtree message, dropping",
 			"offset", msg.Offset,
 			"partition", msg.Partition,
 			"error", err,
 		)
-		return fmt.Errorf("failed to decode subtree message: %w", err)
+		return nil
 	}
 
 	p.Logger.Debug("processing subtree announcement",
 		"hash", subtreeMsg.Hash,
 		"dataHubUrl", subtreeMsg.DataHubURL,
+		"attemptCount", subtreeMsg.AttemptCount,
 	)
 
 	// Check dedup cache — skip if already successfully processed.
@@ -201,18 +271,13 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 	// 3.2: Fetch binary subtree data from DataHub.
 	rawData, err := p.dataHubClient.FetchSubtreeRaw(ctx, subtreeMsg.DataHubURL, subtreeMsg.Hash)
 	if err != nil {
-		p.Logger.Error("failed to fetch subtree from DataHub",
-			"hash", subtreeMsg.Hash,
-			"error", err,
-		)
-		return fmt.Errorf("fetching subtree %s: %w", subtreeMsg.Hash, err)
+		return p.handleTransientFailure(subtreeMsg, "fetching subtree from DataHub", err)
 	}
 
 	// 3.3: Store raw binary data in the subtree blob store.
 	if p.cfg.Subtree.StorageMode == "realtime" {
 		if err := p.subtreeStore.StoreSubtree(subtreeMsg.Hash, rawData, 0); err != nil {
-			p.Logger.Error("failed to store subtree", "hash", subtreeMsg.Hash, "error", err)
-			return fmt.Errorf("storing subtree %s: %w", subtreeMsg.Hash, err)
+			return p.handleTransientFailure(subtreeMsg, "storing subtree", err)
 		}
 	}
 
@@ -220,8 +285,7 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 	// DataHub returns concatenated 32-byte hashes, not full go-subtree Serialize() format.
 	txids, err := datahub.ParseRawTxids(rawData)
 	if err != nil {
-		p.Logger.Error("failed to parse subtree txids", "hash", subtreeMsg.Hash, "error", err)
-		return fmt.Errorf("parsing subtree %s: %w", subtreeMsg.Hash, err)
+		return p.handleTransientFailure(subtreeMsg, "parsing subtree txids", err)
 	}
 	p.Logger.Debug("processing subtree txids", "length", len(txids), "hash", subtreeMsg.Hash)
 
@@ -236,8 +300,7 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 	// 4.2-4.4: Check registrations via cache and Aerospike.
 	registeredTxids, err := p.findRegisteredTxids(txids)
 	if err != nil {
-		p.Logger.Error("failed to check registrations", "hash", subtreeMsg.Hash, "error", err)
-		return fmt.Errorf("checking registrations for subtree %s: %w", subtreeMsg.Hash, err)
+		return p.handleTransientFailure(subtreeMsg, "checking registrations", err)
 	}
 
 	// 4.5-4.6: Emit batched callbacks grouped by callbackURL.
@@ -249,6 +312,57 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 	}
 
 	p.messagesProcessed.Add(1)
+	return nil
+}
+
+// handleTransientFailure bumps AttemptCount and either re-publishes the
+// message to the subtree topic or, once MaxAttempts has been reached, parks
+// it on subtree-dlq. Returns nil on successful hand-off so the consumer acks
+// the original offset; returns an error only when the producer itself is
+// broken (partition stall is preferable to silent loss in that case).
+func (p *Processor) handleTransientFailure(subtreeMsg *kafka.SubtreeMessage, stage string, cause error) error {
+	nextAttempt := subtreeMsg.AttemptCount + 1
+	maxAttempts := p.cfg.Subtree.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 10
+	}
+
+	if nextAttempt >= maxAttempts {
+		p.Logger.Error("subtree message exceeded max attempts, routing to DLQ",
+			"hash", subtreeMsg.Hash,
+			"stage", stage,
+			"attemptCount", subtreeMsg.AttemptCount,
+			"maxAttempts", maxAttempts,
+			"error", cause,
+		)
+		subtreeMsg.AttemptCount = nextAttempt
+		data, encErr := subtreeMsg.Encode()
+		if encErr != nil {
+			return fmt.Errorf("encoding subtree message for DLQ: %w", encErr)
+		}
+		if pubErr := p.dlqProducer.Publish(subtreeMsg.Hash, data); pubErr != nil {
+			return fmt.Errorf("publishing subtree message to DLQ: %w", pubErr)
+		}
+		p.messagesDLQ.Add(1)
+		return nil
+	}
+
+	p.Logger.Warn("subtree message transient failure, re-publishing for retry",
+		"hash", subtreeMsg.Hash,
+		"stage", stage,
+		"attemptCount", subtreeMsg.AttemptCount,
+		"nextAttempt", nextAttempt,
+		"error", cause,
+	)
+	subtreeMsg.AttemptCount = nextAttempt
+	data, encErr := subtreeMsg.Encode()
+	if encErr != nil {
+		return fmt.Errorf("encoding subtree message for retry: %w", encErr)
+	}
+	if pubErr := p.retryProducer.Publish(subtreeMsg.Hash, data); pubErr != nil {
+		return fmt.Errorf("re-publishing subtree message for retry: %w", pubErr)
+	}
+	p.messagesRetried.Add(1)
 	return nil
 }
 

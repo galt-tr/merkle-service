@@ -18,11 +18,13 @@ func clearConfigEnv(t *testing.T) {
 		"AEROSPIKE_SET", "AEROSPIKE_SEEN_SET",
 		"AEROSPIKE_MAX_RETRIES", "AEROSPIKE_RETRY_BASE_MS",
 		"KAFKA_BROKERS", "KAFKA_SUBTREE_TOPIC", "KAFKA_BLOCK_TOPIC",
-		"KAFKA_CALLBACK_TOPIC", "KAFKA_CALLBACK_DLQ_TOPIC", "KAFKA_CONSUMER_GROUP",
+		"KAFKA_CALLBACK_TOPIC", "KAFKA_CALLBACK_DLQ_TOPIC", "KAFKA_SUBTREE_DLQ_TOPIC",
+		"KAFKA_CONSUMER_GROUP",
 		"P2P_NETWORK", "P2P_STORAGE_PATH",
 		"P2P_DHT_MODE", "P2P_PORT", "P2P_ANNOUNCE_ADDRS", "P2P_BOOTSTRAP_PEERS",
 		"P2P_MAX_CONNECTIONS", "P2P_MIN_CONNECTIONS", "P2P_ENABLE_NAT", "P2P_ENABLE_MDNS",
 		"SUBTREE_STORAGE_MODE", "SUBTREE_DAH_OFFSET", "SUBTREE_CACHE_MAX_MB",
+		"SUBTREE_MAX_ATTEMPTS",
 		"BLOCK_WORKER_POOL_SIZE", "BLOCK_POST_MINE_TTL_SEC",
 		"CALLBACK_MAX_RETRIES", "CALLBACK_BACKOFF_BASE_SEC",
 		"CALLBACK_TIMEOUT_SEC", "CALLBACK_SEEN_THRESHOLD",
@@ -83,6 +85,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.Kafka.CallbackDLQTopic != "callback-dlq" {
 		t.Errorf("Kafka.CallbackDLQTopic: expected %q, got %q", "callback-dlq", cfg.Kafka.CallbackDLQTopic)
 	}
+	if cfg.Kafka.SubtreeDLQTopic != "subtree-dlq" {
+		t.Errorf("Kafka.SubtreeDLQTopic: expected %q, got %q", "subtree-dlq", cfg.Kafka.SubtreeDLQTopic)
+	}
 	if cfg.Kafka.ConsumerGroup != "merkle-service" {
 		t.Errorf("Kafka.ConsumerGroup: expected %q, got %q", "merkle-service", cfg.Kafka.ConsumerGroup)
 	}
@@ -104,6 +109,9 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.Subtree.CacheMaxMB != 64 {
 		t.Errorf("Subtree.CacheMaxMB: expected 64, got %d", cfg.Subtree.CacheMaxMB)
+	}
+	if cfg.Subtree.MaxAttempts != 10 {
+		t.Errorf("Subtree.MaxAttempts: expected 10, got %d", cfg.Subtree.MaxAttempts)
 	}
 
 	// Block defaults
@@ -147,12 +155,14 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	os.Setenv("KAFKA_BLOCK_TOPIC", "my-block")
 	os.Setenv("KAFKA_CALLBACK_TOPIC", "my-callback")
 	os.Setenv("KAFKA_CALLBACK_DLQ_TOPIC", "my-callback-dlq")
+	os.Setenv("KAFKA_SUBTREE_DLQ_TOPIC", "my-subtree-dlq")
 	os.Setenv("KAFKA_CONSUMER_GROUP", "my-group")
 	os.Setenv("P2P_NETWORK", "testnet")
 	os.Setenv("P2P_STORAGE_PATH", "/tmp/p2p-test")
 	os.Setenv("SUBTREE_STORAGE_MODE", "deferred")
 	os.Setenv("SUBTREE_DAH_OFFSET", "3")
 	os.Setenv("SUBTREE_CACHE_MAX_MB", "128")
+	os.Setenv("SUBTREE_MAX_ATTEMPTS", "7")
 	os.Setenv("BLOCK_WORKER_POOL_SIZE", "32")
 	os.Setenv("BLOCK_POST_MINE_TTL_SEC", "3600")
 	os.Setenv("CALLBACK_MAX_RETRIES", "10")
@@ -192,6 +202,9 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	if cfg.Kafka.CallbackDLQTopic != "my-callback-dlq" {
 		t.Errorf("Kafka.CallbackDLQTopic: expected %q, got %q", "my-callback-dlq", cfg.Kafka.CallbackDLQTopic)
 	}
+	if cfg.Kafka.SubtreeDLQTopic != "my-subtree-dlq" {
+		t.Errorf("Kafka.SubtreeDLQTopic: expected %q, got %q", "my-subtree-dlq", cfg.Kafka.SubtreeDLQTopic)
+	}
 	if cfg.P2P.Network != "testnet" {
 		t.Errorf("P2P.Network: expected %q, got %q", "testnet", cfg.P2P.Network)
 	}
@@ -203,6 +216,9 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.Subtree.CacheMaxMB != 128 {
 		t.Errorf("Subtree.CacheMaxMB: expected 128, got %d", cfg.Subtree.CacheMaxMB)
+	}
+	if cfg.Subtree.MaxAttempts != 7 {
+		t.Errorf("Subtree.MaxAttempts: expected 7, got %d", cfg.Subtree.MaxAttempts)
 	}
 	if cfg.Block.WorkerPoolSize != 32 {
 		t.Errorf("Block.WorkerPoolSize: expected 32, got %d", cfg.Block.WorkerPoolSize)

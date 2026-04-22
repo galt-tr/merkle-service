@@ -90,19 +90,25 @@ func newTestDeliveryService(t *testing.T, cfg *config.Config, httpClient *http.C
 	return ds, retry, dlq
 }
 
+// newTestDeliveryServiceWithStumps returns a DeliveryService plus two
+// mockSyncProducers. The first return value is retained for backwards
+// compatibility with tests that still reference a "retry" producer mock, but
+// retries are now parked in-process rather than republished to Kafka — so
+// that mock should always observe zero messages. Tests that previously
+// asserted on retry-producer publishes have been updated to assert on
+// DeliveryService counters / message mutation instead.
 func newTestDeliveryServiceWithStumps(t *testing.T, cfg *config.Config, httpClient *http.Client) (*DeliveryService, *mockSyncProducer, *mockSyncProducer, *store.StumpStore) {
 	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	mockRetryProducer := &mockSyncProducer{}
+	unusedRetryProducer := &mockSyncProducer{}
 	mockDLQProducer := &mockSyncProducer{}
 	stumpStore := store.NewStumpStore(store.NewMemoryBlobStore(), 0, logger)
 
 	ds := &DeliveryService{
 		cfg:         cfg,
 		httpClient:  httpClient,
-		producer:    kafka.NewTestProducer(mockRetryProducer, cfg.Kafka.CallbackTopic, logger),
 		dlqProducer: kafka.NewTestProducer(mockDLQProducer, cfg.Kafka.CallbackDLQTopic, logger),
 		stumpStore:  stumpStore,
 		workCh:      make(chan *kafka.CallbackTopicMessage, 64),
@@ -115,15 +121,17 @@ func newTestDeliveryServiceWithStumps(t *testing.T, cfg *config.Config, httpClie
 	workers := 4
 	ds.workerWg.Add(workers)
 	for i := 0; i < workers; i++ {
-		go ds.deliveryWorker()
+		go ds.deliveryWorker(context.Background())
 	}
 
 	t.Cleanup(func() {
+		ds.shuttingDown.Store(true)
+		ds.retryTimerWg.Wait()
 		close(ds.workCh)
 		ds.workerWg.Wait()
 	})
 
-	return ds, mockRetryProducer, mockDLQProducer, stumpStore
+	return ds, unusedRetryProducer, mockDLQProducer, stumpStore
 }
 
 // waitForCondition polls until condition returns true or timeout expires.
@@ -343,20 +351,22 @@ func TestProcessDelivery_RetriesOnFailure(t *testing.T) {
 		RetryCount:   0,
 	}
 
-	ds.processDelivery(msg)
+	ds.processDelivery(context.Background(), msg)
 
-	// Check that message was re-enqueued with incremented retry count.
-	msgs := retryMock.getMessages()
-	if len(msgs) != 1 {
-		t.Fatalf("expected 1 retry message, got %d", len(msgs))
+	// Retries are parked in-process now — Kafka is not touched for a
+	// not-yet-exhausted retry. The message itself is mutated in-place with
+	// the bumped RetryCount and the scheduled NextRetryAt.
+	if got := len(retryMock.getMessages()); got != 0 {
+		t.Errorf("expected 0 Kafka retry publishes (retries are parked in-process), got %d", got)
 	}
-
-	retried := decodePublishedCallbackMessage(t, msgs[0])
-	if retried.RetryCount != 1 {
-		t.Errorf("expected retry count 1, got %d", retried.RetryCount)
+	if msg.RetryCount != 1 {
+		t.Errorf("expected retry count 1 on in-place msg, got %d", msg.RetryCount)
 	}
-	if retried.NextRetryAt.IsZero() {
-		t.Error("expected NextRetryAt to be set")
+	if msg.NextRetryAt.IsZero() {
+		t.Error("expected NextRetryAt to be set on in-place msg")
+	}
+	if ds.messagesRetried.Load() != 1 {
+		t.Errorf("expected messagesRetried=1, got %d", ds.messagesRetried.Load())
 	}
 }
 
@@ -378,7 +388,7 @@ func TestProcessDelivery_PublishesToDLQAfterMaxRetries(t *testing.T) {
 		RetryCount:   3, // Already at max retries.
 	}
 
-	ds.processDelivery(msg)
+	ds.processDelivery(context.Background(), msg)
 
 	// No retry should happen.
 	retryMsgs := retryMock.getMessages()
@@ -416,7 +426,7 @@ func TestProcessDelivery_MissingStumpBlobGoesStraightToDLQ(t *testing.T) {
 		RetryCount:   0,
 	}
 
-	ds.processDelivery(msg)
+	ds.processDelivery(context.Background(), msg)
 
 	if got := len(retryMock.getMessages()); got != 0 {
 		t.Errorf("expected 0 retry messages for missing blob, got %d", got)
@@ -445,7 +455,7 @@ func TestProcessDelivery_SuccessIncrementsCounter(t *testing.T) {
 		TxID:        "tx-counter",
 	}
 
-	ds.processDelivery(msg)
+	ds.processDelivery(context.Background(), msg)
 
 	if ds.messagesProcessed.Load() != 1 {
 		t.Errorf("expected messagesProcessed=1, got %d", ds.messagesProcessed.Load())
@@ -471,7 +481,7 @@ func TestProcessDelivery_DedupSkipsDuplicate(t *testing.T) {
 		SubtreeIndex: 3,
 	}
 
-	ds.processDelivery(msg)
+	ds.processDelivery(context.Background(), msg)
 
 	if requestCount.Load() != 0 {
 		t.Errorf("expected no HTTP requests for dedup hit, got %d", requestCount.Load())
@@ -514,6 +524,61 @@ func TestHandleMessage_DispatchesToWorker(t *testing.T) {
 	waitForCondition(t, 2*time.Second, func() bool {
 		return delivered.Load() > 0
 	})
+}
+
+func TestHandleMessage_ParksRetryInProcess(t *testing.T) {
+	cfg := defaultTestConfig()
+	ds, retryMock, _ := newTestDeliveryService(t, cfg, &http.Client{Timeout: time.Second})
+
+	var delivered atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		delivered.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	ds.httpClient = server.Client()
+
+	delay := 200 * time.Millisecond
+	msg := &kafka.CallbackTopicMessage{
+		CallbackURL: server.URL + "/callback",
+		Type:        kafka.CallbackSeenOnNetwork,
+		TxID:        "tx-parked",
+		RetryCount:  1,
+		NextRetryAt: time.Now().Add(delay),
+	}
+	data, err := msg.Encode()
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+
+	start := time.Now()
+	if err := ds.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data}); err != nil {
+		t.Fatalf("handleMessage failed: %v", err)
+	}
+
+	// Immediately after handleMessage: message should be parked, nothing
+	// published to Kafka, no HTTP delivery yet.
+	if got := len(retryMock.getMessages()); got != 0 {
+		t.Errorf("expected 0 retry-producer publishes while parked, got %d", got)
+	}
+	if got := ds.messagesParked.Load(); got != 1 {
+		t.Errorf("expected messagesParked=1 while parked, got %d", got)
+	}
+	if delivered.Load() != 0 {
+		t.Errorf("expected 0 HTTP deliveries before delay elapses, got %d", delivered.Load())
+	}
+
+	// After the delay, the worker should pick the message off workCh and
+	// deliver it.
+	waitForCondition(t, 2*time.Second, func() bool {
+		return delivered.Load() > 0
+	})
+	if elapsed := time.Since(start); elapsed < delay {
+		t.Errorf("delivery fired before scheduled delay: elapsed %v < delay %v", elapsed, delay)
+	}
+	if got := len(retryMock.getMessages()); got != 0 {
+		t.Errorf("expected 0 retry-producer publishes after worker ran, got %d", got)
+	}
 }
 
 func TestBuildIdempotencyKey(t *testing.T) {

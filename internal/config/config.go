@@ -53,6 +53,7 @@ type KafkaConfig struct {
 	BlockTopic       string   `yaml:"blockTopic"       mapstructure:"blocktopic"`
 	CallbackTopic    string   `yaml:"callbackTopic"    mapstructure:"callbacktopic"`
 	CallbackDLQTopic string   `yaml:"callbackDlqTopic" mapstructure:"callbackdlqtopic"`
+	SubtreeDLQTopic  string   `yaml:"subtreeDlqTopic"  mapstructure:"subtreedlqtopic"`
 	SubtreeWorkTopic string   `yaml:"subtreeWorkTopic" mapstructure:"subtreeworktopic"`
 	ConsumerGroup    string   `yaml:"consumerGroup"    mapstructure:"consumergroup"`
 }
@@ -83,6 +84,11 @@ type SubtreeConfig struct {
 	StumpDAHOffset int    `yaml:"stumpDahOffset" mapstructure:"stumpdahoffset"`
 	CacheMaxMB     int    `yaml:"cacheMaxMB"     mapstructure:"cachemaxmb"`
 	DedupCacheSize int    `yaml:"dedupCacheSize" mapstructure:"dedupcachesize"`
+	// MaxAttempts caps how many times a subtree message is re-driven through
+	// the `subtree` topic before it is parked on `subtree-dlq`. Previously a
+	// permanently-failing subtree (e.g. DataHub 404) stalled the partition
+	// forever because the consumer doesn't MarkMessage on handler error.
+	MaxAttempts int `yaml:"maxAttempts" mapstructure:"maxattempts"`
 }
 
 // BlockConfig holds block processing configuration.
@@ -145,6 +151,7 @@ func registerDefaults(v *viper.Viper) {
 	v.SetDefault("kafka.blocktopic", "block")
 	v.SetDefault("kafka.callbacktopic", "callback")
 	v.SetDefault("kafka.callbackdlqtopic", "callback-dlq")
+	v.SetDefault("kafka.subtreedlqtopic", "subtree-dlq")
 	v.SetDefault("kafka.subtreeworktopic", "subtree-work")
 	v.SetDefault("kafka.consumergroup", "merkle-service")
 
@@ -162,6 +169,7 @@ func registerDefaults(v *viper.Viper) {
 	v.SetDefault("subtree.stumpdahoffset", 6)
 	v.SetDefault("subtree.cachemaxmb", 64)
 	v.SetDefault("subtree.dedupcachesize", 100000)
+	v.SetDefault("subtree.maxattempts", 10)
 
 	// Block
 	v.SetDefault("block.workerpoolsize", 16)
@@ -223,6 +231,7 @@ func bindEnvVars(v *viper.Viper) {
 		"kafka.blocktopic":     "KAFKA_BLOCK_TOPIC",
 		"kafka.callbacktopic":    "KAFKA_CALLBACK_TOPIC",
 		"kafka.callbackdlqtopic": "KAFKA_CALLBACK_DLQ_TOPIC",
+		"kafka.subtreedlqtopic":  "KAFKA_SUBTREE_DLQ_TOPIC",
 		"kafka.subtreeworktopic": "KAFKA_SUBTREE_WORK_TOPIC",
 		"kafka.consumergroup":    "KAFKA_CONSUMER_GROUP",
 
@@ -244,6 +253,7 @@ func bindEnvVars(v *viper.Viper) {
 		"subtree.stumpdahoffset": "SUBTREE_STUMP_DAH_OFFSET",
 		"subtree.cachemaxmb":     "SUBTREE_CACHE_MAX_MB",
 		"subtree.dedupcachesize": "SUBTREE_DEDUP_CACHE_SIZE",
+		"subtree.maxattempts":    "SUBTREE_MAX_ATTEMPTS",
 
 		// Block
 		"block.workerpoolsize": "BLOCK_WORKER_POOL_SIZE",

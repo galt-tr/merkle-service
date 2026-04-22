@@ -2,6 +2,7 @@ package subtree
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 
 	"github.com/bsv-blockchain/merkle-service/internal/cache"
+	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/datahub"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
 	"github.com/bsv-blockchain/merkle-service/internal/store"
@@ -1144,5 +1146,115 @@ func TestBatchedSeenCallbacks_ChunksLargeBatch(t *testing.T) {
 	}
 	if len(seenTxids) != total {
 		t.Errorf("expected %d unique txids across chunks, got %d", total, len(seenTxids))
+	}
+}
+
+// --- Subtree DLQ Tests ---
+
+// TestHandleTransientFailure_RoutesToDLQAtMaxAttempts drives a subtree message
+// through handleTransientFailure with repeated failures and asserts that
+// (a) before MaxAttempts the retry producer sees publishes with incrementing
+// AttemptCount and (b) on the final attempt the DLQ producer sees exactly one
+// publish with AttemptCount == MaxAttempts.
+func TestHandleTransientFailure_RoutesToDLQAtMaxAttempts(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	retryMock := &mockSyncProducer{}
+	dlqMock := &mockSyncProducer{}
+
+	maxAttempts := 3
+	p := &Processor{
+		cfg: &config.Config{
+			Subtree: config.SubtreeConfig{MaxAttempts: maxAttempts},
+		},
+		retryProducer: kafka.NewTestProducer(retryMock, "subtree-test", logger),
+		dlqProducer:   kafka.NewTestProducer(dlqMock, "subtree-dlq-test", logger),
+	}
+	p.InitBase("subtree-dlq-test")
+	p.Logger = logger
+
+	subtreeMsg := &kafka.SubtreeMessage{
+		Hash:       "subtree-hash-abc",
+		DataHubURL: "http://datahub.example.com",
+	}
+	cause := errors.New("datahub 404")
+
+	// Simulate retries until MaxAttempts is reached.
+	for i := 0; i < maxAttempts; i++ {
+		if err := p.handleTransientFailure(subtreeMsg, "fetch", cause); err != nil {
+			t.Fatalf("iteration %d: unexpected error: %v", i, err)
+		}
+	}
+
+	retryMsgs := retryMock.getMessages()
+	if len(retryMsgs) != maxAttempts-1 {
+		t.Fatalf("expected %d retry publishes, got %d", maxAttempts-1, len(retryMsgs))
+	}
+	for i, pm := range retryMsgs {
+		b, err := pm.Value.Encode()
+		if err != nil {
+			t.Fatalf("retry msg %d: encode: %v", i, err)
+		}
+		decoded, err := kafka.DecodeSubtreeMessage(b)
+		if err != nil {
+			t.Fatalf("retry msg %d: decode: %v", i, err)
+		}
+		if decoded.AttemptCount != i+1 {
+			t.Errorf("retry msg %d: expected AttemptCount=%d, got %d", i, i+1, decoded.AttemptCount)
+		}
+	}
+
+	dlqMsgs := dlqMock.getMessages()
+	if len(dlqMsgs) != 1 {
+		t.Fatalf("expected exactly 1 DLQ publish, got %d", len(dlqMsgs))
+	}
+	b, err := dlqMsgs[0].Value.Encode()
+	if err != nil {
+		t.Fatalf("dlq msg: encode: %v", err)
+	}
+	dlqDecoded, err := kafka.DecodeSubtreeMessage(b)
+	if err != nil {
+		t.Fatalf("dlq msg: decode: %v", err)
+	}
+	if dlqDecoded.AttemptCount != maxAttempts {
+		t.Errorf("DLQ msg AttemptCount: expected %d, got %d", maxAttempts, dlqDecoded.AttemptCount)
+	}
+	if dlqDecoded.Hash != subtreeMsg.Hash {
+		t.Errorf("DLQ msg Hash: expected %q, got %q", subtreeMsg.Hash, dlqDecoded.Hash)
+	}
+
+	if got := p.messagesRetried.Load(); got != int64(maxAttempts-1) {
+		t.Errorf("messagesRetried: expected %d, got %d", maxAttempts-1, got)
+	}
+	if got := p.messagesDLQ.Load(); got != 1 {
+		t.Errorf("messagesDLQ: expected 1, got %d", got)
+	}
+}
+
+// TestHandleTransientFailure_DefaultsMaxAttemptsWhenUnset verifies the guard
+// that treats non-positive MaxAttempts as the built-in default (10), so a
+// misconfigured deployment never collapses into "DLQ on first failure".
+func TestHandleTransientFailure_DefaultsMaxAttemptsWhenUnset(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	retryMock := &mockSyncProducer{}
+	dlqMock := &mockSyncProducer{}
+
+	p := &Processor{
+		cfg:           &config.Config{Subtree: config.SubtreeConfig{MaxAttempts: 0}},
+		retryProducer: kafka.NewTestProducer(retryMock, "subtree-test", logger),
+		dlqProducer:   kafka.NewTestProducer(dlqMock, "subtree-dlq-test", logger),
+	}
+	p.InitBase("subtree-dlq-default-test")
+	p.Logger = logger
+
+	subtreeMsg := &kafka.SubtreeMessage{Hash: "h"}
+	if err := p.handleTransientFailure(subtreeMsg, "fetch", errors.New("x")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(retryMock.getMessages()) != 1 {
+		t.Errorf("expected 1 retry publish with default MaxAttempts, got %d", len(retryMock.getMessages()))
+	}
+	if len(dlqMock.getMessages()) != 0 {
+		t.Errorf("expected 0 DLQ publishes, got %d", len(dlqMock.getMessages()))
 	}
 }
