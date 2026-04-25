@@ -9,11 +9,12 @@ import (
 
 const subtreeCounterBin = "remaining"
 
-// SubtreeCounterStore manages atomic subtree completion counters in Aerospike.
-// Used to coordinate BLOCK_PROCESSED emission: the block processor initializes
-// a counter with the subtree count, and each subtree worker decrements it.
-// When the counter reaches zero, the last worker emits BLOCK_PROCESSED.
-type SubtreeCounterStore struct {
+// aerospikeSubtreeCounter is the Aerospike-backed SubtreeCounterStore
+// implementation. Used to coordinate BLOCK_PROCESSED emission: the block
+// processor initializes a counter with the subtree count, and each subtree
+// worker decrements it. When the counter reaches zero, the last worker emits
+// BLOCK_PROCESSED.
+type aerospikeSubtreeCounter struct {
 	client      *AerospikeClient
 	setName     string
 	ttlSec      int
@@ -22,8 +23,10 @@ type SubtreeCounterStore struct {
 	logger      *slog.Logger
 }
 
-func NewSubtreeCounterStore(client *AerospikeClient, setName string, ttlSec int, maxRetries int, retryBaseMs int, logger *slog.Logger) *SubtreeCounterStore {
-	return &SubtreeCounterStore{
+var _ SubtreeCounterStore = (*aerospikeSubtreeCounter)(nil)
+
+func NewSubtreeCounterStore(client *AerospikeClient, setName string, ttlSec int, maxRetries int, retryBaseMs int, logger *slog.Logger) SubtreeCounterStore {
+	return &aerospikeSubtreeCounter{
 		client:      client,
 		setName:     setName,
 		ttlSec:      ttlSec,
@@ -34,7 +37,7 @@ func NewSubtreeCounterStore(client *AerospikeClient, setName string, ttlSec int,
 }
 
 // Init creates a counter record for the given blockHash with the initial count.
-func (s *SubtreeCounterStore) Init(blockHash string, count int) error {
+func (s *aerospikeSubtreeCounter) Init(blockHash string, count int) error {
 	key, err := as.NewKey(s.client.Namespace(), s.setName, blockHash)
 	if err != nil {
 		return fmt.Errorf("failed to create key: %w", err)
@@ -52,7 +55,7 @@ func (s *SubtreeCounterStore) Init(blockHash string, count int) error {
 }
 
 // Decrement atomically decrements the counter for the given blockHash and returns the new value.
-func (s *SubtreeCounterStore) Decrement(blockHash string) (remaining int, err error) {
+func (s *aerospikeSubtreeCounter) Decrement(blockHash string) (remaining int, err error) {
 	key, err := as.NewKey(s.client.Namespace(), s.setName, blockHash)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create key: %w", err)

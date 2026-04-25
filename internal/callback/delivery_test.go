@@ -97,7 +97,7 @@ func newTestDeliveryService(t *testing.T, cfg *config.Config, httpClient *http.C
 // that mock should always observe zero messages. Tests that previously
 // asserted on retry-producer publishes have been updated to assert on
 // DeliveryService counters / message mutation instead.
-func newTestDeliveryServiceWithStumps(t *testing.T, cfg *config.Config, httpClient *http.Client) (*DeliveryService, *mockSyncProducer, *mockSyncProducer, *store.StumpStore) {
+func newTestDeliveryServiceWithStumps(t *testing.T, cfg *config.Config, httpClient *http.Client) (*DeliveryService, *mockSyncProducer, *mockSyncProducer, store.StumpStore) {
 	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func newAccumulatorTestStore(t *testing.T) *CallbackAccumulatorStore {
+func newAccumulatorTestStore(t *testing.T) CallbackAccumulatorStore {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
 

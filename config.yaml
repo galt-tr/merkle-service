@@ -31,7 +31,43 @@ api:
   port: 8080
 
 # ---------------------------------------------------------------------------
+# Store — selects the persistence backend for every non-blob store
+# ---------------------------------------------------------------------------
+# backend: which store implementation to use.
+#   aerospike (default): use the aerospike: block below. Production-recommended.
+#   sql: use the store.sql: block. PostgreSQL and SQLite are supported.
+# Env: STORE_BACKEND
+store:
+  backend: aerospike
+
+  # SQL backend — only read when store.backend == sql.
+  sql:
+    # driver: postgres | sqlite
+    # Env: STORE_SQL_DRIVER
+    driver: postgres
+
+    # DSN (driver-specific connection string).
+    # postgres example: postgres://user:pass@host:5432/merkle?sslmode=disable
+    # sqlite  example: file:/var/lib/merkle.db
+    # Env: STORE_SQL_DSN
+    dsn: ""
+
+    # Optional schema name (postgres only). Empty means default search_path.
+    # Env: STORE_SQL_SCHEMA
+    schema: ""
+
+    # Interval between TTL sweeper passes (Go duration; e.g. 30s, 1m).
+    # Env: STORE_SQL_SWEEPER_INTERVAL
+    sweeperInterval: 60s
+
+    # Connection pool sizing.
+    # Env: STORE_SQL_MAX_OPEN_CONNS, STORE_SQL_MAX_IDLE_CONNS
+    maxOpenConns: 25
+    maxIdleConns: 5
+
+# ---------------------------------------------------------------------------
 # Aerospike — registration store and seen-counter persistence
+# (read only when store.backend == aerospike)
 # ---------------------------------------------------------------------------
 aerospike:
   # Aerospike cluster seed node.

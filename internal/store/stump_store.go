@@ -18,17 +18,19 @@ const stumpKeyPrefix = "stump/"
 // a permanent delivery failure (route to DLQ) rather than retrying.
 var ErrStumpNotFound = errors.New("stump not found")
 
-// StumpStore wraps a BlobStore to provide content-addressed STUMP storage with
-// delete-at-height pruning. Content addressing gives automatic dedup across
-// retries, re-orgs, and any other path that rebuilds an identical STUMP.
-type StumpStore struct {
+// blobStumpStore wraps a BlobStore to provide content-addressed STUMP storage
+// with delete-at-height pruning. Content addressing gives automatic dedup
+// across retries, re-orgs, and any other path that rebuilds an identical STUMP.
+type blobStumpStore struct {
 	store     BlobStore
 	dahOffset uint64
 	logger    *slog.Logger
 }
 
-func NewStumpStore(store BlobStore, dahOffset uint64, logger *slog.Logger) *StumpStore {
-	return &StumpStore{
+var _ StumpStore = (*blobStumpStore)(nil)
+
+func NewStumpStore(store BlobStore, dahOffset uint64, logger *slog.Logger) StumpStore {
+	return &blobStumpStore{
 		store:     store,
 		dahOffset: dahOffset,
 		logger:    logger,
@@ -38,7 +40,7 @@ func NewStumpStore(store BlobStore, dahOffset uint64, logger *slog.Logger) *Stum
 // Put stores the STUMP bytes and returns a content-addressed reference that
 // Get can use later. If blockHeight > 0 the blob is scheduled for deletion at
 // blockHeight + dahOffset; otherwise it is kept until explicitly deleted.
-func (s *StumpStore) Put(data []byte, blockHeight uint64) (string, error) {
+func (s *blobStumpStore) Put(data []byte, blockHeight uint64) (string, error) {
 	ref := StumpRefFor(data)
 	key := stumpKeyPrefix + ref
 
@@ -56,7 +58,7 @@ func (s *StumpStore) Put(data []byte, blockHeight uint64) (string, error) {
 // Get retrieves STUMP bytes for the given reference. Returns ErrStumpNotFound
 // (wrapped) if the blob is absent so callers can distinguish expired/pruned
 // blobs from transient I/O failures.
-func (s *StumpStore) Get(ref string) ([]byte, error) {
+func (s *blobStumpStore) Get(ref string) ([]byte, error) {
 	if ref == "" {
 		return nil, ErrStumpNotFound
 	}
@@ -73,7 +75,7 @@ func (s *StumpStore) Get(ref string) ([]byte, error) {
 // Delete removes the STUMP for the given reference. Missing blobs are not an
 // error — this method is idempotent so it is safe to call after successful
 // delivery without coordinating across callback URLs that share the same ref.
-func (s *StumpStore) Delete(ref string) error {
+func (s *blobStumpStore) Delete(ref string) error {
 	if ref == "" {
 		return nil
 	}

@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func newTestStumpStore(t *testing.T, dahOffset uint64) (*StumpStore, *MemoryBlobStore) {
+func newTestStumpStore(t *testing.T, dahOffset uint64) (StumpStore, *MemoryBlobStore) {
 	t.Helper()
 	blob := NewMemoryBlobStore()
 	return NewStumpStore(blob, dahOffset, slog.New(slog.NewTextHandler(io.Discard, nil))), blob

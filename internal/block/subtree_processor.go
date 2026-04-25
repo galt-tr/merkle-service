@@ -35,8 +35,8 @@ func ProcessBlockSubtree(
 	blockHash string,
 	dataHubURL string,
 	dhClient *datahub.Client,
-	subtreeStore *store.SubtreeStore,
-	regStore *store.RegistrationStore,
+	subtreeStore store.SubtreeStore,
+	regStore store.RegistrationStore,
 	postMineTTLSec int,
 	logger *slog.Logger,
 ) (*SubtreeResult, error) {

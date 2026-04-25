@@ -26,11 +26,11 @@ type SubtreeWorkerService struct {
 	datahubCfg     config.DataHubConfig
 	consumer         *kafka.Consumer
 	callbackProducer *kafka.Producer
-	regStore         *store.RegistrationStore
-	subtreeStore     *store.SubtreeStore
-	stumpStore       *store.StumpStore
-	urlRegistry      *store.CallbackURLRegistry
-	subtreeCounter   *store.SubtreeCounterStore
+	regStore         store.RegistrationStore
+	subtreeStore     store.SubtreeStore
+	stumpStore       store.StumpStore
+	urlRegistry      store.CallbackURLRegistry
+	subtreeCounter   store.SubtreeCounterStore
 	dataHubClient    *datahub.Client
 }
 
@@ -38,11 +38,11 @@ func NewSubtreeWorkerService(
 	kafkaCfg config.KafkaConfig,
 	blockCfg config.BlockConfig,
 	datahubCfg config.DataHubConfig,
-	regStore *store.RegistrationStore,
-	subtreeStore *store.SubtreeStore,
-	stumpStore *store.StumpStore,
-	urlRegistry *store.CallbackURLRegistry,
-	subtreeCounter *store.SubtreeCounterStore,
+	regStore store.RegistrationStore,
+	subtreeStore store.SubtreeStore,
+	stumpStore store.StumpStore,
+	urlRegistry store.CallbackURLRegistry,
+	subtreeCounter store.SubtreeCounterStore,
 	logger *slog.Logger,
 ) *SubtreeWorkerService {
 	s := &SubtreeWorkerService{

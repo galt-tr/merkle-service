@@ -22,10 +22,10 @@ type Processor struct {
 	datahubCfg           config.DataHubConfig
 	consumer             *kafka.Consumer
 	subtreeWorkProducer  *kafka.Producer
-	regStore             *store.RegistrationStore
-	subtreeStore         *store.SubtreeStore
-	urlRegistry          *store.CallbackURLRegistry
-	subtreeCounter       *store.SubtreeCounterStore
+	regStore             store.RegistrationStore
+	subtreeStore         store.SubtreeStore
+	urlRegistry          store.CallbackURLRegistry
+	subtreeCounter       store.SubtreeCounterStore
 	dataHubClient        *datahub.Client
 	dedupCache           *cache.DedupCache
 }
@@ -34,10 +34,10 @@ func NewProcessor(
 	kafkaCfg config.KafkaConfig,
 	blockCfg config.BlockConfig,
 	datahubCfg config.DataHubConfig,
-	regStore *store.RegistrationStore,
-	subtreeStore *store.SubtreeStore,
-	urlRegistry *store.CallbackURLRegistry,
-	subtreeCounter *store.SubtreeCounterStore,
+	regStore store.RegistrationStore,
+	subtreeStore store.SubtreeStore,
+	urlRegistry store.CallbackURLRegistry,
+	subtreeCounter store.SubtreeCounterStore,
 	logger *slog.Logger,
 ) *Processor {
 	p := &Processor{

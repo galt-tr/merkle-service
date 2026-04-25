@@ -15,9 +15,8 @@ const (
 	dedupMarkerBin = "d"
 )
 
-// CallbackDedupStore tracks whether a specific txid/callbackURL/statusType
-// combination has been successfully delivered, preventing duplicate callbacks.
-type CallbackDedupStore struct {
+// aerospikeCallbackDedup is the Aerospike-backed CallbackDedupStore implementation.
+type aerospikeCallbackDedup struct {
 	client      *AerospikeClient
 	setName     string
 	logger      *slog.Logger
@@ -25,8 +24,10 @@ type CallbackDedupStore struct {
 	retryBaseMs int
 }
 
-func NewCallbackDedupStore(client *AerospikeClient, setName string, maxRetries int, retryBaseMs int, logger *slog.Logger) *CallbackDedupStore {
-	return &CallbackDedupStore{
+var _ CallbackDedupStore = (*aerospikeCallbackDedup)(nil)
+
+func NewCallbackDedupStore(client *AerospikeClient, setName string, maxRetries int, retryBaseMs int, logger *slog.Logger) CallbackDedupStore {
+	return &aerospikeCallbackDedup{
 		client:      client,
 		setName:     setName,
 		logger:      logger,
@@ -43,7 +44,7 @@ func dedupKey(txid, callbackURL, statusType string) string {
 }
 
 // Exists checks if a callback delivery has already been recorded.
-func (s *CallbackDedupStore) Exists(txid, callbackURL, statusType string) (bool, error) {
+func (s *aerospikeCallbackDedup) Exists(txid, callbackURL, statusType string) (bool, error) {
 	keyStr := dedupKey(txid, callbackURL, statusType)
 	key, err := as.NewKey(s.client.Namespace(), s.setName, keyStr)
 	if err != nil {
@@ -58,7 +59,7 @@ func (s *CallbackDedupStore) Exists(txid, callbackURL, statusType string) (bool,
 }
 
 // Record marks a callback delivery as completed with a TTL.
-func (s *CallbackDedupStore) Record(txid, callbackURL, statusType string, ttl time.Duration) error {
+func (s *aerospikeCallbackDedup) Record(txid, callbackURL, statusType string, ttl time.Duration) error {
 	keyStr := dedupKey(txid, callbackURL, statusType)
 	key, err := as.NewKey(s.client.Namespace(), s.setName, keyStr)
 	if err != nil {

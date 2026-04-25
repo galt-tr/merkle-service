@@ -11,25 +11,11 @@ import (
 
 const accumEntriesBin = "entries"
 
-// AccumulatedCallbackEntry holds data for one subtree's contribution to a callback URL.
-// All txids in the entry share the same STUMP data and subtree index.
-type AccumulatedCallbackEntry struct {
-	TxIDs        []string
-	SubtreeIndex int
-	StumpData    []byte
-}
-
-// AccumulatedCallback holds the aggregated callback entries for a
-// single callback URL across multiple subtrees within a block.
-type AccumulatedCallback struct {
-	Entries []AccumulatedCallbackEntry
-}
-
-// CallbackAccumulatorStore manages per-block callback accumulation in Aerospike.
-// Subtree workers append entries as they process subtrees. When all subtrees for
-// a block are done, the last worker reads and deletes the accumulated data, then
-// publishes individual CallbackTopicMessages.
-type CallbackAccumulatorStore struct {
+// aerospikeCallbackAccumulator is the Aerospike-backed CallbackAccumulatorStore
+// implementation. Subtree workers append entries as they process subtrees. When
+// all subtrees for a block are done, the last worker reads and deletes the
+// accumulated data, then publishes individual CallbackTopicMessages.
+type aerospikeCallbackAccumulator struct {
 	client      *AerospikeClient
 	setName     string
 	ttlSec      int
@@ -38,8 +24,10 @@ type CallbackAccumulatorStore struct {
 	logger      *slog.Logger
 }
 
-func NewCallbackAccumulatorStore(client *AerospikeClient, setName string, ttlSec int, maxRetries int, retryBaseMs int, logger *slog.Logger) *CallbackAccumulatorStore {
-	return &CallbackAccumulatorStore{
+var _ CallbackAccumulatorStore = (*aerospikeCallbackAccumulator)(nil)
+
+func NewCallbackAccumulatorStore(client *AerospikeClient, setName string, ttlSec int, maxRetries int, retryBaseMs int, logger *slog.Logger) CallbackAccumulatorStore {
+	return &aerospikeCallbackAccumulator{
 		client:      client,
 		setName:     setName,
 		ttlSec:      ttlSec,
@@ -52,7 +40,7 @@ func NewCallbackAccumulatorStore(client *AerospikeClient, setName string, ttlSec
 // Append atomically appends callback data for a set of txids from a single subtree
 // to the accumulation record for the given block. One entry per subtree per callback URL,
 // keeping STUMP data stored only once per subtree (not duplicated per txid).
-func (s *CallbackAccumulatorStore) Append(blockHash, callbackURL string, txids []string, subtreeIndex int, stumpData []byte) error {
+func (s *aerospikeCallbackAccumulator) Append(blockHash, callbackURL string, txids []string, subtreeIndex int, stumpData []byte) error {
 	key, err := as.NewKey(s.client.Namespace(), s.setName, blockHash)
 	if err != nil {
 		return fmt.Errorf("failed to create key: %w", err)
@@ -81,7 +69,7 @@ func (s *CallbackAccumulatorStore) Append(blockHash, callbackURL string, txids [
 
 // ReadAndDelete reads all accumulated callback data for the given block and
 // deletes the record atomically. Returns a map of callbackURL → AccumulatedCallback.
-func (s *CallbackAccumulatorStore) ReadAndDelete(blockHash string) (map[string]*AccumulatedCallback, error) {
+func (s *aerospikeCallbackAccumulator) ReadAndDelete(blockHash string) (map[string]*AccumulatedCallback, error) {
 	key, err := as.NewKey(s.client.Namespace(), s.setName, blockHash)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create key: %w", err)

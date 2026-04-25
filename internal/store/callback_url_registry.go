@@ -12,9 +12,9 @@ const (
 	callbackURLsBin        = "urls"
 )
 
-// CallbackURLRegistry tracks all unique callback URLs for broadcast operations.
-// Uses a single Aerospike record with a CDT list for efficient enumeration.
-type CallbackURLRegistry struct {
+// aerospikeCallbackURLRegistry is the Aerospike-backed CallbackURLRegistry
+// implementation. Uses a single record with a CDT list for efficient enumeration.
+type aerospikeCallbackURLRegistry struct {
 	client      *AerospikeClient
 	setName     string
 	logger      *slog.Logger
@@ -22,9 +22,11 @@ type CallbackURLRegistry struct {
 	retryBaseMs int
 }
 
-// NewCallbackURLRegistry creates a new callback URL registry.
-func NewCallbackURLRegistry(client *AerospikeClient, setName string, maxRetries int, retryBaseMs int, logger *slog.Logger) *CallbackURLRegistry {
-	return &CallbackURLRegistry{
+var _ CallbackURLRegistry = (*aerospikeCallbackURLRegistry)(nil)
+
+// NewCallbackURLRegistry creates a new Aerospike-backed callback URL registry.
+func NewCallbackURLRegistry(client *AerospikeClient, setName string, maxRetries int, retryBaseMs int, logger *slog.Logger) CallbackURLRegistry {
+	return &aerospikeCallbackURLRegistry{
 		client:      client,
 		setName:     setName,
 		logger:      logger,
@@ -34,7 +36,7 @@ func NewCallbackURLRegistry(client *AerospikeClient, setName string, maxRetries 
 }
 
 // Add registers a callback URL in the registry. Duplicates are silently ignored.
-func (r *CallbackURLRegistry) Add(callbackURL string) error {
+func (r *aerospikeCallbackURLRegistry) Add(callbackURL string) error {
 	key, err := as.NewKey(r.client.Namespace(), r.setName, callbackURLRegistryKey)
 	if err != nil {
 		return fmt.Errorf("failed to create key: %w", err)
@@ -57,7 +59,7 @@ func (r *CallbackURLRegistry) Add(callbackURL string) error {
 }
 
 // GetAll returns all registered callback URLs.
-func (r *CallbackURLRegistry) GetAll() ([]string, error) {
+func (r *aerospikeCallbackURLRegistry) GetAll() ([]string, error) {
 	key, err := as.NewKey(r.client.Namespace(), r.setName, callbackURLRegistryKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create key: %w", err)

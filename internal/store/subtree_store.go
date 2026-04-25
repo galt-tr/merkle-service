@@ -38,8 +38,8 @@ func WithDeleteAtHeight(height uint64) BlobOption {
 	}
 }
 
-// SubtreeStore manages subtree storage and retrieval via a BlobStore backend.
-type SubtreeStore struct {
+// blobSubtreeStore manages subtree storage and retrieval via a BlobStore backend.
+type blobSubtreeStore struct {
 	store         BlobStore
 	dahOffset     uint64
 	logger        *slog.Logger
@@ -47,8 +47,10 @@ type SubtreeStore struct {
 	currentHeight uint64
 }
 
-func NewSubtreeStore(store BlobStore, dahOffset uint64, logger *slog.Logger) *SubtreeStore {
-	return &SubtreeStore{
+var _ SubtreeStore = (*blobSubtreeStore)(nil)
+
+func NewSubtreeStore(store BlobStore, dahOffset uint64, logger *slog.Logger) SubtreeStore {
+	return &blobSubtreeStore{
 		store:     store,
 		dahOffset: dahOffset,
 		logger:    logger,
@@ -59,7 +61,7 @@ func NewSubtreeStore(store BlobStore, dahOffset uint64, logger *slog.Logger) *Su
 // If blockHeight is 0 (unknown, e.g. during realtime subtree processing),
 // the blob is stored without a DAH and won't be auto-pruned until
 // re-stored with a real block height during block processing.
-func (s *SubtreeStore) StoreSubtree(id string, data []byte, blockHeight uint64) error {
+func (s *blobSubtreeStore) StoreSubtree(id string, data []byte, blockHeight uint64) error {
 	var opts []BlobOption
 	if blockHeight > 0 {
 		dah := blockHeight + s.dahOffset
@@ -76,7 +78,7 @@ func (s *SubtreeStore) StoreSubtree(id string, data []byte, blockHeight uint64) 
 }
 
 // StoreSubtreeFromReader stores subtree data from a reader with delete-at-height.
-func (s *SubtreeStore) StoreSubtreeFromReader(id string, r io.Reader, size int64, blockHeight uint64) error {
+func (s *blobSubtreeStore) StoreSubtreeFromReader(id string, r io.Reader, size int64, blockHeight uint64) error {
 	dah := blockHeight + s.dahOffset
 	err := s.store.SetFromReader(id, r, size, WithDeleteAtHeight(dah))
 	if err != nil {
@@ -87,7 +89,7 @@ func (s *SubtreeStore) StoreSubtreeFromReader(id string, r io.Reader, size int64
 }
 
 // GetSubtree retrieves subtree data by ID.
-func (s *SubtreeStore) GetSubtree(id string) ([]byte, error) {
+func (s *blobSubtreeStore) GetSubtree(id string) ([]byte, error) {
 	data, err := s.store.Get(id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get subtree %s: %w", id, err)
@@ -96,7 +98,7 @@ func (s *SubtreeStore) GetSubtree(id string) ([]byte, error) {
 }
 
 // GetSubtreeReader retrieves a reader for subtree data by ID.
-func (s *SubtreeStore) GetSubtreeReader(id string) (io.ReadCloser, error) {
+func (s *blobSubtreeStore) GetSubtreeReader(id string) (io.ReadCloser, error) {
 	r, err := s.store.GetIoReader(id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get subtree reader %s: %w", id, err)
@@ -105,7 +107,7 @@ func (s *SubtreeStore) GetSubtreeReader(id string) (io.ReadCloser, error) {
 }
 
 // DeleteSubtree removes a subtree from the store.
-func (s *SubtreeStore) DeleteSubtree(id string) error {
+func (s *blobSubtreeStore) DeleteSubtree(id string) error {
 	err := s.store.Del(id)
 	if err != nil {
 		return fmt.Errorf("failed to delete subtree %s: %w", id, err)
@@ -114,7 +116,7 @@ func (s *SubtreeStore) DeleteSubtree(id string) error {
 }
 
 // SetCurrentBlockHeight updates the current block height for DAH pruning.
-func (s *SubtreeStore) SetCurrentBlockHeight(height uint64) {
+func (s *blobSubtreeStore) SetCurrentBlockHeight(height uint64) {
 	s.mu.Lock()
 	s.currentHeight = height
 	s.mu.Unlock()

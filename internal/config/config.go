@@ -14,6 +14,7 @@ type Config struct {
 	Mode      string          `yaml:"mode"      mapstructure:"mode"`
 	LogLevel  string          `yaml:"logLevel"  mapstructure:"loglevel"`
 	API       APIConfig       `yaml:"api"       mapstructure:"api"`
+	Store     StoreConfig     `yaml:"store"     mapstructure:"store"`
 	Aerospike AerospikeConfig `yaml:"aerospike" mapstructure:"aerospike"`
 	Kafka     KafkaConfig     `yaml:"kafka"     mapstructure:"kafka"`
 	P2P       P2PConfig       `yaml:"p2p"       mapstructure:"p2p"`
@@ -22,6 +23,30 @@ type Config struct {
 	Callback  CallbackConfig  `yaml:"callback"  mapstructure:"callback"`
 	BlobStore BlobStoreConfig `yaml:"blobStore" mapstructure:"blobstore"`
 	DataHub   DataHubConfig   `yaml:"datahub"   mapstructure:"datahub"`
+}
+
+// Backend names. Kept as package-level consts so callers don't stringly-type.
+const (
+	BackendAerospike = "aerospike"
+	BackendSQL       = "sql"
+)
+
+// StoreConfig selects the persistence backend and carries backend-specific
+// nested config blocks. When Backend == "aerospike" the top-level Aerospike
+// block is used; when Backend == "sql" the Store.SQL block is used.
+type StoreConfig struct {
+	Backend string          `yaml:"backend" mapstructure:"backend"`
+	SQL     StoreSQLConfig  `yaml:"sql"     mapstructure:"sql"`
+}
+
+// StoreSQLConfig configures the SQL backend.
+type StoreSQLConfig struct {
+	Driver          string `yaml:"driver"          mapstructure:"driver"`
+	DSN             string `yaml:"dsn"             mapstructure:"dsn"`
+	Schema          string `yaml:"schema"          mapstructure:"schema"`
+	SweeperInterval string `yaml:"sweeperInterval" mapstructure:"sweeperinterval"`
+	MaxOpenConns    int    `yaml:"maxOpenConns"    mapstructure:"maxopenconns"`
+	MaxIdleConns    int    `yaml:"maxIdleConns"    mapstructure:"maxidleconns"`
 }
 
 // APIConfig holds HTTP API configuration.
@@ -130,6 +155,14 @@ func registerDefaults(v *viper.Viper) {
 	// API
 	v.SetDefault("api.port", 8080)
 
+	// Store
+	v.SetDefault("store.backend", BackendAerospike)
+	v.SetDefault("store.sql.driver", "postgres")
+	v.SetDefault("store.sql.schema", "")
+	v.SetDefault("store.sql.sweeperinterval", "60s")
+	v.SetDefault("store.sql.maxopenconns", 25)
+	v.SetDefault("store.sql.maxidleconns", 5)
+
 	// Aerospike
 	v.SetDefault("aerospike.host", "localhost")
 	v.SetDefault("aerospike.port", 3000)
@@ -209,6 +242,15 @@ func bindEnvVars(v *viper.Viper) {
 
 		// API
 		"api.port": "API_PORT",
+
+		// Store
+		"store.backend":             "STORE_BACKEND",
+		"store.sql.driver":          "STORE_SQL_DRIVER",
+		"store.sql.dsn":             "STORE_SQL_DSN",
+		"store.sql.schema":          "STORE_SQL_SCHEMA",
+		"store.sql.sweeperinterval": "STORE_SQL_SWEEPER_INTERVAL",
+		"store.sql.maxopenconns":    "STORE_SQL_MAX_OPEN_CONNS",
+		"store.sql.maxidleconns":    "STORE_SQL_MAX_IDLE_CONNS",
 
 		// Aerospike
 		"aerospike.host":        "AEROSPIKE_HOST",
@@ -320,6 +362,16 @@ func Load() (*Config, error) {
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	// Normalize + validate store backend.
+	if cfg.Store.Backend == "" {
+		cfg.Store.Backend = BackendAerospike
+	}
+	switch cfg.Store.Backend {
+	case BackendAerospike, BackendSQL:
+	default:
+		return nil, fmt.Errorf("invalid store.backend %q: must be %q or %q", cfg.Store.Backend, BackendAerospike, BackendSQL)
 	}
 
 	return &cfg, nil

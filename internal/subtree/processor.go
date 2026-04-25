@@ -45,7 +45,7 @@ type Processor struct {
 	dlqProducer       *kafka.Producer // publishes to subtree-dlq when MaxAttempts is exceeded
 	registrationStore RegistrationGetter
 	seenCounterStore  SeenCounter
-	subtreeStore      *store.SubtreeStore
+	subtreeStore      store.SubtreeStore
 	regCache          RegCache
 	dedupCache        *cache.DedupCache
 	dataHubClient     *datahub.Client
@@ -60,7 +60,7 @@ func NewProcessor(
 	cfg *config.Config,
 	registrationStore RegistrationGetter,
 	seenCounterStore SeenCounter,
-	subtreeStore *store.SubtreeStore,
+	subtreeStore store.SubtreeStore,
 ) *Processor {
 	return &Processor{
 		cfg:               cfg,

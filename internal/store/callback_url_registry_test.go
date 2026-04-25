@@ -16,7 +16,7 @@ func TestCallbackURLRegistryKey(t *testing.T) {
 
 // TestNewCallbackURLRegistry verifies constructor sets fields.
 func TestNewCallbackURLRegistry(t *testing.T) {
-	r := NewCallbackURLRegistry(nil, "test-set", 3, 100, nil)
+	r := NewCallbackURLRegistry(nil, "test-set", 3, 100, nil).(*aerospikeCallbackURLRegistry)
 	if r.setName != "test-set" {
 		t.Errorf("expected set name test-set, got %s", r.setName)
 	}

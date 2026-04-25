@@ -12,8 +12,8 @@ const (
 	seenThresholdFired = "tfired"
 )
 
-// SeenCounterStore manages atomic seen-count tracking per txid in Aerospike.
-type SeenCounterStore struct {
+// aerospikeSeenCounter is the Aerospike-backed SeenCounterStore implementation.
+type aerospikeSeenCounter struct {
 	client      *AerospikeClient
 	setName     string
 	threshold   int
@@ -22,8 +22,10 @@ type SeenCounterStore struct {
 	retryBaseMs int
 }
 
-func NewSeenCounterStore(client *AerospikeClient, setName string, threshold int, maxRetries int, retryBaseMs int, logger *slog.Logger) *SeenCounterStore {
-	return &SeenCounterStore{
+var _ SeenCounterStore = (*aerospikeSeenCounter)(nil)
+
+func NewSeenCounterStore(client *AerospikeClient, setName string, threshold int, maxRetries int, retryBaseMs int, logger *slog.Logger) SeenCounterStore {
+	return &aerospikeSeenCounter{
 		client:      client,
 		setName:     setName,
 		threshold:   threshold,
@@ -33,16 +35,10 @@ func NewSeenCounterStore(client *AerospikeClient, setName string, threshold int,
 	}
 }
 
-// IncrementResult holds the result of an increment operation.
-type IncrementResult struct {
-	NewCount         int
-	ThresholdReached bool // true only when count equals threshold (not above)
-}
-
 // Increment idempotently records that a txid was seen in a specific subtree.
 // Uses Aerospike CDT list with AddUnique to ensure each subtreeID is counted only once.
 // ThresholdReached is true only once: when the unique count first reaches the threshold.
-func (s *SeenCounterStore) Increment(txid string, subtreeID string) (*IncrementResult, error) {
+func (s *aerospikeSeenCounter) Increment(txid string, subtreeID string) (*IncrementResult, error) {
 	key, err := as.NewKey(s.client.Namespace(), s.setName, txid)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create key: %w", err)
@@ -107,6 +103,6 @@ func (s *SeenCounterStore) Increment(txid string, subtreeID string) (*IncrementR
 }
 
 // Threshold returns the configured threshold.
-func (s *SeenCounterStore) Threshold() int {
+func (s *aerospikeSeenCounter) Threshold() int {
 	return s.threshold
 }

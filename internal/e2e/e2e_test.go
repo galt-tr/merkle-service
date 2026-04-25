@@ -168,7 +168,7 @@ func newCallbackProducer(t *testing.T, topic string) *kafka.Producer {
 // consumes from the given callback topic and delivers to callback URLs. The
 // returned StumpStore is backed by an in-memory blob store — tests that send
 // STUMP messages must Put the bytes here and reference them by StumpRef.
-func startDeliveryService(t *testing.T, callbackTopic string) (*callback.DeliveryService, *store.StumpStore) {
+func startDeliveryService(t *testing.T, callbackTopic string) (*callback.DeliveryService, store.StumpStore) {
 	t.Helper()
 	cfg := &config.Config{
 		Kafka: config.KafkaConfig{
@@ -452,7 +452,7 @@ func TestSeenMultipleNodes(t *testing.T) {
 	//    multiple times and track when threshold is reached.
 	var thresholdReached bool
 	for i := 0; i < threshold+1; i++ {
-		result, err := seenStore.Increment(txid)
+		result, err := seenStore.Increment(txid, fmt.Sprintf("subtree-%d", i))
 		if err != nil {
 			t.Fatalf("failed to increment seen counter (iteration %d): %v", i, err)
 		}
@@ -502,7 +502,7 @@ func TestSeenMultipleNodes(t *testing.T) {
 	}
 
 	// 7. Verify that incrementing beyond threshold does NOT set ThresholdReached again.
-	result, err := seenStore.Increment(txid)
+	result, err := seenStore.Increment(txid, "subtree-extra")
 	if err != nil {
 		t.Fatalf("failed to increment seen counter past threshold: %v", err)
 	}

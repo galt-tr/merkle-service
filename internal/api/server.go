@@ -21,20 +21,20 @@ var dashboardHTML []byte
 // Server implements the API server service.
 type Server struct {
 	service.BaseService
-	cfg        config.APIConfig
-	httpServer *http.Server
-	router     chi.Router
-	regStore        *store.RegistrationStore
-	urlRegistry     *store.CallbackURLRegistry
-	asClient        *store.AerospikeClient
+	cfg         config.APIConfig
+	httpServer  *http.Server
+	router      chi.Router
+	regStore    store.RegistrationStore
+	urlRegistry store.CallbackURLRegistry
+	health      store.BackendHealth
 }
 
-func NewServer(cfg config.APIConfig, regStore *store.RegistrationStore, urlRegistry *store.CallbackURLRegistry, asClient *store.AerospikeClient, logger *slog.Logger) *Server {
+func NewServer(cfg config.APIConfig, regStore store.RegistrationStore, urlRegistry store.CallbackURLRegistry, health store.BackendHealth, logger *slog.Logger) *Server {
 	s := &Server{
 		cfg:         cfg,
 		regStore:    regStore,
 		urlRegistry: urlRegistry,
-		asClient:    asClient,
+		health:      health,
 	}
 	s.InitBase("api-server")
 	if logger != nil {
@@ -99,11 +99,11 @@ func (s *Server) Health() service.HealthStatus {
 	status := "healthy"
 	details := map[string]string{}
 
-	if s.asClient != nil && !s.asClient.Healthy() {
+	if s.health != nil && !s.health.Healthy() {
 		status = "unhealthy"
-		details["aerospike"] = "disconnected"
+		details["backend"] = "disconnected"
 	} else {
-		details["aerospike"] = "connected"
+		details["backend"] = "connected"
 	}
 
 	return service.HealthStatus{

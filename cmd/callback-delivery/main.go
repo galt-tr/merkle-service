@@ -8,10 +8,10 @@ import (
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/service"
 	"github.com/bsv-blockchain/merkle-service/internal/store"
+	_ "github.com/bsv-blockchain/merkle-service/internal/store/sql" // register SQL backend
 )
 
 func main() {
-	// Load configuration.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal("failed to load config: ", err)
@@ -19,54 +19,23 @@ func main() {
 
 	logger := service.NewLogger(config.ParseLogLevel(cfg.LogLevel))
 
-	// Create Aerospike client for callback dedup.
-	asClient, err := store.NewAerospikeClient(
-		cfg.Aerospike.Host,
-		cfg.Aerospike.Port,
-		cfg.Aerospike.Namespace,
-		cfg.Aerospike.MaxRetries,
-		cfg.Aerospike.RetryBaseMs,
-		logger,
-	)
+	ctx := context.Background()
+	registry, err := store.NewFromConfig(ctx, cfg, logger)
 	if err != nil {
-		log.Fatal("failed to create aerospike client: ", err)
+		log.Fatal("failed to build store registry: ", err)
 	}
-	defer asClient.Close()
+	defer registry.Close()
 
-	callbackDedupStore := store.NewCallbackDedupStore(
-		asClient,
-		cfg.Aerospike.CallbackDedupSet,
-		cfg.Aerospike.MaxRetries,
-		cfg.Aerospike.RetryBaseMs,
-		logger,
-	)
-
-	// Delivery must resolve StumpRefs via the shared blob store (claim-check);
-	// point cfg.BlobStore.URL at the same location the subtree worker writes to
-	// (file path for all-in-one, s3:// / gs:// in K8s).
-	blobStore, err := store.NewBlobStoreFromURL(cfg.BlobStore.URL)
-	if err != nil {
-		log.Fatal("failed to create blob store: ", err)
-	}
-	stumpStore := store.NewStumpStore(
-		blobStore,
-		uint64(cfg.Subtree.StumpDAHOffset),
-		logger,
-	)
-
-	// Create, init, and start the callback delivery service.
-	deliverySvc := callback.NewDeliveryService(cfg, callbackDedupStore, stumpStore)
+	deliverySvc := callback.NewDeliveryService(cfg, registry.CallbackDedup, registry.Stump)
 
 	if err := deliverySvc.Init(nil); err != nil {
 		log.Fatal("failed to init callback delivery service: ", err)
 	}
 
-	ctx := context.Background()
 	if err := deliverySvc.Start(ctx); err != nil {
 		log.Fatal("failed to start callback delivery service: ", err)
 	}
 
-	// Wait for shutdown signal.
 	var base service.BaseService
 	base.InitBase("callback-delivery")
 	base.WaitForShutdown(ctx)

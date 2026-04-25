@@ -130,7 +130,7 @@ type DeliveryService struct {
 	dlqProducer *kafka.Producer
 	httpClient  *http.Client
 	dedupStore  CallbackDeduper
-	stumpStore  *store.StumpStore
+	stumpStore  store.StumpStore
 	stumpGate   *stumpGate
 
 	// Worker pool for concurrent delivery.
@@ -153,7 +153,7 @@ type DeliveryService struct {
 // NewDeliveryService creates a new callback DeliveryService. stumpStore is
 // required whenever STUMP-type messages are delivered — it is the claim-check
 // store holding the STUMP bytes referenced by CallbackTopicMessage.StumpRef.
-func NewDeliveryService(cfg *config.Config, dedupStore CallbackDeduper, stumpStore *store.StumpStore) *DeliveryService {
+func NewDeliveryService(cfg *config.Config, dedupStore CallbackDeduper, stumpStore store.StumpStore) *DeliveryService {
 	return &DeliveryService{
 		cfg:        cfg,
 		dedupStore: dedupStore,

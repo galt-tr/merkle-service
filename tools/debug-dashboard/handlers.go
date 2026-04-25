@@ -20,7 +20,7 @@ var txidRegex = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
 type Handlers struct {
 	callbackStore *CallbackStore
 	txidTracker   *TxidTracker
-	regStore      *store.RegistrationStore
+	regStore      store.RegistrationStore
 	templates     map[string]*template.Template
 	merkleAPIURL  string
 	callbackURL   string

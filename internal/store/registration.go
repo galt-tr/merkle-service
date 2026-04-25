@@ -12,8 +12,8 @@ const (
 	callbacksBin = "callbacks"
 )
 
-// RegistrationStore manages txid -> callback URL registrations in Aerospike.
-type RegistrationStore struct {
+// aerospikeRegistration is the Aerospike-backed RegistrationStore implementation.
+type aerospikeRegistration struct {
 	client      *AerospikeClient
 	setName     string
 	logger      *slog.Logger
@@ -21,8 +21,12 @@ type RegistrationStore struct {
 	retryBaseMs int
 }
 
-func NewRegistrationStore(client *AerospikeClient, setName string, maxRetries int, retryBaseMs int, logger *slog.Logger) *RegistrationStore {
-	return &RegistrationStore{
+// Compile-time check: aerospikeRegistration satisfies RegistrationStore.
+var _ RegistrationStore = (*aerospikeRegistration)(nil)
+
+// NewRegistrationStore constructs an Aerospike-backed RegistrationStore.
+func NewRegistrationStore(client *AerospikeClient, setName string, maxRetries int, retryBaseMs int, logger *slog.Logger) RegistrationStore {
+	return &aerospikeRegistration{
 		client:      client,
 		setName:     setName,
 		logger:      logger,
@@ -32,7 +36,7 @@ func NewRegistrationStore(client *AerospikeClient, setName string, maxRetries in
 }
 
 // Add registers a callback URL for a txid using CDT list operations with UNIQUE flag to ensure set semantics.
-func (s *RegistrationStore) Add(txid string, callbackURL string) error {
+func (s *aerospikeRegistration) Add(txid string, callbackURL string) error {
 	key, err := as.NewKey(s.client.Namespace(), s.setName, txid)
 	if err != nil {
 		return fmt.Errorf("failed to create key: %w", err)
@@ -57,7 +61,7 @@ func (s *RegistrationStore) Add(txid string, callbackURL string) error {
 }
 
 // Get returns all callback URLs registered for a txid.
-func (s *RegistrationStore) Get(txid string) ([]string, error) {
+func (s *aerospikeRegistration) Get(txid string) ([]string, error) {
 	key, err := as.NewKey(s.client.Namespace(), s.setName, txid)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create key: %w", err)
@@ -91,7 +95,7 @@ func (s *RegistrationStore) Get(txid string) ([]string, error) {
 }
 
 // BatchGet returns callback URLs for multiple txids in a single batch call.
-func (s *RegistrationStore) BatchGet(txids []string) (map[string][]string, error) {
+func (s *aerospikeRegistration) BatchGet(txids []string) (map[string][]string, error) {
 	if len(txids) == 0 {
 		return make(map[string][]string), nil
 	}
@@ -139,7 +143,7 @@ func (s *RegistrationStore) BatchGet(txids []string) (map[string][]string, error
 }
 
 // UpdateTTL updates the TTL of a registration record.
-func (s *RegistrationStore) UpdateTTL(txid string, ttl time.Duration) error {
+func (s *aerospikeRegistration) UpdateTTL(txid string, ttl time.Duration) error {
 	key, err := as.NewKey(s.client.Namespace(), s.setName, txid)
 	if err != nil {
 		return fmt.Errorf("failed to create key: %w", err)
@@ -160,7 +164,7 @@ func (s *RegistrationStore) UpdateTTL(txid string, ttl time.Duration) error {
 }
 
 // BatchUpdateTTL updates TTL for multiple txids in batch.
-func (s *RegistrationStore) BatchUpdateTTL(txids []string, ttl time.Duration) error {
+func (s *aerospikeRegistration) BatchUpdateTTL(txids []string, ttl time.Duration) error {
 	if len(txids) == 0 {
 		return nil
 	}

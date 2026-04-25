@@ -1,0 +1,45 @@
+name: Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: Unit tests + vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -short
+        run: go test -short -count=1 ./...
+
+      - name: lint-store-imports
+        run: make lint-store-imports
+
+  e2e-postgres:
+    name: PostgreSQL e2e (SQL backend)
+    runs-on: ubuntu-latest
+    # Keep isolated so infra flakiness here doesn't block other CI.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Run SQL-backed e2e suite
+        run: go test -tags=e2e_postgres -count=1 -timeout=15m ./internal/e2e/...
