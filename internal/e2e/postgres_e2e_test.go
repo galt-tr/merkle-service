@@ -75,7 +75,9 @@ func newSQLConfig(t *testing.T, dsn string) *config.Config {
 			StumpDAHOffset: 6,
 		},
 		Callback: config.CallbackConfig{
-			SeenThreshold: 3,
+			SeenThreshold:      3,
+			SeenWindowBlocks:   100,
+			SeenScoreThreshold: 51,
 			DedupTTLSec:   3600,
 		},
 		Aerospike: config.AerospikeConfig{
@@ -185,11 +187,20 @@ func TestPostgres_SeenCounterThreshold(t *testing.T) {
 
 	txid := "tx" + fmt.Sprintf("%064d", 1)
 
+	// Weighted peers: 40+20 crosses default score threshold of 51.
+	peers := []struct {
+		id string
+		w  int
+	}{
+		{"peer-A", 40},
+		{"peer-B", 20},
+		{"peer-C", 10},
+	}
 	firedCount := 0
-	for i := 0; i < 6; i++ {
-		res, err := registry.SeenCounter.Increment(txid, fmt.Sprintf("st-%d", i))
+	for _, p := range peers {
+		res, err := registry.SeenCounter.AddPeer(txid, p.id, p.w)
 		if err != nil {
-			t.Fatalf("Increment: %v", err)
+			t.Fatalf("AddPeer: %v", err)
 		}
 		if res.ThresholdReached {
 			firedCount++

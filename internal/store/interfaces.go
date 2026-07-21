@@ -53,12 +53,47 @@ type CallbackAccumulatorStore interface {
 	ReadAndDelete(blockHash string) (map[string]*AccumulatedCallback, error)
 }
 
-// SeenCounterStore tracks how many distinct subtrees have reported a txid.
-// Increment fires ThresholdReached exactly once — when the unique count first
-// reaches the configured threshold.
+// SeenCounterStore tracks weighted confidence that multiple mining nodes have
+// seen a txid. AddPeer records each peerID at most once per txid, adding the
+// peer's current node weight to the score. ThresholdReached fires exactly once
+// when the score first reaches the configured threshold.
+//
+// BatchAddPeer is the hot-path API: one subtree may contain tens or hundreds of
+// thousands of registered txids. Implementations MUST batch store I/O (Aerospike
+// BatchOperate / multi-row SQL) rather than one RTT per txid.
+//
+// The former Increment(txid, subtreeID) unique-subtree counter is deprecated
+// in favour of peer-weighted scoring against the node registry window.
 type SeenCounterStore interface {
-	Increment(txid string, subtreeID string) (*IncrementResult, error)
+	AddPeer(txid, peerID string, weight int) (*IncrementResult, error)
+	// BatchAddPeer applies peerID/weight to each txid once. Returns the subset
+	// of txids for which ThresholdReached became true on this call (fire-once).
+	BatchAddPeer(txids []string, peerID string, weight int) (thresholdReached []string, err error)
 	Threshold() int
+}
+
+// SubtreeAttributionStore records the first peer to announce each subtree hash.
+// Later announcements of the same hash are discarded for scoring and processing.
+type SubtreeAttributionStore interface {
+	// TryAttribute returns the stored peer for subtreeHash. first is true only
+	// when this call won the first-seen race and inserted peerID.
+	TryAttribute(subtreeHash, peerID string) (attributedPeer string, first bool, err error)
+}
+
+// BlockAttributionStore persists first-seen block→peer attributions for the
+// node registry (shared across k8s replicas).
+type BlockAttributionStore interface {
+	TryAttribute(hash, prevHash, peerID string, height uint32) (attributedPeer string, first bool, err error)
+	ListAll() ([]BlockAttribution, error)
+	DeleteHashes(hashes []string) error
+}
+
+// BlockAttribution is a persisted first-seen block announcement.
+type BlockAttribution struct {
+	Hash     string
+	PrevHash string
+	Height   uint32
+	PeerID   string
 }
 
 // SubtreeCounterStore coordinates BLOCK_PROCESSED emission: Init sets the

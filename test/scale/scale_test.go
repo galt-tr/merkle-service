@@ -242,7 +242,7 @@ func runScaleTest(t *testing.T, fixtureDir string, instanceCount int, timeout ti
 		MaxRetries: 2,
 	}
 
-	processor := block.NewProcessor(kafkaCfg, blockCfg, datahubCfg, regStore, subtreeStore, urlRegistry, subtreeCounter, logger)
+	processor := block.NewProcessor(kafkaCfg, blockCfg, datahubCfg, regStore, subtreeStore, urlRegistry, subtreeCounter, nil, logger)
 	if err := processor.Init(nil); err != nil {
 		t.Fatalf("failed to init block processor: %v", err)
 	}

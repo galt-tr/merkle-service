@@ -75,8 +75,10 @@ func New(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*storepk
 		CallbackDedup:       newCallbackDedup(db, d),
 		CallbackURLRegistry: newCallbackURLRegistry(db, d),
 		CallbackAccumulator: newCallbackAccumulator(db, d, cfg.Aerospike.CallbackAccumulatorTTLSec),
-		SeenCounter:         newSeenCounter(db, d, cfg.Callback.SeenThreshold),
+		SeenCounter:         newSeenCounter(db, d, cfg.Callback.SeenScoreThreshold),
 		SubtreeCounter:      newSubtreeCounter(db, d, cfg.Aerospike.SubtreeCounterTTLSec),
+		BlockAttribution:    newBlockAttributionStore(db, d),
+		SubtreeAttribution:  newSubtreeAttributionStore(db, d, cfg.Callback.DedupTTLSec),
 		Health:              &pingHealth{db: db},
 	}
 	r.AddCloser(func() error {

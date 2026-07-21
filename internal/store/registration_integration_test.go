@@ -209,20 +209,21 @@ func TestRegistrationStore_GetNonExistent(t *testing.T) {
 
 // --- SeenCounterStore tests ---
 
-func TestSeenCounter_IncrementReturnsCorrectCount(t *testing.T) {
+func TestSeenCounter_AddPeerReturnsCorrectScore(t *testing.T) {
 	client := newAerospikeClient(t)
 	setName := uniqueSet(t, "seen_inc")
-	counter := store.NewSeenCounterStore(client, setName, 3, 3, 100, slog.Default())
+	counter := store.NewSeenCounterStore(client, setName, 100, 3, 100, slog.Default())
 
 	txid := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
+	// Each peer adds weight 1 → score equals unique peer count.
 	for i := 1; i <= 5; i++ {
-		result, err := counter.Increment(txid)
+		result, err := counter.AddPeer(txid, fmt.Sprintf("peer-%d", i), 1)
 		if err != nil {
-			t.Fatalf("Increment #%d failed: %v", i, err)
+			t.Fatalf("AddPeer #%d failed: %v", i, err)
 		}
 		if result.NewCount != i {
-			t.Errorf("Increment #%d: expected count=%d, got %d", i, i, result.NewCount)
+			t.Errorf("AddPeer #%d: expected score=%d, got %d", i, i, result.NewCount)
 		}
 	}
 }
@@ -236,18 +237,18 @@ func TestSeenCounter_ThresholdReachedFiresAtThreshold(t *testing.T) {
 	txid := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 	for i := 1; i <= 5; i++ {
-		result, err := counter.Increment(txid)
+		result, err := counter.AddPeer(txid, fmt.Sprintf("peer-%d", i), 1)
 		if err != nil {
-			t.Fatalf("Increment #%d failed: %v", i, err)
+			t.Fatalf("AddPeer #%d failed: %v", i, err)
 		}
 
 		if i == threshold {
 			if !result.ThresholdReached {
-				t.Errorf("Increment #%d: expected ThresholdReached=true at threshold=%d", i, threshold)
+				t.Errorf("AddPeer #%d: expected ThresholdReached=true at threshold=%d", i, threshold)
 			}
 		} else {
 			if result.ThresholdReached {
-				t.Errorf("Increment #%d: ThresholdReached should be false (threshold=%d)", i, threshold)
+				t.Errorf("AddPeer #%d: ThresholdReached should be false (threshold=%d)", i, threshold)
 			}
 		}
 	}
@@ -263,9 +264,9 @@ func TestSeenCounter_AboveThresholdDoesNotReFire(t *testing.T) {
 
 	thresholdFiredCount := 0
 	for i := 1; i <= 10; i++ {
-		result, err := counter.Increment(txid)
+		result, err := counter.AddPeer(txid, fmt.Sprintf("peer-%d", i), 1)
 		if err != nil {
-			t.Fatalf("Increment #%d failed: %v", i, err)
+			t.Fatalf("AddPeer #%d failed: %v", i, err)
 		}
 		if result.ThresholdReached {
 			thresholdFiredCount++

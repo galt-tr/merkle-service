@@ -3,7 +3,6 @@ package sql
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -159,14 +158,22 @@ func TestCallbackURLRegistry_AddGetAll(t *testing.T) {
 
 func TestSeenCounter_ThresholdFiresOnce(t *testing.T) {
 	db, d := newTestDB(t)
-	s := newSeenCounter(db, d, 3)
+	s := newSeenCounter(db, d, 51)
 
 	var firedCount int
-	// Increment with 5 distinct subtreeIDs.
-	for i := 0; i < 5; i++ {
-		res, err := s.Increment("tx", fmt.Sprintf("st%d", i))
+	// peer-A=40 then peer-B=20 → score 60 fires once.
+	peers := []struct {
+		id string
+		w  int
+	}{
+		{"peer-A", 40},
+		{"peer-B", 20},
+		{"peer-C", 10},
+	}
+	for i, p := range peers {
+		res, err := s.AddPeer("tx", p.id, p.w)
 		if err != nil {
-			t.Fatalf("Increment %d: %v", i, err)
+			t.Fatalf("AddPeer %d: %v", i, err)
 		}
 		if res.ThresholdReached {
 			firedCount++
@@ -176,13 +183,13 @@ func TestSeenCounter_ThresholdFiresOnce(t *testing.T) {
 		t.Fatalf("threshold fired %d times, want exactly 1", firedCount)
 	}
 
-	// Duplicate subtreeID shouldn't bump count further.
-	res, err := s.Increment("tx", "st0")
+	// Duplicate peer shouldn't refire.
+	res, err := s.AddPeer("tx", "peer-A", 40)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.ThresholdReached {
-		t.Fatal("duplicate subtreeID should not refire threshold")
+		t.Fatal("duplicate peer should not refire threshold")
 	}
 }
 

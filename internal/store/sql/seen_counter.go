@@ -23,12 +23,27 @@ func newSeenCounter(db *sql.DB, d *dialect, threshold int) *seenCounter {
 
 func (s *seenCounter) Threshold() int { return s.threshold }
 
-// Increment inserts (txid, subtreeID) into seen_counter_subtrees (idempotent
-// via the compound PK), counts distinct subtrees for the txid, and flips the
-// threshold_fired flag atomically on the first call that reaches the threshold.
-// The caller observes ThresholdReached=true on exactly one call.
-func (s *seenCounter) Increment(txid, subtreeID string) (*storepkg.IncrementResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// AddPeer records peerID as a unique observer of txid.
+// Incremental score update (no SUM over peers) — one short transaction.
+func (s *seenCounter) AddPeer(txid, peerID string, weight int) (*storepkg.IncrementResult, error) {
+	fired, err := s.BatchAddPeer([]string{txid}, peerID, weight)
+	if err != nil {
+		return nil, err
+	}
+	if len(fired) == 1 {
+		return &storepkg.IncrementResult{NewCount: s.threshold, ThresholdReached: true}, nil
+	}
+	return &storepkg.IncrementResult{NewCount: 0, ThresholdReached: false}, nil
+}
+
+// BatchAddPeer applies the same peer/weight to many txids in one transaction.
+// Hot path: tens–hundreds of thousands of registered txids per subtree.
+func (s *seenCounter) BatchAddPeer(txids []string, peerID string, weight int) ([]string, error) {
+	if weight <= 0 || len(txids) == 0 || peerID == "" {
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -37,50 +52,67 @@ func (s *seenCounter) Increment(txid, subtreeID string) (*storepkg.IncrementResu
 	}
 	defer tx.Rollback()
 
-	// Ensure the parent counter row exists (no-op if already there).
-	qIns := fmt.Sprintf("INSERT INTO seen_counters (txid) VALUES (%s)%s",
+	qParent := fmt.Sprintf("INSERT INTO seen_counters (txid) VALUES (%s)%s",
 		s.d.placeholder(1), s.d.onConflictDoNothing)
-	if _, err := tx.ExecContext(ctx, qIns, txid); err != nil {
-		return nil, fmt.Errorf("insert seen_counters: %w", err)
-	}
-
-	// Idempotent append of subtreeID.
-	qSub := fmt.Sprintf("INSERT INTO seen_counter_subtrees (txid, subtree_id) VALUES (%s, %s)%s",
-		s.d.placeholder(1), s.d.placeholder(2), s.d.onConflictDoNothing)
-	if _, err := tx.ExecContext(ctx, qSub, txid, subtreeID); err != nil {
-		return nil, fmt.Errorf("insert seen_counter_subtrees: %w", err)
-	}
-
-	// Count distinct subtrees for this txid.
-	qCount := fmt.Sprintf("SELECT COUNT(*) FROM seen_counter_subtrees WHERE txid = %s", s.d.placeholder(1))
-	var count int
-	if err := tx.QueryRowContext(ctx, qCount, txid).Scan(&count); err != nil {
-		return nil, fmt.Errorf("count subtrees: %w", err)
-	}
-
-	// Lock the counter row and check/flip the fired flag atomically.
-	var lockQuery string
+	qPeer := fmt.Sprintf(
+		"INSERT INTO seen_counter_peers (txid, peer_id, weight) VALUES (%s, %s, %s)%s",
+		s.d.placeholder(1), s.d.placeholder(2), s.d.placeholder(3), s.d.onConflictDoNothing,
+	)
+	qBump := fmt.Sprintf(
+		"UPDATE seen_counters SET score = score + %s WHERE txid = %s",
+		s.d.placeholder(1), s.d.placeholder(2),
+	)
+	var qRead string
 	if isPostgres(s.d) {
-		lockQuery = fmt.Sprintf("SELECT threshold_fired FROM seen_counters WHERE txid = %s FOR UPDATE", s.d.placeholder(1))
+		qRead = fmt.Sprintf(
+			"SELECT score, threshold_fired FROM seen_counters WHERE txid = %s FOR UPDATE",
+			s.d.placeholder(1),
+		)
 	} else {
-		lockQuery = fmt.Sprintf("SELECT threshold_fired FROM seen_counters WHERE txid = %s", s.d.placeholder(1))
+		qRead = fmt.Sprintf(
+			"SELECT score, threshold_fired FROM seen_counters WHERE txid = %s",
+			s.d.placeholder(1),
+		)
 	}
-	var fired int
-	if err := tx.QueryRowContext(ctx, lockQuery, txid).Scan(&fired); err != nil {
-		return nil, fmt.Errorf("read fired flag: %w", err)
-	}
+	qFire := fmt.Sprintf(
+		"UPDATE seen_counters SET threshold_fired = 1 WHERE txid = %s AND threshold_fired = 0 AND score >= %s",
+		s.d.placeholder(1), s.d.placeholder(2),
+	)
 
-	thresholdReached := false
-	if fired == 0 && count >= s.threshold {
-		qFire := fmt.Sprintf("UPDATE seen_counters SET threshold_fired = 1 WHERE txid = %s", s.d.placeholder(1))
-		if _, err := tx.ExecContext(ctx, qFire, txid); err != nil {
-			return nil, fmt.Errorf("set fired: %w", err)
+	var fired []string
+	for _, txid := range txids {
+		if _, err := tx.ExecContext(ctx, qParent, txid); err != nil {
+			return nil, fmt.Errorf("insert seen_counters: %w", err)
 		}
-		thresholdReached = true
+		res, err := tx.ExecContext(ctx, qPeer, txid, peerID, weight)
+		if err != nil {
+			return nil, fmt.Errorf("insert seen_counter_peers: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n > 0 {
+			// New peer for this txid — bump score by weight observed now.
+			if _, err := tx.ExecContext(ctx, qBump, weight, txid); err != nil {
+				return nil, fmt.Errorf("bump score: %w", err)
+			}
+		}
+
+		var score, alreadyFired int
+		if err := tx.QueryRowContext(ctx, qRead, txid).Scan(&score, &alreadyFired); err != nil {
+			return nil, fmt.Errorf("read score: %w", err)
+		}
+		if alreadyFired == 0 && score >= s.threshold {
+			fr, err := tx.ExecContext(ctx, qFire, txid, s.threshold)
+			if err != nil {
+				return nil, fmt.Errorf("set fired: %w", err)
+			}
+			if fn, _ := fr.RowsAffected(); fn > 0 {
+				fired = append(fired, txid)
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &storepkg.IncrementResult{NewCount: count, ThresholdReached: thresholdReached}, nil
+	return fired, nil
 }

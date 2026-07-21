@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/merkle-service/internal/block"
 	"github.com/bsv-blockchain/merkle-service/internal/config"
+	"github.com/bsv-blockchain/merkle-service/internal/nodes"
 	"github.com/bsv-blockchain/merkle-service/internal/service"
 	"github.com/bsv-blockchain/merkle-service/internal/store"
 	_ "github.com/bsv-blockchain/merkle-service/internal/store/sql" // register SQL backend
@@ -26,9 +27,15 @@ func main() {
 	}
 	defer registry.Close()
 
+	nodeRegistry, err := nodes.NewRegistry(registry.BlockAttribution, cfg.Callback.SeenWindowBlocks, logger)
+	if err != nil {
+		log.Fatal("failed to create node registry: ", err)
+	}
+
 	processor := block.NewProcessor(
 		cfg.Kafka, cfg.Block, cfg.DataHub,
 		registry.Registration, registry.Subtree, registry.CallbackURLRegistry, registry.SubtreeCounter,
+		nodeRegistry,
 		logger,
 	)
 

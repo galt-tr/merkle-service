@@ -45,9 +45,35 @@ func (m *mockRegStore) Get(txid string) ([]string, error) {
 
 type mockSeenCounter struct{}
 
-func (m *mockSeenCounter) Increment(txid string, subtreeID string) (*store.IncrementResult, error) {
-	return &store.IncrementResult{NewCount: 1, ThresholdReached: false}, nil
+func (m *mockSeenCounter) AddPeer(txid, peerID string, weight int) (*store.IncrementResult, error) {
+	return &store.IncrementResult{NewCount: weight, ThresholdReached: false}, nil
 }
+
+func (m *mockSeenCounter) BatchAddPeer(txids []string, peerID string, weight int) ([]string, error) {
+	return nil, nil
+}
+
+// mockReadyNodes always reports ready with a fixed weight per peer.
+type mockReadyNodes struct {
+	weight int
+}
+
+func (m *mockReadyNodes) Ready() bool { return true }
+func (m *mockReadyNodes) Weight(peerID string) int {
+	if peerID == "" {
+		return 0
+	}
+	if m.weight > 0 {
+		return m.weight
+	}
+	return 1
+}
+
+// mockNotReadyNodes never scores.
+type mockNotReadyNodes struct{}
+
+func (m *mockNotReadyNodes) Ready() bool          { return false }
+func (m *mockNotReadyNodes) Weight(peerID string) int { return 0 }
 
 type mockRegCache struct {
 	cached map[string]bool // txid -> isRegistered
@@ -573,142 +599,127 @@ func TestFindRegisteredTxids_CacheUpdatedCorrectly(t *testing.T) {
 
 // --- Idempotent Seen Counter Tests ---
 
-// mockIdempotentSeenCounter simulates the idempotent seen counter behavior:
-// tracks which subtreeIDs have been counted per txid and fires threshold once.
+// mockIdempotentSeenCounter simulates peer-weighted scoring: each peerID
+// contributes once per txid with the given weight; threshold fires once.
 type mockIdempotentSeenCounter struct {
-	mu              sync.Mutex
-	subtreesByTxid  map[string]map[string]bool // txid -> set of subtreeIDs
-	thresholdFired  map[string]bool            // txid -> whether threshold already fired
-	threshold       int
+	mu             sync.Mutex
+	peersByTxid    map[string]map[string]int // txid -> peerID -> weight
+	thresholdFired map[string]bool
+	threshold      int
 }
 
 func newMockIdempotentSeenCounter(threshold int) *mockIdempotentSeenCounter {
 	return &mockIdempotentSeenCounter{
-		subtreesByTxid: make(map[string]map[string]bool),
+		peersByTxid:    make(map[string]map[string]int),
 		thresholdFired: make(map[string]bool),
 		threshold:      threshold,
 	}
 }
 
-func (m *mockIdempotentSeenCounter) Increment(txid string, subtreeID string) (*store.IncrementResult, error) {
+func (m *mockIdempotentSeenCounter) AddPeer(txid, peerID string, weight int) (*store.IncrementResult, error) {
+	fired, err := m.BatchAddPeer([]string{txid}, peerID, weight)
+	if err != nil {
+		return nil, err
+	}
+	if len(fired) == 1 {
+		return &store.IncrementResult{NewCount: m.threshold, ThresholdReached: true}, nil
+	}
+	// Compute score for assertions.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	score := 0
+	for _, w := range m.peersByTxid[txid] {
+		score += w
+	}
+	return &store.IncrementResult{NewCount: score, ThresholdReached: false}, nil
+}
+
+func (m *mockIdempotentSeenCounter) BatchAddPeer(txids []string, peerID string, weight int) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.subtreesByTxid[txid] == nil {
-		m.subtreesByTxid[txid] = make(map[string]bool)
+	var fired []string
+	for _, txid := range txids {
+		if m.peersByTxid[txid] == nil {
+			m.peersByTxid[txid] = make(map[string]int)
+		}
+		if _, ok := m.peersByTxid[txid][peerID]; !ok {
+			m.peersByTxid[txid][peerID] = weight
+		}
+		score := 0
+		for _, w := range m.peersByTxid[txid] {
+			score += w
+		}
+		if score >= m.threshold && !m.thresholdFired[txid] {
+			m.thresholdFired[txid] = true
+			fired = append(fired, txid)
+		}
 	}
-
-	// AddUnique semantics: only count if not already present.
-	m.subtreesByTxid[txid][subtreeID] = true
-	newCount := len(m.subtreesByTxid[txid])
-
-	thresholdReached := false
-	if newCount >= m.threshold && !m.thresholdFired[txid] {
-		thresholdReached = true
-		m.thresholdFired[txid] = true
-	}
-
-	return &store.IncrementResult{
-		NewCount:         newCount,
-		ThresholdReached: thresholdReached,
-	}, nil
+	return fired, nil
 }
 
-func TestIdempotentSeenCounter_FirstSubtreeIncrements(t *testing.T) {
-	sc := newMockIdempotentSeenCounter(3)
+func TestIdempotentSeenCounter_FirstPeerAddsWeight(t *testing.T) {
+	sc := newMockIdempotentSeenCounter(100)
 
-	result, err := sc.Increment("txid-1", "subtree-A")
+	result, err := sc.AddPeer("txid-1", "peer-A", 40)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.NewCount != 1 {
-		t.Errorf("expected count=1, got %d", result.NewCount)
+	if result.NewCount != 40 {
+		t.Errorf("expected score=40, got %d", result.NewCount)
 	}
 	if result.ThresholdReached {
-		t.Error("threshold should not be reached with 1 subtree")
+		t.Error("threshold should not fire at 40/100")
 	}
 }
 
-func TestIdempotentSeenCounter_DuplicateSubtreeDoesNotIncrement(t *testing.T) {
-	sc := newMockIdempotentSeenCounter(3)
-
-	// First call with subtree-A.
-	sc.Increment("txid-1", "subtree-A")
-
-	// Duplicate call with same subtree-A.
-	result, _ := sc.Increment("txid-1", "subtree-A")
-	if result.NewCount != 1 {
-		t.Errorf("expected count=1 after duplicate, got %d", result.NewCount)
-	}
-	if result.ThresholdReached {
-		t.Error("threshold should not fire on duplicate")
+func TestIdempotentSeenCounter_DuplicatePeerDoesNotAdd(t *testing.T) {
+	sc := newMockIdempotentSeenCounter(100)
+	sc.AddPeer("txid-1", "peer-A", 40)
+	result, _ := sc.AddPeer("txid-1", "peer-A", 40)
+	if result.NewCount != 40 {
+		t.Errorf("expected score=40 after duplicate, got %d", result.NewCount)
 	}
 }
 
 func TestIdempotentSeenCounter_ThresholdFiresOnce(t *testing.T) {
-	sc := newMockIdempotentSeenCounter(3)
+	sc := newMockIdempotentSeenCounter(51)
 
-	sc.Increment("txid-1", "subtree-A")
-	sc.Increment("txid-1", "subtree-B")
-
-	// Third unique subtree should trigger threshold.
-	result, _ := sc.Increment("txid-1", "subtree-C")
-	if result.NewCount != 3 {
-		t.Errorf("expected count=3, got %d", result.NewCount)
-	}
+	sc.AddPeer("txid-1", "peer-A", 40)
+	result, _ := sc.AddPeer("txid-1", "peer-B", 20)
 	if !result.ThresholdReached {
-		t.Error("threshold should fire when unique count reaches threshold")
+		t.Error("threshold should fire at 60 >= 51")
 	}
 
-	// Fourth unique subtree — threshold should NOT fire again.
-	result, _ = sc.Increment("txid-1", "subtree-D")
-	if result.NewCount != 4 {
-		t.Errorf("expected count=4, got %d", result.NewCount)
-	}
+	result, _ = sc.AddPeer("txid-1", "peer-C", 10)
 	if result.ThresholdReached {
-		t.Error("threshold should NOT fire again after already fired")
+		t.Error("threshold should NOT fire again")
 	}
 }
 
-func TestIdempotentSeenCounter_ThresholdDoesNotFireOnDuplicates(t *testing.T) {
-	sc := newMockIdempotentSeenCounter(2)
+func TestIdempotentSeenCounter_BatchAddPeer(t *testing.T) {
+	sc := newMockIdempotentSeenCounter(51)
+	// Pre-seed so second peer crosses threshold for both.
+	sc.AddPeer("tx1", "peer-A", 40)
+	sc.AddPeer("tx2", "peer-A", 40)
 
-	sc.Increment("txid-1", "subtree-A")
-
-	// Duplicate of subtree-A — count stays 1, no threshold.
-	result, _ := sc.Increment("txid-1", "subtree-A")
-	if result.NewCount != 1 {
-		t.Errorf("expected count=1, got %d", result.NewCount)
+	fired, err := sc.BatchAddPeer([]string{"tx1", "tx2", "tx3"}, "peer-B", 20)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if result.ThresholdReached {
-		t.Error("threshold should not fire on duplicate subtree")
-	}
-
-	// Now a truly new subtree triggers threshold.
-	result, _ = sc.Increment("txid-1", "subtree-B")
-	if result.NewCount != 2 {
-		t.Errorf("expected count=2, got %d", result.NewCount)
-	}
-	if !result.ThresholdReached {
-		t.Error("threshold should fire on second unique subtree")
-	}
-
-	// Re-send subtree-A — should NOT fire threshold.
-	result, _ = sc.Increment("txid-1", "subtree-A")
-	if result.ThresholdReached {
-		t.Error("threshold should not fire again on re-sent subtree")
+	if len(fired) != 2 {
+		t.Fatalf("expected 2 fired, got %v", fired)
 	}
 }
 
 func TestIdempotentSeenCounter_IndependentPerTxid(t *testing.T) {
-	sc := newMockIdempotentSeenCounter(2)
+	sc := newMockIdempotentSeenCounter(51)
 
-	sc.Increment("txid-1", "subtree-A")
-	sc.Increment("txid-2", "subtree-A")
+	sc.AddPeer("txid-1", "peer-A", 40)
+	sc.AddPeer("txid-2", "peer-A", 40)
 
-	// Same subtreeID for different txids should be independent.
-	result1, _ := sc.Increment("txid-1", "subtree-B")
-	result2, _ := sc.Increment("txid-2", "subtree-B")
+	result1, _ := sc.AddPeer("txid-1", "peer-B", 20)
+	result2, _ := sc.AddPeer("txid-2", "peer-B", 20)
 
 	if !result1.ThresholdReached {
 		t.Error("txid-1 threshold should fire")
@@ -771,38 +782,48 @@ func TestIntegration_DuplicateSubtreeOnlyProcessedOnce(t *testing.T) {
 	}
 }
 
-// TestIntegration_SeenCounterIdempotency simulates the full seen counter
-// flow: same subtreeID for same txid incremented multiple times, verifying
-// count stays correct and threshold fires exactly once.
+// TestIntegration_SeenCounterIdempotency simulates peer-weighted scoring:
+// unique peers add weight once; threshold fires exactly once.
 func TestIntegration_SeenCounterIdempotency(t *testing.T) {
-	sc := newMockIdempotentSeenCounter(3)
+	sc := newMockIdempotentSeenCounter(51)
 
-	// Simulate 3 different subtrees for the same txid.
-	subtrees := []string{"subtree-A", "subtree-B", "subtree-C"}
+	peers := []struct {
+		id     string
+		weight int
+	}{
+		{"peer-A", 40},
+		{"peer-B", 20},
+		{"peer-C", 10},
+	}
 	var thresholdCount int
+	var lastScore int
 
-	for _, st := range subtrees {
-		result, err := sc.Increment("txid-1", st)
+	for _, p := range peers {
+		result, err := sc.AddPeer("txid-1", p.id, p.weight)
 		if err != nil {
-			t.Fatalf("Increment error: %v", err)
+			t.Fatalf("AddPeer error: %v", err)
 		}
+		lastScore = result.NewCount
 		if result.ThresholdReached {
 			thresholdCount++
 		}
 	}
 
+	if lastScore != 70 {
+		t.Errorf("expected score=70, got %d", lastScore)
+	}
 	if thresholdCount != 1 {
 		t.Errorf("expected threshold to fire exactly once, fired %d times", thresholdCount)
 	}
 
-	// Now replay all subtrees (duplicates).
-	for _, st := range subtrees {
-		result, _ := sc.Increment("txid-1", st)
+	// Replay peers — score and fire status unchanged.
+	for _, p := range peers {
+		result, _ := sc.AddPeer("txid-1", p.id, p.weight)
 		if result.ThresholdReached {
-			t.Errorf("threshold should not fire on duplicate subtree %s", st)
+			t.Errorf("threshold should not fire on duplicate peer %s", p.id)
 		}
-		if result.NewCount != 3 {
-			t.Errorf("count should remain at 3 after duplicates, got %d", result.NewCount)
+		if result.NewCount != 70 {
+			t.Errorf("score should remain 70 after duplicates, got %d", result.NewCount)
 		}
 	}
 }
@@ -943,6 +964,7 @@ func newTestProcessor(t *testing.T, regStore RegistrationGetter, seenCounter See
 	p := &Processor{
 		registrationStore: regStore,
 		seenCounterStore:  seenCounter,
+		nodeRegistry:      &mockReadyNodes{weight: 51},
 		callbackProducer:  kafka.NewTestProducer(mockProducer, "callback-test", logger),
 	}
 	p.InitBase("subtree-test")
@@ -962,10 +984,10 @@ func TestBatchedSeenCallbacks_SingleCallbackURL(t *testing.T) {
 		"tx3": {"http://arcade.example.com/cb"},
 	}
 
-	p.emitBatchedSeenCallbacks(registered, "subtree-A")
+	p.emitBatchedSeenCallbacks(registered, "peer-A")
 
 	msgs := mockProd.getMessages()
-	// 1 SEEN_ON_NETWORK (no threshold reached → 0 SEEN_MULTIPLE_NODES)
+	// mockSeenCounter never fires threshold → 1 SEEN_ON_NETWORK only
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
@@ -1000,7 +1022,7 @@ func TestBatchedSeenCallbacks_MultipleCallbackURLs(t *testing.T) {
 		"tx3": {"http://url-A/cb"},
 	}
 
-	p.emitBatchedSeenCallbacks(registered, "subtree-A")
+	p.emitBatchedSeenCallbacks(registered, "peer-A")
 
 	msgs := mockProd.getMessages()
 	if len(msgs) != 2 {
@@ -1028,7 +1050,7 @@ func TestBatchedSeenCallbacks_NoRegistered(t *testing.T) {
 	regStore := &mockRegStore{registrations: map[string][]string{}}
 	p, mockProd := newTestProcessor(t, regStore, &mockSeenCounter{})
 
-	p.emitBatchedSeenCallbacks(map[string][]string{}, "subtree-A")
+	p.emitBatchedSeenCallbacks(map[string][]string{}, "peer-A")
 
 	if len(mockProd.getMessages()) != 0 {
 		t.Error("expected no messages for empty registered map")
@@ -1037,7 +1059,7 @@ func TestBatchedSeenCallbacks_NoRegistered(t *testing.T) {
 
 // TestBatchedSeenCallbacks_SeenMultipleNodesThreshold verifies batched SEEN_MULTIPLE_NODES.
 func TestBatchedSeenCallbacks_SeenMultipleNodesThreshold(t *testing.T) {
-	// Threshold=1 so every txid triggers SEEN_MULTIPLE_NODES.
+	// Threshold=1 so any peer weight fires SEEN_MULTIPLE_NODES.
 	sc := newMockIdempotentSeenCounter(1)
 	regStore := &mockRegStore{registrations: map[string][]string{}}
 	p, mockProd := newTestProcessor(t, regStore, sc)
@@ -1047,7 +1069,7 @@ func TestBatchedSeenCallbacks_SeenMultipleNodesThreshold(t *testing.T) {
 		"tx2": {"http://arcade/cb"},
 	}
 
-	p.emitBatchedSeenCallbacks(registered, "subtree-A")
+	p.emitBatchedSeenCallbacks(registered, "peer-A")
 
 	msgs := mockProd.getMessages()
 	// 1 SEEN_ON_NETWORK + 1 SEEN_MULTIPLE_NODES = 2 messages
@@ -1074,19 +1096,20 @@ func TestBatchedSeenCallbacks_SeenMultipleNodesThreshold(t *testing.T) {
 
 // TestBatchedSeenCallbacks_PartialThreshold verifies only threshold-reached txids in SEEN_MULTIPLE_NODES.
 func TestBatchedSeenCallbacks_PartialThreshold(t *testing.T) {
-	// Threshold=2: tx1 has already been seen once (will reach threshold), tx2 hasn't.
-	sc := newMockIdempotentSeenCounter(2)
-	sc.Increment("tx1", "subtree-PREV") // pre-seen once
+	// Threshold=100: pre-seed tx1 with weight 60 so a second peer at 51 fires only for tx1
+	// (score becomes 60+51=111). tx2 only gets 51 and stays below 100.
+	sc := newMockIdempotentSeenCounter(100)
+	sc.AddPeer("tx1", "peer-PREV", 60)
 
 	regStore := &mockRegStore{registrations: map[string][]string{}}
 	p, mockProd := newTestProcessor(t, regStore, sc)
-
+	// newTestProcessor uses weight=51 for the announcing peer.
 	registered := map[string][]string{
 		"tx1": {"http://arcade/cb"},
 		"tx2": {"http://arcade/cb"},
 	}
 
-	p.emitBatchedSeenCallbacks(registered, "subtree-A")
+	p.emitBatchedSeenCallbacks(registered, "peer-A")
 
 	msgs := mockProd.getMessages()
 	// 1 SEEN_ON_NETWORK (both txids) + 1 SEEN_MULTIPLE_NODES (only tx1) = 2
@@ -1104,6 +1127,26 @@ func TestBatchedSeenCallbacks_PartialThreshold(t *testing.T) {
 	}
 }
 
+// TestBatchedSeenCallbacks_SkipsWhenRegistryNotReady verifies warm-up gate.
+func TestBatchedSeenCallbacks_SkipsWhenRegistryNotReady(t *testing.T) {
+	sc := newMockIdempotentSeenCounter(1)
+	regStore := &mockRegStore{registrations: map[string][]string{}}
+	p, mockProd := newTestProcessor(t, regStore, sc)
+	p.nodeRegistry = &mockNotReadyNodes{}
+
+	p.emitBatchedSeenCallbacks(map[string][]string{
+		"tx1": {"http://arcade/cb"},
+	}, "peer-A")
+
+	msgs := mockProd.getMessages()
+	if len(msgs) != 1 {
+		t.Fatalf("expected only SEEN_ON_NETWORK, got %d msgs", len(msgs))
+	}
+	if decodeCallbackMsg(t, msgs[0]).Type != kafka.CallbackSeenOnNetwork {
+		t.Error("expected SEEN_ON_NETWORK only while registry warms up")
+	}
+}
+
 // TestBatchedSeenCallbacks_ChunksLargeBatch verifies that batches exceeding
 // callbackBatchChunkSize are split into multiple messages, preventing
 // Kafka "Message was too large" rejections.
@@ -1117,7 +1160,7 @@ func TestBatchedSeenCallbacks_ChunksLargeBatch(t *testing.T) {
 		registered[fmt.Sprintf("tx%05d", i)] = []string{"http://arcade/cb"}
 	}
 
-	p.emitBatchedSeenCallbacks(registered, "subtree-A")
+	p.emitBatchedSeenCallbacks(registered, "peer-A")
 
 	msgs := mockProd.getMessages()
 	// total txids / chunk size, rounded up → 3 SEEN_ON_NETWORK messages.

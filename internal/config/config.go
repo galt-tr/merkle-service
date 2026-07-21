@@ -67,6 +67,8 @@ type AerospikeConfig struct {
 	SubtreeCounterTTLSec  int    `yaml:"subtreeCounterTTLSec"  mapstructure:"subtreecounterttlsec"`
 	CallbackAccumulatorSet    string `yaml:"callbackAccumulatorSet"    mapstructure:"callbackaccumulatorset"`
 	CallbackAccumulatorTTLSec int    `yaml:"callbackAccumulatorTTLSec" mapstructure:"callbackaccumulatorttlsec"`
+	BlockAttributionSet       string `yaml:"blockAttributionSet"       mapstructure:"blockattributionset"`
+	SubtreeAttributionSet     string `yaml:"subtreeAttributionSet"     mapstructure:"subtreeattributionset"`
 	MaxRetries                int    `yaml:"maxRetries"                mapstructure:"maxretries"`
 	RetryBaseMs           int    `yaml:"retryBaseMs"           mapstructure:"retrybasems"`
 }
@@ -128,7 +130,14 @@ type CallbackConfig struct {
 	MaxRetries          int `yaml:"maxRetries"          mapstructure:"maxretries"`
 	BackoffBaseSec      int `yaml:"backoffBaseSec"      mapstructure:"backoffbasesec"`
 	TimeoutSec          int `yaml:"timeoutSec"          mapstructure:"timeoutsec"`
+	// SeenThreshold is deprecated. Prefer SeenScoreThreshold (weighted peer score).
+	// Kept for backward-compatible config parsing; ignored at runtime.
 	SeenThreshold       int `yaml:"seenThreshold"       mapstructure:"seenthreshold"`
+	// SeenWindowBlocks is W: number of tip-path blocks used for node weights (default 100).
+	SeenWindowBlocks int `yaml:"seenWindowBlocks" mapstructure:"seenwindowblocks"`
+	// SeenScoreThreshold is the minimum weighted score (out of SeenWindowBlocks) to
+	// emit SEEN_MULTIPLE_NODES (default 51).
+	SeenScoreThreshold  int `yaml:"seenScoreThreshold"  mapstructure:"seenscorethreshold"`
 	DedupTTLSec         int `yaml:"dedupTTLSec"         mapstructure:"dedupttlsec"`
 	DeliveryWorkers     int `yaml:"deliveryWorkers"     mapstructure:"deliveryworkers"`
 	MaxConnsPerHost     int `yaml:"maxConnsPerHost"     mapstructure:"maxconnsperhost"`
@@ -175,6 +184,8 @@ func registerDefaults(v *viper.Viper) {
 	v.SetDefault("aerospike.subtreecounterttlsec", 600)
 	v.SetDefault("aerospike.callbackaccumulatorset", "callback_accum")
 	v.SetDefault("aerospike.callbackaccumulatorttlsec", 600)
+	v.SetDefault("aerospike.blockattributionset", "block_attributions")
+	v.SetDefault("aerospike.subtreeattributionset", "subtree_attributions")
 	v.SetDefault("aerospike.maxretries", 3)
 	v.SetDefault("aerospike.retrybasems", 100)
 
@@ -213,7 +224,9 @@ func registerDefaults(v *viper.Viper) {
 	v.SetDefault("callback.maxretries", 5)
 	v.SetDefault("callback.backoffbasesec", 30)
 	v.SetDefault("callback.timeoutsec", 10)
-	v.SetDefault("callback.seenthreshold", 3)
+	v.SetDefault("callback.seenthreshold", 3) // deprecated
+	v.SetDefault("callback.seenwindowblocks", 100)
+	v.SetDefault("callback.seenscorethreshold", 51)
 	v.SetDefault("callback.dedupttlsec", 86400)
 	v.SetDefault("callback.deliveryworkers", 64)
 	v.SetDefault("callback.maxconnsperhost", 32)
@@ -264,8 +277,10 @@ func bindEnvVars(v *viper.Viper) {
 		"aerospike.subtreecounterttlsec": "AEROSPIKE_SUBTREE_COUNTER_TTL_SEC",
 		"aerospike.callbackaccumulatorset":    "AEROSPIKE_CALLBACK_ACCUMULATOR_SET",
 		"aerospike.callbackaccumulatorttlsec": "AEROSPIKE_CALLBACK_ACCUMULATOR_TTL_SEC",
-		"aerospike.maxretries":           "AEROSPIKE_MAX_RETRIES",
-		"aerospike.retrybasems":          "AEROSPIKE_RETRY_BASE_MS",
+		"aerospike.blockattributionset":       "AEROSPIKE_BLOCK_ATTRIBUTION_SET",
+		"aerospike.subtreeattributionset":     "AEROSPIKE_SUBTREE_ATTRIBUTION_SET",
+		"aerospike.maxretries":                "AEROSPIKE_MAX_RETRIES",
+		"aerospike.retrybasems":               "AEROSPIKE_RETRY_BASE_MS",
 
 		// Kafka
 		"kafka.brokers":        "KAFKA_BROKERS",
@@ -306,10 +321,12 @@ func bindEnvVars(v *viper.Viper) {
 		"callback.maxretries":     "CALLBACK_MAX_RETRIES",
 		"callback.backoffbasesec": "CALLBACK_BACKOFF_BASE_SEC",
 		"callback.timeoutsec":     "CALLBACK_TIMEOUT_SEC",
-		"callback.seenthreshold":  "CALLBACK_SEEN_THRESHOLD",
-		"callback.dedupttlsec":         "CALLBACK_DEDUP_TTL_SEC",
-		"callback.deliveryworkers":     "CALLBACK_DELIVERY_WORKERS",
-		"callback.maxconnsperhost":     "CALLBACK_MAX_CONNS_PER_HOST",
+		"callback.seenthreshold":      "CALLBACK_SEEN_THRESHOLD", // deprecated
+		"callback.seenwindowblocks":   "CALLBACK_SEEN_WINDOW_BLOCKS",
+		"callback.seenscorethreshold": "CALLBACK_SEEN_SCORE_THRESHOLD",
+		"callback.dedupttlsec":        "CALLBACK_DEDUP_TTL_SEC",
+		"callback.deliveryworkers":    "CALLBACK_DELIVERY_WORKERS",
+		"callback.maxconnsperhost":    "CALLBACK_MAX_CONNS_PER_HOST",
 		"callback.maxidleconnsperhost": "CALLBACK_MAX_IDLE_CONNS_PER_HOST",
 
 		// BlobStore

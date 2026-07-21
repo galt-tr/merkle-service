@@ -68,7 +68,9 @@ data:
       maxRetries: 5
       backoffBaseSec: 30
       timeoutSec: 10
-      seenThreshold: 3
+      seenThreshold: 3  # deprecated
+      seenWindowBlocks: 100
+      seenScoreThreshold: 51
       dedupTTLSec: 86400
       deliveryWorkers: 64
       maxConnsPerHost: 32

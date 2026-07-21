@@ -9,6 +9,7 @@ import (
 	"github.com/bsv-blockchain/merkle-service/internal/callback"
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
+	"github.com/bsv-blockchain/merkle-service/internal/nodes"
 	"github.com/bsv-blockchain/merkle-service/internal/p2p"
 	"github.com/bsv-blockchain/merkle-service/internal/service"
 	"github.com/bsv-blockchain/merkle-service/internal/store"
@@ -43,10 +44,18 @@ func main() {
 	}
 	defer blockProducer.Close()
 
+	nodeRegistry, err := nodes.NewRegistry(registry.BlockAttribution, cfg.Callback.SeenWindowBlocks, logger)
+	if err != nil {
+		log.Fatal("failed to create node registry: ", err)
+	}
+	// All-in-one still benefits from refresh if block processing lags; cheap at block rate.
+	nodeRegistry.StartBackgroundRefresh(0)
+	defer nodeRegistry.StopBackgroundRefresh()
+
 	apiServer := api.NewServer(cfg.API, registry.Registration, registry.CallbackURLRegistry, registry.Health, logger)
 	p2pClient := p2p.NewClient(cfg.P2P, subtreeProducer, blockProducer, logger)
-	subtreeFetcher := subtree.NewProcessor(cfg, registry.Registration, registry.SeenCounter, registry.Subtree)
-	blockProcessor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, registry.Registration, registry.Subtree, registry.CallbackURLRegistry, registry.SubtreeCounter, logger)
+	subtreeFetcher := subtree.NewProcessor(cfg, registry.Registration, registry.SeenCounter, registry.Subtree, nodeRegistry, registry.SubtreeAttribution)
+	blockProcessor := block.NewProcessor(cfg.Kafka, cfg.Block, cfg.DataHub, registry.Registration, registry.Subtree, registry.CallbackURLRegistry, registry.SubtreeCounter, nodeRegistry, logger)
 	subtreeWorker := block.NewSubtreeWorkerService(cfg.Kafka, cfg.Block, cfg.DataHub, registry.Registration, registry.Subtree, registry.Stump, registry.CallbackURLRegistry, registry.SubtreeCounter, logger)
 	callbackDelivery := callback.NewDeliveryService(cfg, registry.CallbackDedup, registry.Stump)
 

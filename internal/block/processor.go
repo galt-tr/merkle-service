@@ -10,9 +10,15 @@ import (
 	"github.com/bsv-blockchain/merkle-service/internal/config"
 	"github.com/bsv-blockchain/merkle-service/internal/datahub"
 	"github.com/bsv-blockchain/merkle-service/internal/kafka"
+	"github.com/bsv-blockchain/merkle-service/internal/nodes"
 	"github.com/bsv-blockchain/merkle-service/internal/service"
 	"github.com/bsv-blockchain/merkle-service/internal/store"
 )
+
+// NodeRecorder attributes first-seen block announcements for the node registry.
+type NodeRecorder interface {
+	RecordBlock(hash string, height uint32, headerHex, peerID string) (ready bool, err error)
+}
 
 // Processor implements the block processor service.
 type Processor struct {
@@ -26,6 +32,7 @@ type Processor struct {
 	subtreeStore         store.SubtreeStore
 	urlRegistry          store.CallbackURLRegistry
 	subtreeCounter       store.SubtreeCounterStore
+	nodeRegistry         NodeRecorder
 	dataHubClient        *datahub.Client
 	dedupCache           *cache.DedupCache
 }
@@ -38,6 +45,7 @@ func NewProcessor(
 	subtreeStore store.SubtreeStore,
 	urlRegistry store.CallbackURLRegistry,
 	subtreeCounter store.SubtreeCounterStore,
+	nodeRegistry NodeRecorder,
 	logger *slog.Logger,
 ) *Processor {
 	p := &Processor{
@@ -48,6 +56,7 @@ func NewProcessor(
 		subtreeStore:   subtreeStore,
 		urlRegistry:    urlRegistry,
 		subtreeCounter: subtreeCounter,
+		nodeRegistry:   nodeRegistry,
 	}
 	p.InitBase("block-processor")
 	if logger != nil {
@@ -55,6 +64,9 @@ func NewProcessor(
 	}
 	return p
 }
+
+// Ensure nodes.Registry satisfies NodeRecorder.
+var _ NodeRecorder = (*nodes.Registry)(nil)
 
 func (p *Processor) Init(cfg interface{}) error {
 	p.dataHubClient = datahub.NewClient(p.datahubCfg.TimeoutSec, p.datahubCfg.MaxRetries, p.Logger)
@@ -132,7 +144,21 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 		"hash", blockMsg.Hash,
 		"height", blockMsg.Height,
 		"dataHubUrl", blockMsg.DataHubURL,
+		"peerId", blockMsg.PeerID,
 	)
+
+	// First-seen peer attribution for the node registry (shared store).
+	// Must run before dedup skip so the first announce always wins, even if
+	// another replica already processed the block work path.
+	if p.nodeRegistry != nil && blockMsg.PeerID != "" {
+		if _, err := p.nodeRegistry.RecordBlock(blockMsg.Hash, blockMsg.Height, blockMsg.Header, blockMsg.PeerID); err != nil {
+			p.Logger.Warn("failed to record block peer for node registry",
+				"hash", blockMsg.Hash,
+				"peerId", blockMsg.PeerID,
+				"error", err,
+			)
+		}
+	}
 
 	// Check dedup cache — skip if already successfully processed.
 	if p.dedupCache != nil && p.dedupCache.Contains(blockMsg.Hash) {

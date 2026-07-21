@@ -181,7 +181,9 @@ func startDeliveryService(t *testing.T, callbackTopic string) (*callback.Deliver
 			MaxRetries:     3,
 			BackoffBaseSec: 1,
 			TimeoutSec:     5,
-			SeenThreshold:  3,
+			SeenThreshold:      3,
+			SeenWindowBlocks:   100,
+			SeenScoreThreshold: 51,
 		},
 	}
 
@@ -443,31 +445,34 @@ func TestSeenMultipleNodes(t *testing.T) {
 		t.Fatalf("failed to register txid: %v", err)
 	}
 
-	// 2. Create a seen counter store with threshold = 3.
+	// 2. Create a peer-weighted seen counter (threshold = 51).
 	seenSetName := uniqueSetName("seen")
-	threshold := 3
+	threshold := 51
 	seenStore := store.NewSeenCounterStore(asClient, seenSetName, threshold, 3, 100, logger)
 
-	// 3. Simulate multiple subtree appearances: increment the seen counter
-	//    multiple times and track when threshold is reached.
+	// 3. Simulate multiple mining peers observing the txid.
+	peers := []struct {
+		id string
+		w  int
+	}{
+		{"peer-A", 40},
+		{"peer-B", 20}, // score 60 → fire
+		{"peer-C", 10},
+	}
 	var thresholdReached bool
-	for i := 0; i < threshold+1; i++ {
-		result, err := seenStore.Increment(txid, fmt.Sprintf("subtree-%d", i))
+	for i, p := range peers {
+		result, err := seenStore.AddPeer(txid, p.id, p.w)
 		if err != nil {
-			t.Fatalf("failed to increment seen counter (iteration %d): %v", i, err)
+			t.Fatalf("failed to add peer to seen counter (iteration %d): %v", i, err)
 		}
 		if result.ThresholdReached {
 			thresholdReached = true
-			t.Logf("threshold reached at count %d", result.NewCount)
-		}
-		// After threshold, ThresholdReached should be false (only true at exactly threshold).
-		if i == threshold && result.ThresholdReached {
-			t.Errorf("expected ThresholdReached=false above threshold, count=%d", result.NewCount)
+			t.Logf("threshold reached at score %d", result.NewCount)
 		}
 	}
 
 	if !thresholdReached {
-		t.Fatal("expected threshold to be reached during increments")
+		t.Fatal("expected threshold to be reached during peer observations")
 	}
 
 	// 4. Set up Kafka callback topic and delivery service.
@@ -501,13 +506,13 @@ func TestSeenMultipleNodes(t *testing.T) {
 		t.Errorf("expected txid %s, got %s", txid, payloads[0].TxID)
 	}
 
-	// 7. Verify that incrementing beyond threshold does NOT set ThresholdReached again.
-	result, err := seenStore.Increment(txid, "subtree-extra")
+	// 7. Verify that adding another peer does NOT set ThresholdReached again.
+	result, err := seenStore.AddPeer(txid, "peer-extra", 5)
 	if err != nil {
-		t.Fatalf("failed to increment seen counter past threshold: %v", err)
+		t.Fatalf("failed to add peer past threshold: %v", err)
 	}
 	if result.ThresholdReached {
-		t.Errorf("expected ThresholdReached=false after passing threshold, count=%d", result.NewCount)
+		t.Errorf("expected ThresholdReached=false after passing threshold, score=%d", result.NewCount)
 	}
 
 	t.Logf("SEEN_MULTIPLE_NODES callback received for txid %s", txid)

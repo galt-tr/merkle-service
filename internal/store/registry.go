@@ -11,8 +11,10 @@ type Registry struct {
 	CallbackDedup       CallbackDedupStore
 	CallbackURLRegistry CallbackURLRegistry
 	CallbackAccumulator CallbackAccumulatorStore
-	SeenCounter         SeenCounterStore
-	SubtreeCounter      SubtreeCounterStore
+	SeenCounter            SeenCounterStore
+	SubtreeCounter         SubtreeCounterStore
+	BlockAttribution       BlockAttributionStore
+	SubtreeAttribution     SubtreeAttributionStore
 
 	// Health reports backend reachability for the API health endpoint. May be
 	// nil for backends that don't need a liveness probe (e.g., an in-memory

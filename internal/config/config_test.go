@@ -129,6 +129,12 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.Callback.SeenThreshold != 3 {
 		t.Errorf("Callback.SeenThreshold: expected 3, got %d", cfg.Callback.SeenThreshold)
 	}
+	if cfg.Callback.SeenWindowBlocks != 100 {
+		t.Errorf("Callback.SeenWindowBlocks: expected 100, got %d", cfg.Callback.SeenWindowBlocks)
+	}
+	if cfg.Callback.SeenScoreThreshold != 51 {
+		t.Errorf("Callback.SeenScoreThreshold: expected 51, got %d", cfg.Callback.SeenScoreThreshold)
+	}
 
 	// BlobStore default
 	if cfg.BlobStore.URL != "file:///tmp/merkle-subtrees" {

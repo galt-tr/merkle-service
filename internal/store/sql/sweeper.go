@@ -16,6 +16,7 @@ var ttlTables = []string{
 	"callback_dedup",
 	"subtree_counters",
 	"callback_accumulator",
+	"subtree_attributions",
 }
 
 // sweeper runs a periodic DELETE pass over TTL-bearing tables. One goroutine

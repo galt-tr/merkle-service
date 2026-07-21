@@ -21,9 +21,21 @@ type RegistrationGetter interface {
 	Get(txid string) ([]string, error)
 }
 
-// SeenCounter abstracts seen-count tracking for testability.
+// SeenCounter abstracts peer-weighted seen scoring for testability.
 type SeenCounter interface {
-	Increment(txid string, subtreeID string) (*store.IncrementResult, error)
+	AddPeer(txid, peerID string, weight int) (*store.IncrementResult, error)
+	BatchAddPeer(txids []string, peerID string, weight int) (thresholdReached []string, err error)
+}
+
+// NodeWeights provides mining-node weights for SEEN_MULTIPLE_NODES scoring.
+type NodeWeights interface {
+	Ready() bool
+	Weight(peerID string) int
+}
+
+// SubtreeAttributor records first-seen peer per subtree hash.
+type SubtreeAttributor interface {
+	TryAttribute(subtreeHash, peerID string) (attributedPeer string, first bool, err error)
 }
 
 // RegCache abstracts the registration deduplication cache for testability.
@@ -43,12 +55,14 @@ type Processor struct {
 	callbackProducer  *kafka.Producer
 	retryProducer     *kafka.Producer // re-publishes to the subtree topic on transient failure
 	dlqProducer       *kafka.Producer // publishes to subtree-dlq when MaxAttempts is exceeded
-	registrationStore RegistrationGetter
-	seenCounterStore  SeenCounter
-	subtreeStore      store.SubtreeStore
-	regCache          RegCache
-	dedupCache        *cache.DedupCache
-	dataHubClient     *datahub.Client
+	registrationStore    RegistrationGetter
+	seenCounterStore     SeenCounter
+	subtreeStore         store.SubtreeStore
+	nodeRegistry         NodeWeights
+	subtreeAttribution   SubtreeAttributor
+	regCache             RegCache
+	dedupCache           *cache.DedupCache
+	dataHubClient        *datahub.Client
 
 	messagesProcessed atomic.Int64
 	messagesRetried   atomic.Int64
@@ -61,12 +75,16 @@ func NewProcessor(
 	registrationStore RegistrationGetter,
 	seenCounterStore SeenCounter,
 	subtreeStore store.SubtreeStore,
+	nodeRegistry NodeWeights,
+	subtreeAttribution SubtreeAttributor,
 ) *Processor {
 	return &Processor{
-		cfg:               cfg,
-		registrationStore: registrationStore,
-		seenCounterStore:  seenCounterStore,
-		subtreeStore:      subtreeStore,
+		cfg:                cfg,
+		registrationStore:  registrationStore,
+		seenCounterStore:   seenCounterStore,
+		subtreeStore:       subtreeStore,
+		nodeRegistry:       nodeRegistry,
+		subtreeAttribution: subtreeAttribution,
 	}
 }
 
@@ -259,13 +277,44 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 	p.Logger.Debug("processing subtree announcement",
 		"hash", subtreeMsg.Hash,
 		"dataHubUrl", subtreeMsg.DataHubURL,
+		"peerId", subtreeMsg.PeerID,
 		"attemptCount", subtreeMsg.AttemptCount,
 	)
 
-	// Check dedup cache — skip if already successfully processed.
+	// Local dedup FIRST — O(1) memory, no shared-store RTT. At high fan-in
+	// most subtree announces are duplicates; never pay Aerospike/SQL for them.
 	if p.dedupCache != nil && p.dedupCache.Contains(subtreeMsg.Hash) {
 		p.Logger.Debug("skipping duplicate subtree message", "hash", subtreeMsg.Hash)
 		return nil
+	}
+
+	// First-seen peer attribution (shared store) — only for hashes this process
+	// has not finished yet. Cross-replica races: loser still processes once
+	// (SEEN_ON_NETWORK may double; delivery dedup absorbs it) but scoring uses
+	// the stored first peer when available.
+	attributedPeer := subtreeMsg.PeerID
+	if p.subtreeAttribution != nil && subtreeMsg.Hash != "" && subtreeMsg.PeerID != "" {
+		peer, first, err := p.subtreeAttribution.TryAttribute(subtreeMsg.Hash, subtreeMsg.PeerID)
+		if err != nil {
+			p.Logger.Warn("subtree attribution failed; continuing with message peer",
+				"hash", subtreeMsg.Hash,
+				"error", err,
+			)
+		} else {
+			attributedPeer = peer
+			if !first {
+				// Another replica already owns this hash. Skip heavy work; local
+				// dedup prevents us from re-entering on the next redelivery.
+				p.Logger.Debug("skipping subtree hash owned by another first-seen peer",
+					"hash", subtreeMsg.Hash,
+					"peerId", peer,
+				)
+				if p.dedupCache != nil {
+					p.dedupCache.Add(subtreeMsg.Hash)
+				}
+				return nil
+			}
+		}
 	}
 
 	// 3.2: Fetch binary subtree data from DataHub.
@@ -304,7 +353,7 @@ func (p *Processor) handleMessage(ctx context.Context, msg *sarama.ConsumerMessa
 	}
 
 	// 4.5-4.6: Emit batched callbacks grouped by callbackURL.
-	p.emitBatchedSeenCallbacks(registeredTxids, subtreeMsg.Hash)
+	p.emitBatchedSeenCallbacks(registeredTxids, attributedPeer)
 
 	// Mark subtree as successfully processed for dedup.
 	if p.dedupCache != nil {
@@ -429,7 +478,8 @@ func (p *Processor) findRegisteredTxids(txids []string) (map[string][]string, er
 
 // emitBatchedSeenCallbacks emits batched SEEN_ON_NETWORK and SEEN_MULTIPLE_NODES callbacks.
 // Groups txids by callbackURL and publishes one message per callbackURL.
-func (p *Processor) emitBatchedSeenCallbacks(registeredTxids map[string][]string, subtreeID string) {
+// peerID is the first-seen announcer of the subtree (for weighted multi-node scoring).
+func (p *Processor) emitBatchedSeenCallbacks(registeredTxids map[string][]string, peerID string) {
 	if len(registeredTxids) == 0 {
 		return
 	}
@@ -462,18 +512,35 @@ func (p *Processor) emitBatchedSeenCallbacks(registeredTxids map[string][]string
 		}
 	}
 
-	// 4.6: Increment seen counters and collect threshold-reached txids.
+	// 4.6: Peer-weighted SEEN_MULTIPLE_NODES scoring.
+	// Warm-up gate: do not score until the node registry has a full tip window.
+	if p.nodeRegistry == nil || !p.nodeRegistry.Ready() {
+		p.Logger.Debug("skipping SEEN_MULTIPLE_NODES scoring: node registry not ready")
+		return
+	}
+	weight := p.nodeRegistry.Weight(peerID)
+	if weight <= 0 {
+		p.Logger.Debug("skipping SEEN_MULTIPLE_NODES scoring: peer is not a known mining node",
+			"peerId", peerID,
+		)
+		return
+	}
+
+	// Batch scoring — one store round-trip (or few chunks) for the whole set.
+	txids := make([]string, 0, len(registeredTxids))
+	for txid := range registeredTxids {
+		txids = append(txids, txid)
+	}
+	fired, err := p.seenCounterStore.BatchAddPeer(txids, peerID, weight)
+	if err != nil {
+		p.Logger.Warn("failed to batch-add peer to seen counter", "peerId", peerID, "n", len(txids), "error", err)
+		return
+	}
+
 	thresholdGroups := make(map[string][]string) // callbackURL → threshold-reached txids
-	for txid, callbackURLs := range registeredTxids {
-		result, err := p.seenCounterStore.Increment(txid, subtreeID)
-		if err != nil {
-			p.Logger.Warn("failed to increment seen counter", "txid", txid, "error", err)
-			continue
-		}
-		if result.ThresholdReached {
-			for _, url := range callbackURLs {
-				thresholdGroups[url] = append(thresholdGroups[url], txid)
-			}
+	for _, txid := range fired {
+		for _, url := range registeredTxids[txid] {
+			thresholdGroups[url] = append(thresholdGroups[url], txid)
 		}
 	}
 
